@@ -160,7 +160,7 @@ public enum SettingsCatalog {
         // 通用
         pref("general.auto_check_update", .bool, "true"),
         pref("general.clipboard_watch", .bool, "false"),
-        pref("analytics_enabled", .bool, "true"),
+        pref("analytics_enabled", .bool, "false"),
         pref("ui.show_sidebar_status", .bool, "true"),
         pref("ui.show_sidebar_queues", .bool, "true"),
         pref("ui.show_sidebar_category", .bool, "true"),

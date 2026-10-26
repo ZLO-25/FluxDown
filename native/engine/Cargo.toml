@@ -16,7 +16,7 @@ base64 = "0.22"
 bytes = "1"
 cbc = "0.1"
 chrono = { version = "0.4.43", default-features = false, features = ["clock", "std"] }
-dash-mpd = { version = "0.19", default-features = false }
+dash-mpd = { version = "0.20", default-features = false }
 # 系统标准用户目录（下载目录 = Windows FOLDERID_Downloads / XDG user-dirs），
 # 禁止 $HOME 拼接。与 native/cli 同版本。
 directories = "6.0.0"

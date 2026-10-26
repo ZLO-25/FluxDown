@@ -1,4 +1,4 @@
-//! 仅发送安装一次与每日活跃两类匿名部署事件。
+//! 仅发送安装一次与每日活跃两类匿名部署事件；默认关闭（opt-in），用户打开 `analytics_enabled` 后才上报。
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -72,7 +72,8 @@ impl AnalyticsWorker {
                 .get("analytics_enabled")
                 .or_else(|| state.preferences.values.get("general.analytics_enabled"))
                 .and_then(serde_json::Value::as_bool)
-                .unwrap_or(true);
+                // 未设置 = 未同意：统计为 opt-in，用户在设置里打开后才上报。
+                .unwrap_or(false);
             if enabled && state.analytics_id.is_empty() {
                 state.analytics_id = uuid::Uuid::new_v4().to_string();
                 if let Err(error) = self.store.save(&state).await {

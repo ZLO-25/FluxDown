@@ -6,6 +6,9 @@
 //!
 //! 官方站点在域名迁移期有多个（[`DEFAULT_API_BASES`]），任一可达即可：检查时错峰竞速，
 //! 胜出站点用于同一轮的更新说明、校验和与更新包下载。
+//!
+//! 分叉自行发布时，构建期设 `FLUXDOWN_UPDATE_BASE_URLS`（逗号分隔的 https 站点）替换官方站点，
+//! 否则应用会从官方站点下载更新、覆盖分叉版本。
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -22,8 +25,42 @@ use crate::http_client::HttpClientError;
 
 /// 官方站点，按优先级：主域名在前，旧域名在后；两者长期并存，任一失效时自动换用另一个。
 const DEFAULT_API_BASES: [&str; 2] = ["https://fluxdown.com", "https://fluxdown.zerx.dev"];
-/// 未检查前（初始状态）展示的发布页。检查后改用胜出站点的 `/changelog`。
-pub(super) const RELEASE_PAGE_URL: &str = "https://fluxdown.com/changelog";
+/// 构建期覆盖的更新站点（逗号分隔）；未设置或无有效项时用 [`DEFAULT_API_BASES`]。
+const BAKED_API_BASES: Option<&str> = option_env!("FLUXDOWN_UPDATE_BASE_URLS");
+
+/// 解析逗号分隔的站点列表：只收 https、去掉末尾 `/`；一个有效项都没有则为 `None`。
+fn parse_api_bases(raw: &str) -> Option<Vec<String>> {
+    let bases: Vec<String> = raw
+        .split(',')
+        .map(|base| base.trim().trim_end_matches('/'))
+        .filter(|base| {
+            reqwest::Url::parse(base).is_ok_and(|url| {
+                url.scheme() == "https" && url.host_str().is_some() && url.username().is_empty()
+            })
+        })
+        .map(str::to_owned)
+        .collect();
+    (!bases.is_empty()).then_some(bases)
+}
+
+/// 生效的更新站点，按优先级。
+fn api_bases() -> Vec<String> {
+    BAKED_API_BASES
+        .and_then(parse_api_bases)
+        .unwrap_or_else(|| {
+            DEFAULT_API_BASES
+                .iter()
+                .map(|&base| base.to_owned())
+                .collect()
+        })
+}
+
+/// 未检查前（初始状态）展示的发布页：首选站点的 `/changelog`。检查后改用胜出站点的。
+pub(super) fn default_release_page_url() -> String {
+    let bases = api_bases();
+    let base = bases.first().map_or(DEFAULT_API_BASES[0], String::as_str);
+    format!("{base}/changelog")
+}
 /// 首选站点在此时长内无结果，才并行请求下一个站点（避免每次都双发请求）。
 pub(super) const FALLBACK_STAGGER: Duration = Duration::from_secs(3);
 const CHANGELOG_PER_PAGE: u32 = 50;
@@ -69,7 +106,9 @@ impl Endpoint {
                 return Self::with_bases(&[base], true, FALLBACK_STAGGER);
             }
         }
-        Self::with_bases(&DEFAULT_API_BASES, false, FALLBACK_STAGGER)
+        let bases = api_bases();
+        let bases: Vec<&str> = bases.iter().map(String::as_str).collect();
+        Self::with_bases(&bases, false, FALLBACK_STAGGER)
     }
 
     pub(super) fn with_bases(bases: &[&str], trust_any: bool, stagger: Duration) -> Self {
@@ -151,9 +190,30 @@ impl Endpoint {
         }
     }
 
-    /// 下载地址只接受 https 且主机属于官方分发域：清单被篡改时也不会把用户带到任意 scheme / 主机。
+    /// 下载地址只接受 https 且主机属于官方分发域或更新站点本身：清单被篡改时也不会把用户带到
+    /// 任意 scheme / 主机。
     fn is_trusted(&self, url: &str) -> bool {
-        self.trust_any || is_trusted_download_url(url)
+        self.trust_any || is_trusted_download_url(url) || self.is_api_host(url)
+    }
+
+    fn is_api_host(&self, url: &str) -> bool {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        if parsed.scheme() != "https"
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return false;
+        }
+        self.bases.iter().any(|base| {
+            reqwest::Url::parse(base).is_ok_and(|base| {
+                base.host_str()
+                    .zip(parsed.host_str())
+                    .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+                    && base.port_or_known_default() == parsed.port_or_known_default()
+            })
+        })
     }
 }
 
@@ -739,5 +799,30 @@ mod tests {
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].version, "1.3.0");
         assert_eq!(notes[0].body, "new");
+    }
+
+    #[test]
+    fn baked_api_bases_keep_only_https_sites() {
+        assert_eq!(
+            parse_api_bases(" https://dl.example.org/ , http://plain.example , https://b.example "),
+            Some(vec![
+                "https://dl.example.org".to_owned(),
+                "https://b.example".to_owned()
+            ])
+        );
+        assert_eq!(parse_api_bases("https://user@x.example"), None);
+        assert_eq!(parse_api_bases(" , "), None);
+        assert_eq!(parse_api_bases("not a url"), None);
+    }
+
+    #[test]
+    fn downloads_from_the_update_site_itself_are_trusted() {
+        let endpoint = Endpoint::with_bases(&["https://dl.example.org"], false, FALLBACK_STAGGER);
+        assert!(endpoint.is_trusted("https://dl.example.org/api/download/a.exe"));
+        assert!(endpoint.is_trusted("https://DL.example.org/a.exe"));
+        assert!(!endpoint.is_trusted("http://dl.example.org/a.exe"));
+        assert!(!endpoint.is_trusted("https://dl.example.org:8443/a.exe"));
+        assert!(!endpoint.is_trusted("https://evil.example/a.exe"));
+        assert!(!endpoint.is_trusted("https://user@dl.example.org/a.exe"));
     }
 }

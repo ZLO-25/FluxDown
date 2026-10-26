@@ -143,8 +143,8 @@ async fn dispatch_method(
 ) -> Value {
     match method {
         // ---- 真实实现：经 &dyn ApiHost -------------------------------
-        "aria2.addUri" => add_uri(arr, id, host).await,
-        "aria2.addTorrent" => add_torrent(arr, id, host).await,
+        "aria2.addUri" => add_uri(arr, id, host, token_empty).await,
+        "aria2.addTorrent" => add_torrent(arr, id, host, token_empty).await,
         "aria2.remove" | "aria2.forceRemove" => remove_download(arr, id, host).await,
         "aria2.pause" | "aria2.forcePause" => pause_download(arr, id, host).await,
         "aria2.unpause" => unpause_download(arr, id, host).await,
@@ -246,7 +246,7 @@ async fn system_multicall(
 /// `aria2.addUri`：`params = [uris, options?, position?]`。`uris` 取首个
 /// 非空条目建任务（其余镜像 URI 被忽略——引擎任务模型只有单一 `url`）；
 /// `position`（插入等待队列指定位置）被忽略——等待队列只有 FIFO。
-async fn add_uri(arr: &[Value], id: &Value, host: &dyn ApiHost) -> Value {
+async fn add_uri(arr: &[Value], id: &Value, host: &dyn ApiHost, token_empty: bool) -> Value {
     let uris = match arr.first() {
         None => return rpc_err(id, 1, &aria2::err_missing_param(0)),
         Some(v) => match v.as_array() {
@@ -264,6 +264,9 @@ async fn add_uri(arr: &[Value], id: &Value, host: &dyn ApiHost) -> Value {
     };
 
     let options = arr.get(1).and_then(|v| v.as_object());
+    if let Some(resp) = reject_dir_without_token(id, options, token_empty) {
+        return resp;
+    }
     let opts = match aria2::parse_request_options(options) {
         Ok(o) => o,
         Err(e) => return rpc_err(id, 1, &e),
@@ -275,7 +278,7 @@ async fn add_uri(arr: &[Value], id: &Value, host: &dyn ApiHost) -> Value {
 /// `aria2.addTorrent`：`params = [torrent(base64), uris?, options?, position?]`。
 /// `uris`（web seed 列表）与 `position` 被忽略（引擎不支持 web seed /
 /// 队列插入位置）；`torrent` 原样透传给宿主（宿主负责 base64 解码）。
-async fn add_torrent(arr: &[Value], id: &Value, host: &dyn ApiHost) -> Value {
+async fn add_torrent(arr: &[Value], id: &Value, host: &dyn ApiHost, token_empty: bool) -> Value {
     let torrent = match arr.first() {
         None => return rpc_err(id, 1, &aria2::err_missing_param(0)),
         Some(v) => match v.as_str() {
@@ -288,12 +291,26 @@ async fn add_torrent(arr: &[Value], id: &Value, host: &dyn ApiHost) -> Value {
     }
 
     let options = arr.get(2).and_then(|v| v.as_object());
+    if let Some(resp) = reject_dir_without_token(id, options, token_empty) {
+        return resp;
+    }
     let opts = match aria2::parse_request_options(options) {
         Ok(o) => o,
         Err(e) => return rpc_err(id, 1, &e),
     };
     let req = aria2::build_create_task_request(String::new(), Some(torrent.to_string()), opts);
     create_task_and_respond(id, host, req).await
+}
+
+/// 无 token 时拒绝任务级 `dir`：与 `changeGlobalOption` 同一理由——任何能触达端口的
+/// 调用方都能借它把文件写进任意目录。
+fn reject_dir_without_token(
+    id: &Value,
+    options: Option<&serde_json::Map<String, Value>>,
+    token_empty: bool,
+) -> Option<Value> {
+    (token_empty && options.is_some_and(|o| o.contains_key("dir")))
+        .then(|| rpc_err(id, 1, "the dir option requires an rpc token"))
 }
 
 /// `addUri`/`addTorrent` 共用尾段：建任务、返回 GID。aria2 的 `pause`
@@ -802,12 +819,20 @@ mod tests {
         handle_jsonrpc(host, "", false, body.to_string().as_bytes()).await
     }
 
+    /// 服务端配置了 token `S` 且请求带 `token:S`。
+    async fn call_with_token(host: &dyn ApiHost, method: &str, params: Value) -> Value {
+        let mut params = params.as_array().cloned().unwrap_or_default();
+        params.insert(0, json!("token:S"));
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+        handle_jsonrpc(host, "S", false, body.to_string().as_bytes()).await
+    }
+
     // -- addUri / addTorrent -------------------------------------------------
 
     #[tokio::test]
     async fn add_uri_creates_task_with_mapped_options_and_returns_gid() {
         let host = TestHost::new("550e8400-e29b-41d4-a716-446655440000");
-        let resp = call(
+        let resp = call_with_token(
             &host,
             "aria2.addUri",
             json!([
@@ -831,6 +856,39 @@ mod tests {
         assert_eq!(created[0].user_agent, "UA/1");
         assert_eq!(created[0].checksum, "sha-1=abc");
         assert_eq!(created[0].cookies, "s=1");
+    }
+
+    #[tokio::test]
+    async fn add_uri_and_add_torrent_reject_dir_without_token() {
+        let host = TestHost::new("task-xyz");
+        let resp = call(
+            &host,
+            "aria2.addUri",
+            json!([["https://a.com/f"], { "dir": "C:/Windows/System32" }]),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], 1);
+        assert_eq!(
+            resp["error"]["message"],
+            "the dir option requires an rpc token"
+        );
+        let resp = call(
+            &host,
+            "aria2.addTorrent",
+            json!(["YmFzZTY0Ym9keQ==", [], { "dir": "/etc" }]),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], 1);
+        assert!(host.created.lock().unwrap().is_empty());
+
+        // 不带 dir 的无 token 调用照常建任务。
+        let resp = call(
+            &host,
+            "aria2.addUri",
+            json!([["https://a.com/f"], { "out": "f" }]),
+        )
+        .await;
+        assert!(resp["result"].is_string());
     }
 
     #[tokio::test]
