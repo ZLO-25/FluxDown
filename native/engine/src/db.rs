@@ -3413,8 +3413,8 @@ impl Db {
             ("close_to_tray", "true"),
             ("auto_startup", "false"),
             ("auto_check_update", "true"),
-            // 匿名使用统计（每日活跃事件）；首装事件由 agent `analytics.rs` 一次性上报，不受此开关控制。
-            ("analytics_enabled", "true"),
+            // 匿名使用统计（首装 + 每日活跃事件，agent `analytics.rs` 上报）；默认关闭，用户同意后才开。
+            ("analytics_enabled", "false"),
             ("proxy_mode", "none"),
             ("proxy_type", "http"),
             ("proxy_host", ""),

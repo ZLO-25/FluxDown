@@ -29,7 +29,7 @@ export function GeneralSettings() {
   return (
     <SettingsPage title={t('settingsCatGeneral')} description={t('settingsCatGeneralDesc')}>
       <SettingsSection title={t('settingsGroupSystem')}>
-        <PrefSwitchRow prefKey="analytics_enabled" fallback titleKey="analyticsEnabled" descKey="analyticsEnabledDesc" />
+        <PrefSwitchRow prefKey="analytics_enabled" fallback={false} titleKey="analyticsEnabled" descKey="analyticsEnabledDesc" />
       </SettingsSection>
       <SettingsSection title={t('sidebarVisibility')} subtitle={t('sidebarVisibilityDesc')}>
         <PrefSwitchRow prefKey="ui.show_sidebar_status" fallback titleKey="showSidebarStatus" descKey="showSidebarStatusDesc" />

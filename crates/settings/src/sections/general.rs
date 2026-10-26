@@ -168,7 +168,7 @@ fn system_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
         .row(ctx.item(
             "analyticsEnabled",
             Some("analyticsEnabledDesc"),
-            ctx.pref_switch("analytics_enabled", true),
+            ctx.pref_switch("analytics_enabled", false),
         ))
 }
 
