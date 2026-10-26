@@ -39,8 +39,8 @@ use tokio_util::sync::CancellationToken;
 use self::download::{DownloadError, DownloadSpec, discard_partial, download_verified};
 pub use self::install::InstallTarget;
 use self::release::{
-    ChangelogResponse, ComponentRelease, Endpoint, RELEASE_PAGE_URL, RawRelease,
-    checksum_file_names, find_checksum, normalize_channel,
+    ChangelogResponse, ComponentRelease, Endpoint, RawRelease, checksum_file_names, find_checksum,
+    normalize_channel,
 };
 pub use self::release::{UpdateError, is_newer};
 use crate::egress::{Egress, EgressClient};
@@ -180,7 +180,7 @@ fn initial_status_for(current_version: &str, target: &InstallTarget) -> UpdateSt
         current_version: current_version.to_owned(),
         install_kind: target.kind,
         manual_reason: target.manual_reason,
-        release_page_url: RELEASE_PAGE_URL.to_owned(),
+        release_page_url: release::default_release_page_url(),
         ..UpdateStatusDto::default()
     }
 }
