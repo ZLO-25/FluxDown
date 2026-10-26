@@ -13,6 +13,8 @@
 )]
 
 mod archive;
+#[cfg(any(windows, test))]
+mod authenticode;
 mod detect;
 pub(crate) use detect::current_exe_path;
 #[cfg(target_os = "linux")]
@@ -129,8 +131,8 @@ pub(crate) enum InstallError {
     /// 后台任务异常终止。
     #[error("install task failed: {0}")]
     Task(String),
-    /// 系统工具（hdiutil / ditto / codesign / apt-get / pacman …）失败。
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// 系统工具（hdiutil / ditto / codesign / apt-get / pacman / PowerShell …）失败。
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[error("{0}")]
     Command(String),
     /// 用户取消了管理员授权。
@@ -149,7 +151,7 @@ impl InstallError {
             Self::InvalidPackage(_) => UpdateFailure::Verify,
             Self::Storage { .. } => UpdateFailure::Storage,
             Self::Replace { .. } | Self::Unsupported(_) | Self::Task(_) => UpdateFailure::Install,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
             Self::Command(_) => UpdateFailure::Install,
             #[cfg(target_os = "linux")]
             Self::ElevationCancelled => UpdateFailure::ElevationCancelled,
@@ -235,9 +237,7 @@ pub(crate) async fn apply(
     tracing::info!(kind = ?target.kind, package = %package.display(), "applying update package");
     match target.kind {
         #[cfg(windows)]
-        UpdateInstallKind::WindowsSetup => {
-            blocking(move || windows::apply_setup(&package, &work_dir)).await
-        }
+        UpdateInstallKind::WindowsSetup => windows::apply_setup(&package, &work_dir).await,
         #[cfg(any(windows, target_os = "linux"))]
         UpdateInstallKind::WindowsPortable | UpdateInstallKind::LinuxPortable => {
             blocking(move || apply_portable(&package, &work_dir)).await
@@ -437,10 +437,26 @@ where
     S: AsRef<std::ffi::OsStr>,
 {
     let mut command = tokio::process::Command::new(program);
+    command.args(args);
+    output_within(command, program, timeout).await
+}
+
+/// [`run_tool`] 的执行部分：调用方可先给 `command` 设好环境变量等再交给它。
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+async fn output_within(
+    mut command: tokio::process::Command,
+    program: &Path,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, InstallError> {
     command
-        .args(args)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        /// `CREATE_NO_WINDOW`：PowerShell 是控制台程序，不闪黑窗。
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
     match tokio::time::timeout(timeout, command.output()).await {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(error)) => Err(InstallError::Command(format!(
@@ -469,7 +485,7 @@ fn ensure_success(program: &Path, output: &std::process::Output) -> Result<(), I
     )))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(windows, target_os = "macos"))]
 fn stderr_tail(stderr: &[u8]) -> String {
     const MAX_CHARS: usize = 600;
     let text = String::from_utf8_lossy(stderr);
