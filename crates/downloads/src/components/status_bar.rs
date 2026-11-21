@@ -1,18 +1,19 @@
-//! 下载能力提供给 shell 的可摆放控件：全局速度、全部暂停 / 全部开始、限速、代理、
-//! 完成后关机、剩余空间。默认摆在状态栏，用户可经 chrome 布局拖到顶栏 / 活动栏；
+//! 下载能力提供给 shell 的可摆放控件：全局速度、全部暂停 / 全部开始 / 失败重试、限速、代理、
+//! 定时关机 / 睡眠、剩余空间。全局任务操作默认摆在顶栏，其余在状态栏，可经 chrome 布局移动；
 //! 控件窗口级显示（不随路由切换消失），由 app 把 [`DownloadWidget`] 登记为 shell 控件。
 //!
 //! 下载限速走云同步偏好写入；上传限速与代理模式走 `DownloadsCommand::PatchConfig`
 //!（`upload_limit_bytes` 为字节/秒，`proxy_mode` 为现有四模式之一）。
-//! 完成后关机走宿主注入的 `ShutdownPort`（状态机与真正执行归 agent，本文件只发请求 +
-//! 刷新倒计时显示）。
+//! 定时关机 / 睡眠走宿主注入的 `ShutdownPort`（状态机与真正执行归 agent，本文件只发请求 +
+//! 刷新倒计时显示）；选中的操作记在设备本地偏好 `download.power_action`。
 
 use std::{collections::BTreeMap, rc::Rc, time::Duration};
 
 /// 数字输入弹窗的确认回调。
 type NumberConfirm = Rc<dyn Fn(i64, &mut App)>;
 
-use fluxdown_protocol::ApplicationErrorCode;
+use super::power_prompt;
+use fluxdown_protocol::{ApplicationErrorCode, PowerAction, PowerLowSpeedCondition};
 use fluxdown_ui_components::{
     ControlExt as _, DialogIntent, FluxIcon, dialog_footer, dialog_title, field_hint, form,
     form_field, tabular_numbers, toolbar_action_button, tooltip_view,
@@ -36,7 +37,10 @@ use crate::{
     controller::{DownloadsCommand, SPEED_LIMIT_RECENT_PREF, UPLOAD_LIMIT_RECENT_PREF},
     model::{
         format_bytes,
-        shutdown::ShutdownRequest,
+        shutdown::{
+            POWER_ACTION_PREF, POWER_LOW_SPEED_KBPS_PREF, POWER_LOW_SPEED_MINUTES_PREF,
+            ShutdownRequest, ShutdownStatus, power_action_pref_value, read_power_action,
+        },
         speed_limit_recent::{push_recent, read_speed_limit_recent},
     },
     pages::downloads::DownloadView,
@@ -44,7 +48,7 @@ use crate::{
 
 /// 下载 / 上传限速预设（MB/s）。
 const SPEED_PRESETS_MB: [i64; 4] = [1, 5, 10, 50];
-/// 完成后关机延迟预设（分钟）。
+/// 定时关机 / 睡眠延迟预设（分钟）。
 const SHUTDOWN_PRESETS_MIN: [i64; 4] = [1, 5, 10, 30];
 
 /// 下载能力的可摆放控件；[`Self::id`] 是 chrome 布局里的稳定 id（与 Web 同名）。
@@ -54,6 +58,7 @@ pub enum DownloadWidget {
     UploadSpeed,
     PauseAll,
     ResumeAll,
+    RetryFailed,
     DownloadLimit,
     UploadLimit,
     Proxy,
@@ -62,12 +67,13 @@ pub enum DownloadWidget {
 }
 
 impl DownloadWidget {
-    /// 默认顺序（状态栏自左向右）。
-    pub const ALL: [Self; 9] = [
+    /// 目录顺序；各控件的默认区域由宿主 chrome 目录决定。
+    pub const ALL: [Self; 10] = [
         Self::DownloadSpeed,
         Self::UploadSpeed,
         Self::PauseAll,
         Self::ResumeAll,
+        Self::RetryFailed,
         Self::DownloadLimit,
         Self::UploadLimit,
         Self::Proxy,
@@ -83,6 +89,7 @@ impl DownloadWidget {
             Self::UploadSpeed => "uploadSpeed",
             Self::PauseAll => "pauseAll",
             Self::ResumeAll => "resumeAll",
+            Self::RetryFailed => "retryFailed",
             Self::DownloadLimit => "downloadLimit",
             Self::UploadLimit => "uploadLimit",
             Self::Proxy => "proxy",
@@ -99,6 +106,7 @@ impl DownloadWidget {
             Self::UploadSpeed => "chromeWidgetUploadSpeed",
             Self::PauseAll => "pauseAll",
             Self::ResumeAll => "resumeAll",
+            Self::RetryFailed => "retryFailed",
             Self::DownloadLimit => "speedLimitTitle",
             Self::UploadLimit => "uploadLimit",
             Self::Proxy => "statusBarProxyLabel",
@@ -240,9 +248,97 @@ fn kb_to_bytes(kb: i64) -> i64 {
     kb.max(0) * 1024
 }
 
-/// 分钟延迟 → `ShutdownRequest::ArmAfter` 所需 `Duration`；负值视为 0。
+/// 分钟延迟 → `ShutdownRequest::Arm` 所需 `Duration`；负值视为 0。
 fn minutes_to_duration(minutes: i64) -> Duration {
     Duration::from_secs(60 * minutes.max(0) as u64)
+}
+
+/// 已排定操作对应的文案键。
+struct PowerActionKeys {
+    countdown: &'static str,
+    armed_immediate: &'static str,
+    armed_after: &'static str,
+    cancel: &'static str,
+}
+
+impl PowerActionKeys {
+    fn of(action: PowerAction) -> Self {
+        match action {
+            PowerAction::Shutdown => Self {
+                countdown: "shutdownCountdown",
+                armed_immediate: "shutdownArmedHintImmediate",
+                armed_after: "shutdownArmedHint",
+                cancel: "shutdownCancelButton",
+            },
+            PowerAction::Sleep => Self {
+                countdown: "sleepCountdown",
+                armed_immediate: "sleepArmedHintImmediate",
+                armed_after: "sleepArmedHint",
+                cancel: "sleepCancelButton",
+            },
+        }
+    }
+}
+
+/// 已排定时的状态文字：倒计时中显示剩余时间，等待任务完成时显示排定的延迟。
+fn armed_text(
+    translator: &fluxdown_ui_i18n::Translator,
+    status: &ShutdownStatus,
+    keys: &PowerActionKeys,
+) -> String {
+    if status.countdown_remaining.is_none()
+        && let Some(condition) = status.low_speed
+    {
+        let elapsed = status.low_speed_elapsed_secs.map_or_else(
+            || translator.text("powerLowSpeedWaiting").to_owned(),
+            |seconds| {
+                translator.text_with(
+                    "powerLowSpeedElapsed",
+                    &[("time", &format_countdown(Duration::from_secs(seconds)))],
+                )
+            },
+        );
+        let action = translator.text(match status.action {
+            PowerAction::Shutdown => "powerActionShutdown",
+            PowerAction::Sleep => "powerActionSleep",
+        });
+        return translator.text_with(
+            "powerLowSpeedArmed",
+            &[
+                ("threshold", &(condition.threshold_bps / 1024).to_string()),
+                ("duration", &(condition.duration_secs / 60).to_string()),
+                ("elapsed", &elapsed),
+                ("action", action),
+            ],
+        );
+    }
+    match (status.countdown_remaining, status.armed_delay) {
+        (Some(remaining), _) => {
+            translator.text_with(keys.countdown, &[("time", &format_countdown(remaining))])
+        }
+        (None, Some(delay)) if !delay.is_zero() => translator.text_with(
+            keys.armed_after,
+            &[("m", &(delay.as_secs() / 60).to_string())],
+        ),
+        (None, _) => translator.text(keys.armed_immediate).to_owned(),
+    }
+}
+
+/// 记住状态栏选中的电源操作（设备本地偏好）。
+fn select_power_action(view: WeakEntity<DownloadView>, action: PowerAction, cx: &mut App) {
+    let value = power_action_pref_value(action);
+    let Ok(()) = view.update(cx, |this, cx| {
+        this.execute_status_config_command(
+            DownloadsCommand::SetLocalPreference {
+                key: POWER_ACTION_PREF,
+                value,
+            },
+            cx,
+        );
+    }) else {
+        // 视图已释放，结束这次回调而不再更新状态。
+        return;
+    };
 }
 
 fn apply_speed_limit(view: WeakEntity<DownloadView>, key: &'static str, value: i64, cx: &mut App) {
@@ -587,10 +683,15 @@ impl DownloadView {
             .into_any_element()
     }
 
-    /// 完成后关机控件：未启用时只显示电源图标（悬浮提示 + 预设菜单）；
-    /// 已启用 / 倒计时中显示 warning 色倒计时文字，点击取消（紧凑摆放只留 warning 色图标）。
+    /// 定时 / 低速关机与睡眠控件，低速条件独立于完成条件。
+    /// 倒计时中显示 warning 色文字并可点击取消。
     /// 宿主未注入关机端口时为 `None`。
-    fn render_shutdown_control(&self, placement: WidgetPlacement, cx: &App) -> Option<AnyElement> {
+    fn render_shutdown_control(
+        &self,
+        placement: WidgetPlacement,
+        view: WeakEntity<Self>,
+        cx: &App,
+    ) -> Option<AnyElement> {
         let translator = self.translator.read(cx);
         let shutdown = self.host.shutdown.clone()?;
         let status = self
@@ -599,29 +700,12 @@ impl DownloadView {
             .as_ref()
             .map(|status| status.get())
             .unwrap_or_default();
-        let can_arm = self.controller.runtime_stats().active_tasks > 0;
-        let cancel_label = SharedString::from(translator.text("shutdownCancelButton").to_owned());
         let warning = active_theme(cx).extended().colors.warning;
 
-        let armed_text = if let Some(remaining) = status.countdown_remaining {
-            Some(translator.text_with(
-                "shutdownCountdown",
-                &[("time", &format_countdown(remaining))],
-            ))
-        } else {
-            status.armed_delay.map(|delay| {
-                if delay.is_zero() {
-                    translator.text("shutdownArmedHintImmediate").to_owned()
-                } else {
-                    translator.text_with(
-                        "shutdownArmedHint",
-                        &[("m", &(delay.as_secs() / 60).to_string())],
-                    )
-                }
-            })
-        };
-        if let Some(text) = armed_text {
-            let text = SharedString::from(text);
+        if status.armed_delay.is_some() {
+            let keys = PowerActionKeys::of(status.action);
+            let cancel_label = SharedString::from(translator.text(keys.cancel).to_owned());
+            let text = SharedString::from(armed_text(translator, &status, &keys));
             let (label, tooltip) = if placement.compact {
                 (None, compact_tooltip(&cancel_label, &text))
             } else {
@@ -641,16 +725,25 @@ impl DownloadView {
             );
         }
 
+        let stats = self.controller.runtime_stats();
+        let has_work =
+            stats.active_tasks > 0 || stats.pending_tasks > 0 || stats.retry_pending_tasks > 0;
+        let action = read_power_action(self.controller.preference(POWER_ACTION_PREF));
         let title = SharedString::from(translator.text("shutdownTitle").to_owned());
-        let need_active_hint =
-            SharedString::from(translator.text("shutdownNeedActiveTask").to_owned());
+        let action_items = [
+            (PowerAction::Shutdown, "powerActionShutdown"),
+            (PowerAction::Sleep, "powerActionSleep"),
+        ]
+        .map(|(item, key)| (item, SharedString::from(translator.text(key).to_owned())));
         let immediate_label = SharedString::from(translator.text("shutdownImmediate").to_owned());
         let custom_label = SharedString::from(translator.text("speedLimitCustom").to_owned());
         let prompt = NumberPrompt {
             title: title.clone(),
             label: SharedString::from(translator.text("shutdownDelayLabel").to_owned()),
             unit: SharedString::from(translator.text("shutdownMinutesUnit").to_owned()),
-            hint: None,
+            hint: Some(SharedString::from(
+                translator.text("shutdownDelayHint").to_owned(),
+            )),
             cancel_label: SharedString::from(translator.text("cancel").to_owned()),
             confirm_label: SharedString::from(translator.text("confirm").to_owned()),
         };
@@ -662,85 +755,147 @@ impl DownloadView {
                 (minutes, SharedString::from(label))
             })
             .collect();
+        let initial_condition = PowerLowSpeedCondition {
+            threshold_bps: self
+                .controller
+                .preference(POWER_LOW_SPEED_KBPS_PREF)
+                .and_then(serde_json::Value::as_u64)
+                .filter(|n| (1..=1_048_576).contains(n))
+                .unwrap_or(5)
+                * 1024,
+            duration_secs: self
+                .controller
+                .preference(POWER_LOW_SPEED_MINUTES_PREF)
+                .and_then(serde_json::Value::as_u64)
+                .filter(|n| (1..=1_440).contains(n))
+                .unwrap_or(5)
+                * 60,
+        };
+        let low_label = SharedString::from(translator.text("powerLowSpeedEntry").to_owned());
+        let low_translator = translator.clone();
+        let low_available = (stats.active_tasks > 0 || stats.retry_pending_tasks > 0)
+            && stats.local_work_count.is_some();
+        let arm = move |minutes: i64| ShutdownRequest::Arm {
+            delay: minutes_to_duration(minutes),
+            action,
+        };
+        let low_view = view.clone();
+        let low_shutdown = shutdown.clone();
+        let low_arm: power_prompt::LowSpeedConfirm = Rc::new(move |condition, cx| {
+            if low_view
+                .update(cx, |this, cx| {
+                    for (key, value) in [
+                        (POWER_LOW_SPEED_KBPS_PREF, condition.threshold_bps / 1024),
+                        (POWER_LOW_SPEED_MINUTES_PREF, condition.duration_secs / 60),
+                    ] {
+                        this.execute_status_config_command(
+                            DownloadsCommand::SetLocalPreference {
+                                key,
+                                value: serde_json::Value::from(value),
+                            },
+                            cx,
+                        );
+                    }
+                })
+                .is_err()
+            {
+                // The window was released; do not arm a plan from a stale dialog.
+                return;
+            }
+            low_shutdown(ShutdownRequest::ArmLowSpeed { condition, action }, cx);
+        });
 
         let trigger = status_button("shutdown-trigger", cx)
             .min_w(active_theme(cx).density().status_control)
             .child(status_button_content(Some(FluxIcon::Power), None, None, cx))
-            .tooltip(if can_arm {
-                title.clone()
-            } else {
-                need_active_hint
-            })
+            .tooltip(title)
             .dropdown_menu_with_anchor(placement.menu_anchor, move |menu, _, _| {
-                let mut menu = menu.item(
-                    PopupMenuItem::new(immediate_label.clone())
-                        .disabled(!can_arm)
-                        .on_click({
-                            let shutdown = shutdown.clone();
-                            move |_, _, cx| {
-                                shutdown(ShutdownRequest::ArmAfter(Duration::ZERO), cx);
-                            }
-                        }),
-                );
-                for (minutes, label) in minute_presets.clone() {
-                    menu = menu.item(PopupMenuItem::new(label).disabled(!can_arm).on_click({
-                        let shutdown = shutdown.clone();
-                        move |_, _, cx| {
-                            shutdown(ShutdownRequest::ArmAfter(minutes_to_duration(minutes)), cx);
-                        }
+                let mut menu = menu;
+                for (item, label) in action_items.clone() {
+                    menu = menu.item(PopupMenuItem::new(label).checked(item == action).on_click({
+                        let view = view.clone();
+                        move |_, _, cx| select_power_action(view.clone(), item, cx)
                     }));
                 }
-                menu.separator().item(
-                    PopupMenuItem::new(custom_label.clone())
-                        .disabled(!can_arm)
+                menu = menu.separator();
+                if has_work {
+                    menu = menu.item(PopupMenuItem::new(immediate_label.clone()).on_click({
+                        let shutdown = shutdown.clone();
+                        move |_, _, cx| shutdown(arm(0), cx)
+                    }));
+                }
+                for (minutes, label) in minute_presets.clone() {
+                    menu = menu.item(PopupMenuItem::new(label).on_click({
+                        let shutdown = shutdown.clone();
+                        move |_, _, cx| shutdown(arm(minutes), cx)
+                    }));
+                }
+                menu = menu.separator();
+                menu = menu.item(
+                    PopupMenuItem::new(low_label.clone())
+                        .disabled(!low_available)
                         .on_click({
-                            let shutdown = shutdown.clone();
-                            let prompt = prompt.clone();
+                            let low_arm = low_arm.clone();
+                            let translator = low_translator.clone();
                             move |_, window, cx| {
-                                let shutdown = shutdown.clone();
-                                open_number_prompt(
+                                power_prompt::open(
                                     window,
                                     cx,
-                                    prompt.clone(),
-                                    // 0 分钟等同立即关机，「立即」是独立菜单项；自定义必须 ≥ 1。
-                                    1,
-                                    None,
-                                    Rc::new(move |minutes, cx| {
-                                        shutdown(
-                                            ShutdownRequest::ArmAfter(minutes_to_duration(minutes)),
-                                            cx,
-                                        );
-                                    }),
+                                    translator.clone(),
+                                    initial_condition,
+                                    low_arm.clone(),
                                 );
                             }
                         }),
-                )
+                );
+                menu.item(PopupMenuItem::new(custom_label.clone()).on_click({
+                    let shutdown = shutdown.clone();
+                    let prompt = prompt.clone();
+                    move |_, window, cx| {
+                        let shutdown = shutdown.clone();
+                        open_number_prompt(
+                            window,
+                            cx,
+                            prompt.clone(),
+                            // 0 分钟等同「完成后立即」（独立菜单项，仅有任务时可用）；自定义必须 ≥ 1。
+                            1,
+                            None,
+                            Rc::new(move |minutes, cx| shutdown(arm(minutes), cx)),
+                        );
+                    }
+                }))
             });
         Some(trigger.into_any_element())
     }
 
-    /// 全部暂停 / 全部开始小图标按钮；不可用时置灰禁用，tooltip 改为说明原因
+    /// 全部暂停 / 全部开始 / 失败重试小图标按钮；不可用时置灰禁用，tooltip 改为说明原因
     /// （tooltip 挂在外层，禁用时仍可悬停）。
     fn render_status_action(
         &self,
         command: ToolbarCommand,
         view: WeakEntity<Self>,
         cx: &App,
-    ) -> AnyElement {
-        let (id, label, icon, blocker) = if matches!(command, ToolbarCommand::PauseAll) {
-            (
+    ) -> Option<AnyElement> {
+        let (id, label, icon, blocker) = match command {
+            ToolbarCommand::PauseAll => (
                 "status-pause-all",
                 self.strings.pause_all.clone(),
                 FluxIcon::Pause,
                 self.pause_all_blocker(),
-            )
-        } else {
-            (
+            ),
+            ToolbarCommand::ResumeAll => (
                 "status-resume-all",
                 self.strings.resume_all.clone(),
                 FluxIcon::Play,
                 self.resume_all_blocker(),
-            )
+            ),
+            ToolbarCommand::RetryFailed => (
+                "status-retry-failed",
+                SharedString::from(self.translator.read(cx).text("retryFailed").to_owned()),
+                FluxIcon::RotateCw,
+                self.retry_failed_blocker(cx),
+            ),
+            _ => return None,
         };
         let theme = active_theme(cx);
         let icon_size = theme.extended().icon.sm;
@@ -763,12 +918,14 @@ impl DownloadView {
                 return;
             };
         });
-        div()
-            .id(SharedString::from(format!("{id}-tooltip")))
-            .flex_none()
-            .tooltip(move |window, cx| tooltip_view(tooltip_label.clone(), window, cx))
-            .child(button)
-            .into_any_element()
+        Some(
+            div()
+                .id(SharedString::from(format!("{id}-tooltip")))
+                .flex_none()
+                .tooltip(move |window, cx| tooltip_view(tooltip_label.clone(), window, cx))
+                .child(button)
+                .into_any_element(),
+        )
     }
 
     /// 渲染一个可摆放控件（由 shell 在布局指定的位置调用）。`None` = 当前没有内容
@@ -793,10 +950,13 @@ impl DownloadView {
                 cx,
             )),
             DownloadWidget::PauseAll => {
-                Some(self.render_status_action(ToolbarCommand::PauseAll, view.clone(), cx))
+                self.render_status_action(ToolbarCommand::PauseAll, view.clone(), cx)
             }
             DownloadWidget::ResumeAll => {
-                Some(self.render_status_action(ToolbarCommand::ResumeAll, view.clone(), cx))
+                self.render_status_action(ToolbarCommand::ResumeAll, view.clone(), cx)
+            }
+            DownloadWidget::RetryFailed => {
+                self.render_status_action(ToolbarCommand::RetryFailed, view.clone(), cx)
             }
             DownloadWidget::DownloadLimit => {
                 Some(self.render_speed_limit_control(&DOWNLOAD_LIMIT, placement, view.clone(), cx))
@@ -805,7 +965,7 @@ impl DownloadView {
                 Some(self.render_speed_limit_control(&UPLOAD_LIMIT, placement, view.clone(), cx))
             }
             DownloadWidget::Proxy => Some(self.render_proxy_control(placement, view.clone(), cx)),
-            DownloadWidget::Shutdown => self.render_shutdown_control(placement, cx),
+            DownloadWidget::Shutdown => self.render_shutdown_control(placement, view.clone(), cx),
             DownloadWidget::DiskFree => stats.disk_free_bytes.map(|bytes| {
                 let text = self
                     .translator

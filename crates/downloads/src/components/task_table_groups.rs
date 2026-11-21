@@ -8,15 +8,16 @@ use fluxdown_ui_components::{CheckState, FluxIcon, check_mark, tabular_numbers, 
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Div, FontWeight, InteractiveElement as _, IntoElement,
-    Modifiers, MouseButton, ParentElement, SharedString, Stateful, StatefulInteractiveElement as _,
-    Styled, div, prelude::FluentBuilder as _, px,
+    MouseButton, ParentElement, SharedString, Stateful, StatefulInteractiveElement as _, Styled,
+    div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{Icon, h_flex, table::TableState, v_flex};
 
 use super::{
     CELL_PADDING_X, DownloadColumnKind, DownloadTableDelegate, GroupBucket, PROGRESS_GAP,
     PROGRESS_LABEL_WIDTH, ROW_ACTION_SIZE, ROW_GROUP, SELECT_CELL_GROUP, SELECTED_INSET_X,
-    TABLE_TRAILING_GUTTER, VisibleRow, meta_cell, percent_label, row_at, status_color,
+    SelectModifiers, VisibleRow, meta_cell, percent_label, row_at, status_color,
+    wrap_row_action_strip,
 };
 use crate::{
     components::group_visuals::{group_counts_line, group_folder_icon},
@@ -356,7 +357,7 @@ impl DownloadTableDelegate {
 
     /// 单击组行：普通单击选中整组并聚焦（停靠面板显示组概览）；Cmd/Ctrl 单击把整组并入 /
     /// 移出选区；Shift 单击从锚点选到该组最后一个成员。
-    pub(crate) fn select_group(&mut self, group_id: &str, modifiers: Modifiers) {
+    pub(crate) fn select_group(&mut self, group_id: &str, modifiers: SelectModifiers) {
         let Some(ix) = self.group_ix(group_id) else {
             return;
         };
@@ -368,7 +369,7 @@ impl DownloadTableDelegate {
             self.select_task(last, modifiers);
             return;
         }
-        if modifiers.secondary() {
+        if modifiers.toggle {
             if keys.iter().all(|key| self.selected_tasks.contains(key)) {
                 for key in &keys {
                     self.selected_tasks.remove(key);
@@ -416,7 +417,7 @@ impl DownloadTableDelegate {
         if let Some(ix) = self.group_ix(group_id)
             && self.group_check_state(ix) != CheckState::Checked
         {
-            self.select_group(group_id, Modifiers::default());
+            self.select_group(group_id, SelectModifiers::default());
         }
     }
 
@@ -465,7 +466,8 @@ impl DownloadTableDelegate {
         let selected = self.group_check_state(ix) == CheckState::Checked;
         let group_id = group.id.clone();
         let hover = theme.extended().colors.row_hover;
-        row.group(ROW_GROUP)
+        let row = row
+            .group(ROW_GROUP)
             .relative()
             .child(div().absolute().inset_0().bg(theme.tokens().colors.surface))
             .child(
@@ -482,16 +484,20 @@ impl DownloadTableDelegate {
                     }),
             )
             .on_click(cx.listener(move |table, event: &ClickEvent, _, cx| {
+                if table.delegate_mut().take_sweep_suppress(cx) {
+                    return;
+                }
                 let modifiers = event.modifiers();
                 let delegate = table.delegate_mut();
-                if event.click_count() == 2 && !modifiers.secondary() && !modifiers.shift {
+                if event.click_count() == 2 && !modifiers.secondary(cx) && !modifiers.shift {
                     delegate.toggle_group_expanded(&group_id);
                     delegate.refresh_view();
                 } else {
-                    delegate.select_group(&group_id, modifiers);
+                    delegate.select_group(&group_id, SelectModifiers::from_event(modifiers, cx));
                 }
                 cx.notify();
-            }))
+            }));
+        DownloadTableDelegate::arm_row_sweep(row, row_ix, true, cx)
     }
 
     /// 目录行容器：单击切换该目录折叠；不参与选择。
@@ -511,7 +517,8 @@ impl DownloadTableDelegate {
         };
         let path = path.clone();
         let hover = theme.extended().colors.row_hover;
-        row.group(ROW_GROUP)
+        let row = row
+            .group(ROW_GROUP)
             .relative()
             .cursor_pointer()
             .child(div().absolute().inset_0().bg(theme.tokens().colors.surface))
@@ -526,11 +533,15 @@ impl DownloadTableDelegate {
                     .group_hover(ROW_GROUP, move |style| style.bg(hover)),
             )
             .on_click(cx.listener(move |table, _: &ClickEvent, _, cx| {
+                if table.delegate_mut().take_sweep_suppress(cx) {
+                    return;
+                }
                 let delegate = table.delegate_mut();
                 delegate.toggle_group_dir(&group_id, &path);
                 delegate.refresh_view();
                 cx.notify();
-            }))
+            }));
+        DownloadTableDelegate::arm_row_sweep(row, row_ix, false, cx)
     }
 
     /// 组行单元格：选择列为文件夹图标 / 复选框，文件名列为展开箭头 + 组名 + 计数行，
@@ -885,24 +896,7 @@ impl DownloadTableDelegate {
                 })
                 .child(Icon::new(icon).size(extended.icon.md))
         });
-        Some(
-            h_flex()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                // 父节点是右侧留白列：浮层右缘对齐其左缘，即单元格可视区右缘。
-                .right(px(TABLE_TRAILING_GUTTER))
-                .gap(tokens.spacing.xxs)
-                .pl(tokens.spacing.xs)
-                .bg(extended.colors.row_hover)
-                .invisible()
-                .group_hover(ROW_GROUP, |style| style.visible())
-                .when(selected, |this| {
-                    this.child(div().absolute().inset_0().bg(tokens.colors.accent))
-                })
-                .children(buttons)
-                .into_any_element(),
-        )
+        Some(wrap_row_action_strip(selected, buttons, cx))
     }
 
     /// 目录行单元格：选择列只画树轨，文件名列为展开箭头 + 文件夹图标 + 压缩路径 + 文件数与

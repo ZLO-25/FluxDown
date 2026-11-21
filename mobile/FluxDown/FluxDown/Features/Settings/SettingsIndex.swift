@@ -89,6 +89,7 @@ enum SettingsIndex {
         "appearance.color": ["searchKeywordsThemeColor"],
         "download.saveDir": ["searchKeywordsSaveDir"],
         "download.silentDownload": ["searchKeywordsSilentDownload"],
+        "download.silentAutoCategory": ["searchKeywordsSilentAutoCategory"],
         "download.silentSkipSelection": ["searchKeywordsSilentSkipSelection"],
         "download.useServerTime": ["searchKeywordsUseServerTime"],
         "download.fileExistsBehavior": ["searchKeywordsFileExists"],
@@ -101,6 +102,8 @@ enum SettingsIndex {
         "download.userAgent": ["searchKeywordsUserAgent"],
         "logs.maxSize": ["searchKeywordsLogExport"],
         "logs.export": ["searchKeywordsLogExport"],
+        "btGuard.enabled": ["btGuardKeywords"],
+        "btGuard.bans": ["btGuardKeywords"],
     ]
 
     /// `, | ，` 分隔的别名词表 → 词。

@@ -39,6 +39,11 @@ type ManifestBack = Rc<dyn Fn(&mut Window, &mut App)>;
 pub(crate) struct ManifestView {
     translator: Entity<Translator>,
     selection: ManifestSelection,
+    /// Identity of the plugin that produced the manifest; copied into the group request.
+    plugin_id: String,
+    archive_metadata: Option<fluxdown_protocol::daemon::ArchiveMetadataDto>,
+    category_route: Option<fluxdown_protocol::CategoryRouteDto>,
+    offered_save_dir: String,
     base: CreateTaskRequest,
     queues: Vec<NewDownloadQueue>,
     group_name: Entity<InputState>,
@@ -46,6 +51,8 @@ pub(crate) struct ManifestView {
     search: Entity<InputState>,
     picking: bool,
     submitting: bool,
+    /// 当前（或最近一次）提交走「稍后下载」：在途时只让被点击的那一侧按钮转圈。
+    submitting_paused: bool,
     on_submit: ManifestSubmit,
     on_back: ManifestBack,
 }
@@ -62,6 +69,8 @@ impl ManifestView {
         manifest: ResolvePreviewResponse,
         base: CreateTaskRequest,
         queues: Vec<NewDownloadQueue>,
+        category_route: Option<fluxdown_protocol::CategoryRouteDto>,
+        offered_save_dir: String,
         on_submit: ManifestSubmit,
         on_back: ManifestBack,
         window: &mut Window,
@@ -108,13 +117,18 @@ impl ManifestView {
         Self {
             translator,
             selection: ManifestSelection::new(manifest.items),
+            plugin_id: manifest.plugin_id,
+            archive_metadata: manifest.archive_metadata,
             base,
             queues,
+            category_route,
+            offered_save_dir,
             group_name,
             save_dir,
             search,
             picking: false,
             submitting: false,
+            submitting_paused: false,
             on_submit,
             on_back,
         }
@@ -172,15 +186,28 @@ impl ManifestView {
             &self.base.queue_id
         };
         let queue = queue.as_deref().unwrap_or(default_queue);
-        let Some(request) = self.selection.build_request(
+        let submitted_save_dir = self.save_dir.read(cx).value().to_string();
+        let category_route = self
+            .category_route
+            .clone()
+            .filter(|route| route.follows(&submitted_save_dir, &self.offered_save_dir));
+        let save_dir = category_route.as_ref().map_or_else(
+            || submitted_save_dir.clone(),
+            |route| route.base_dir(&submitted_save_dir, &self.offered_save_dir),
+        );
+        let Some(mut request) = self.selection.build_request(
             &self.base,
             self.group_name.read(cx).value().as_str(),
-            self.save_dir.read(cx).value().as_str(),
+            &save_dir,
             queue,
+            &self.plugin_id,
             paused,
         ) else {
             return;
         };
+        request.archive_metadata = self.archive_metadata.clone();
+        request.category_route = category_route;
+        self.submitting_paused = paused;
         self.set_submitting(true, cx);
         (self.on_submit)(request, window, cx);
     }

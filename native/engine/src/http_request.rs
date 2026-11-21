@@ -134,7 +134,14 @@ impl<'s> HttpRequest<'s> {
                 learned: &learned,
                 deadline,
             };
-            let resp = self.hop(&hop).send().await?;
+            // 站点代理规则：命中与发送方出口不同的规则时换用规则 client。重定向由本循环
+            // 逐跳跟随（下载 client 用 `Policy::none()`），所以每一跳都经过这里。
+            let routed = match &self.spec.egress {
+                Some(router) => router.client_for(&url).await?,
+                None => None,
+            };
+            let client = routed.as_ref().unwrap_or(&self.client);
+            let resp = self.hop(client, &hop).send().await?;
             let status = resp.status();
             if !is_redirect(status) {
                 return Ok(resp);
@@ -183,21 +190,24 @@ impl<'s> HttpRequest<'s> {
             .anchor
             .as_deref()
             .map_or_else(|| url.clone(), |anchor| Url::parse(anchor).unwrap());
-        self.hop(&Hop {
-            url: &url,
-            method: &self.method,
-            keeps_body: true,
-            anchor: Some(&anchor),
-            previous: None,
-            learned: &[],
-            deadline: None,
-        })
+        self.hop(
+            &self.client,
+            &Hop {
+                url: &url,
+                method: &self.method,
+                keeps_body: true,
+                anchor: Some(&anchor),
+                previous: None,
+                learned: &[],
+                deadline: None,
+            },
+        )
         .build()
         .unwrap()
     }
 
     /// 构造一跳。
-    fn hop(&self, hop: &Hop<'_>) -> RequestBuilder {
+    fn hop(&self, client: &Client, hop: &Hop<'_>) -> RequestBuilder {
         let Hop {
             url,
             method,
@@ -208,7 +218,7 @@ impl<'s> HttpRequest<'s> {
             deadline,
         } = *hop;
         let spec = self.spec;
-        let mut req = self.client.request(method.clone(), url.clone());
+        let mut req = client.request(method.clone(), url.clone());
 
         let captured = header_value(spec, "cookie").unwrap_or(&spec.cookies).trim();
         if !captured.is_empty() && anchor.is_some_and(|a| credential_scope::cookies_apply(a, url)) {

@@ -10,6 +10,7 @@ import type { AgentSessionDto } from '../../../../lib/rpc'
 import { Button, Card, CheckRow, ConfirmFooter, Dialog, FieldError, FieldHint, Form, FormField, Icon, Input, Switch, Tooltip, toast } from '../../../../ui'
 import { setPref, usePrefBoolean } from '../../kit'
 import { SHOW_REFERRAL_PREF } from '../referral/pref'
+import { localDate } from './billing'
 import { accountErrorKey } from './errorText'
 import { PlanBadge } from './PlanBadge'
 import { PlanDialog } from './PlanDialog'
@@ -161,6 +162,7 @@ export function ProfileCard({ session, disabled }: { session: AgentSessionDto; d
     return () => window.clearTimeout(timer)
   }, [copied])
 
+
   const name = displayName(session)
   const initial = [...name.trim()][0]?.toUpperCase()
   const originId = session.user.originId
@@ -248,6 +250,11 @@ export function ProfileCard({ session, disabled }: { session: AgentSessionDto; d
         <span className="text-xs text-muted-foreground">{t('accountPlanLabel')}</span>
         <span className="min-w-0 truncate text-sm font-medium text-foreground">{session.currentPlan ? session.currentPlan.name || session.currentPlan.code : '—'}</span>
         {session.currentPlan ? <PlanBadge plan={session.currentPlan} ordinal={session.user.membershipOrdinal} /> : null}
+        {session.activeSubscription ? (
+          <span className="min-w-0 truncate text-xs text-muted-foreground tabular">
+            {t('accountSubscriptionUntil', { date: localDate(session.activeSubscription.endsAt) ?? '' })}
+          </span>
+        ) : null}
         <Button variant="primary" className="ml-auto" disabled={disabled} onClick={() => setPlanOpen(true)}>
           {t('accountPlanUpgrade')}
         </Button>

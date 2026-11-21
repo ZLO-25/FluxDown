@@ -6,15 +6,17 @@ import { ChevronDown, ChevronRight, Ellipsis, Folder } from 'lucide-react'
 import { memo, useCallback, useRef } from 'react'
 import { useT } from '../../../i18n'
 import { cn } from '../../../lib/cn'
+import { usePrefBool } from '../../../lib/rpc'
 import { ActionMenu, Checkbox, ContextMenuArea, Icon } from '../../../ui'
 import type { MenuEntry } from '../../../ui'
 import { notePointerActivity } from '../model/rowOrder'
-import { formatBytes, percentLabel, sourceSite } from '../model/task'
+import { percentLabel } from '../model/task'
 import type { DownloadTaskView } from '../model/task'
+import { HIDE_TASK_SOURCE_PREF } from '../model/viewPrefs'
 import { useDownloads } from '../state'
 import { useConflictTaskIds } from '../dialogs/fileConflict'
 import { ConflictBadge, KindGlyph } from './cells'
-import { kindLabel, STATUS_TEXT, statusDetail, statusLabel, taskStatusClass } from './text'
+import { cardMeta, STATUS_TEXT, statusDetail, statusLabel, taskStatusClass } from './text'
 import type { Translate } from './text'
 import { usePluginTaskCommands } from '../../plugins/usePluginContributions'
 import { buildGroupMenu, buildTaskMenu } from './menus'
@@ -31,6 +33,7 @@ import { CountsLine, GroupGlyph } from './groupText'
 import { TREE_INDENT } from './rowMetrics'
 import { TreeRails } from './rowParts'
 import { stateLabel } from '../state'
+import { DirectoryHeaderView } from './GroupRows'
 
 interface CardProps {
   t: Translate
@@ -48,10 +51,8 @@ interface CardProps {
 
 const TaskCard = memo(function TaskCard({ t, view, depth, conflict, selected, anySelected, onTap, onToggle, getMenu, onContext }: CardProps) {
   const detail = statusDetail(t, view)
-  const site = sourceSite(view)
-  const meta = [kindLabel(t, view.kind), site, view.sizeBytes > 0 ? formatBytes(view.sizeBytes) : '']
-    .filter((part) => part !== '')
-    .join(' · ')
+  const hideSource = usePrefBool(HIDE_TASK_SOURCE_PREF, false)
+  const meta = cardMeta(t, view, hideSource)
   return (
     <ContextMenuArea entries={() => getMenu(view)} title={view.name} className="h-full">
       <div
@@ -335,6 +336,8 @@ export function TaskCards() {
                 />
               ) : row.type === 'dir' ? (
                 <DirCard t={t} row={row} onToggle={ctx.toggleDirCollapsed} />
+              ) : row.type === 'directory' ? (
+                <DirectoryHeaderView t={t} row={row} onToggle={ctx.toggleBucketCollapsed} />
               ) : (
                 renderTask(row)
               )}

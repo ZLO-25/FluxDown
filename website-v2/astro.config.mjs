@@ -198,7 +198,7 @@ export default defineConfig({
 
       // ── 可选：阿里云 OSS 发布资产 + dl-cn 下载镜像（/api/download，见 src/lib/oss.ts）──
       // 对象布局 `<OSS_RELEASE_PREFIX>/<tag>/<file>`，与 .github/actions/oss-upload 一致。
-      // bucket 私有：官网用 AK/SK 只做 HEAD 存在性探测；中国大陆访客（Cloudflare 国家码，client-ip.ts）与 source=oss
+      // bucket 私有：官网用 AK/SK 只做 HEAD 存在性探测；中国大陆访客（ESA 国家码，client-ip.ts）与 source=oss
       // 302 到 CN_CDN_BASE（URL 鉴权 A），其余访客走 GitHub。AK/SK 或 CN_CDN_AUTH_KEY 缺失时全部走 GitHub。
       OSS_ACCESS_KEY_ID: envField.string({
         context: "server",
@@ -225,14 +225,29 @@ export default defineConfig({
         access: "secret",
         default: "FluxDownRelease",
       }),
-      // dl-cn 下载镜像：现为 Cloudflare Worker（website-v2/cdn/oss-proxy.js，私有 OSS 回源），ICP 备案后
-      // 改回阿里云 CDN；两者都按「URL 鉴权 A 方式」校验 CN_CDN_AUTH_KEY，缺省则镜像关闭。
+      // dl-cn 下载镜像：阿里云 ESA 边缘函数（website-v2/cdn/esa-dl-cn.js，私有 OSS 回源），
+      // 按「URL 鉴权 A 方式」校验 CN_CDN_AUTH_KEY，缺省则镜像关闭。
       CN_CDN_BASE: envField.string({
         context: "server",
         access: "secret",
         default: "https://dl-cn.fluxdown.com",
       }),
       CN_CDN_AUTH_KEY: envField.string({
+        context: "server",
+        access: "secret",
+        optional: true,
+      }),
+      // dl-cn 全站每日预算（GB，北京时间自然日，按签发时的文件大小累计；见 src/lib/download-gate.ts::checkMirrorQuota）。
+      // 更新器用到 80% 即改走 GitHub，浏览器到 100%；0 = 不设预算。正常日 60–90 GB、发版日 200 GB 以上。
+      CN_CDN_DAILY_BUDGET_GB: envField.number({
+        context: "server",
+        access: "secret",
+        default: 150,
+      }),
+      // 官网浏览器下载的验证码通行证（src/lib/download-pass.ts）：HMAC 密钥，随机 32 字节以上。
+      // 配置后浏览器（非 FluxDown 更新器 UA）须先过 ESA AI 验证码才拿 dl-cn 镜像，否则 GitHub；留空则不要求。
+      // 先在两个站点的反代写好 X-Fluxdown-Edge（见 .omp/knowledge/ops.md「下载准入」）再配置，否则浏览器全部回落 GitHub。
+      DOWNLOAD_PASS_SECRET: envField.string({
         context: "server",
         access: "secret",
         optional: true,

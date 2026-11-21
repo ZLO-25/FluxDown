@@ -93,8 +93,48 @@ pub fn open(cx: &mut App, context: NewDownloadContext) {
     open_with(cx, context, Vec::new());
 }
 
+/// 系统打开的链接被 agent 拒绝时在主窗口 toast（含启动时已发生的失败）；文案按错误原因取，
+/// 分享链接的原因（本机分享、分享方离线、已过期……）与接收窗口一致。
+fn install_capture_failure_notices(cx: &mut App) {
+    let mut failures = Desktop::global(cx)
+        .client
+        .submissions
+        .capture_failure
+        .subscribe();
+    cx.spawn(async move |cx| {
+        let mut pending = failures.borrow_and_update().clone();
+        loop {
+            if pending.take().is_some() {
+                cx.update(|cx| {
+                    crate::windows::main::reveal(cx);
+                    let Some(main) = WindowRegistry::handle(cx, &WindowKey::Main) else {
+                        return;
+                    };
+                    let message = Desktop::global(cx)
+                        .translator
+                        .read(cx)
+                        .text("localServiceActionFailed")
+                        .to_owned();
+                    if let Err(error) = main.update(cx, |_, window, cx| {
+                        window.push_notification(Notification::error(message), cx);
+                    }) {
+                        log::error!("could not display capture failure: {error:#}");
+                    }
+                });
+            }
+            if failures.changed().await.is_err() {
+                log::debug!("capture failure notification channel closed");
+                break;
+            }
+            pending = failures.borrow_and_update().clone();
+        }
+    })
+    .detach();
+}
+
 /// 订阅会话：待确认捕获出现 → 追加进新建下载表单（必要时打开）；启动时回放快照。
 pub fn install_captures(cx: &mut App) {
+    install_capture_failure_notices(cx);
     cx.set_global(CaptureDispatch::default());
     let mut interruptions = Desktop::global(cx)
         .client
@@ -461,6 +501,7 @@ fn ignore_captures(captures: Vec<PendingCaptureDto>, port: &AgentDownloadsPort, 
             CaptureResolveParams {
                 transaction_id: capture.transaction_id,
                 accepted: false,
+                disable_category_route: true,
                 request: None,
             },
         )));

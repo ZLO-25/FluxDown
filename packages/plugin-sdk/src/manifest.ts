@@ -16,6 +16,7 @@ export const VALID_PERMISSIONS = [
   "background",
   "intercept",
   "pageScripts",
+  "archive",
 ] as const;
 export const VALID_INTERCEPT_STAGES = [
   "prepare",
@@ -31,7 +32,7 @@ export const VALID_INTERCEPT_STAGES = [
 export type PluginPermission = (typeof VALID_PERMISSIONS)[number];
 
 export const VALID_EVENTS = ["onStart", "onError", "onDone", "onMetaProbed", "onCancel"] as const;
-export const VIEW_LOCATIONS = ["activity", "settings", "taskDetail", "window"] as const;
+export const VIEW_LOCATIONS = ["activity", "settings", "taskDetail", "window", "auth"] as const;
 
 export const WINDOW_SIZE_MIN = 240;
 export const WINDOW_SIZE_MAX = 4096;
@@ -61,7 +62,7 @@ export interface ValidateOptions {
   /**
    * Listing-grade checks, stricter than the client: version/minAppVersion must be a plain
    * three-part number, and every resolver/hooks/auth/subscription entry and `icon` must exist
-   * in the package. The client only requires `main`, `desktop` and `sniffRules` files at install.
+   * in the package. The client only requires `main`, `desktop`, `sniffRules` and `archive` files at install.
    */
   strict?: boolean;
 }
@@ -164,6 +165,19 @@ export function isValidNetworkHost(host: unknown): host is string {
   return host.split(".").every((label) => /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(label));
 }
 
+function isPublicHttpsUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || !url.hostname || url.username || url.password || url.hash) return false;
+    const host = url.hostname.toLowerCase();
+    if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return false;
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.startsWith("[") || host.includes(":")) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function unknownKeys(errors: string[], where: string, value: Obj, allowed: readonly string[]) {
   for (const key of Object.keys(value)) {
     if (!allowed.includes(key)) errors.push(`${where}: 未知字段 ${key}`);
@@ -231,7 +245,7 @@ function checkMain(errors: string[], manifest: Obj, files: Files, permissions: u
   const main = manifest.main;
   if (main === undefined || main === null) return;
   if (!isObject(main)) return void errors.push("main 须为对象");
-  unknownKeys(errors, "main", main, ["entry", "events", "background"]);
+  unknownKeys(errors, "main", main, ["entry", "events", "background", "imageHosts"]);
   if (!isSafeRelativePath(main.entry)) {
     errors.push(`main entry 路径 '${String(main.entry)}' 非法`);
   } else {
@@ -251,6 +265,17 @@ function checkMain(errors: string[], manifest: Obj, files: Files, permissions: u
     errors.push("main.background 须为布尔");
   } else if (main.background === true && !hasPermission(permissions, "background")) {
     errors.push("main.background 为 true 时 permissions 必须包含 background");
+  }
+  const imageHosts = main.imageHosts ?? [];
+  if (!Array.isArray(imageHosts)) errors.push("main.imageHosts 须为数组");
+  else {
+    if (imageHosts.length > NETWORK_HOSTS_MAX) errors.push(`main.imageHosts 至多 ${NETWORK_HOSTS_MAX} 项`);
+    const seen = new Set<string>();
+    for (const host of imageHosts) {
+      if (!isValidNetworkHost(host)) errors.push(`main.imageHosts '${String(host)}' 非法`);
+      else if (seen.has(host)) errors.push(`main.imageHosts '${host}' 重复`);
+      else seen.add(host);
+    }
   }
 }
 
@@ -412,7 +437,7 @@ function checkContributes(
   const contributes = manifest.contributes;
   if (contributes === undefined || contributes === null) return;
   if (!isObject(contributes)) return void errors.push("contributes 须为对象");
-  unknownKeys(errors, "contributes", contributes, ["views", "commands", "sniffRules", "pageScripts"]);
+  unknownKeys(errors, "contributes", contributes, ["views", "commands", "sniffRules", "pageScripts", "archive", "archiveRules"]);
   const hasMain = manifest.main !== undefined && manifest.main !== null;
 
   const views = contributes.views ?? [];
@@ -421,6 +446,7 @@ function checkContributes(
     if (views.length > VIEWS_MAX) errors.push(`contributes.views 至多 ${VIEWS_MAX} 项`);
     const seen = new Set<string>();
     let settingsViews = 0;
+    let authViews = 0;
     for (const view of views) {
       if (!isObject(view)) {
         errors.push("view 须为对象");
@@ -440,6 +466,12 @@ function checkContributes(
       }
       if (view.location === "settings" && ++settingsViews > 1) {
         errors.push("location 为 settings 的 view 至多 1 个");
+      }
+      if (view.location === "auth") {
+        if (++authViews > 1) errors.push("location 为 auth 的 view 至多 1 个");
+        if (manifest.auth === undefined || manifest.auth === null) {
+          errors.push("location 为 auth 的 view 要求声明 auth");
+        }
       }
       const hasDesktop = view.desktop !== undefined && view.desktop !== null;
       if (view.portable !== undefined && typeof view.portable !== "boolean") {
@@ -500,6 +532,39 @@ function checkContributes(
       if (!inPackage(files, rules)) errors.push(`包内缺少文件 '${rules}'`);
     }
   }
+  const archive = contributes.archive;
+  if (archive !== undefined && archive !== null) {
+    if (typeof archive !== "string" || !isSafeRelativePath(archive)) {
+      errors.push(`archive 路径 '${String(archive)}' 非法`);
+    } else {
+      if (!hasExtension(archive, [".js"])) errors.push(`archive '${archive}' 扩展名须为 .js`);
+      if (!hasPermission(permissions, "archive")) errors.push("声明 archive 时 permissions 必须包含 archive");
+      if (!inPackage(files, archive)) errors.push(`包内缺少文件 '${archive}'`);
+    }
+  }
+  const archiveRules = contributes.archiveRules;
+  if (archiveRules !== undefined && archiveRules !== null) {
+    if (!isObject(archiveRules)) {
+      errors.push("archiveRules 须为对象");
+    } else {
+      unknownKeys(errors, "archiveRules", archiveRules, ["entry", "publicKey", "updateUrl"]);
+      const entry = archiveRules.entry;
+      if (typeof entry !== "string" || !isSafeRelativePath(entry)) {
+        errors.push(`archiveRules entry 路径 '${String(entry)}' 非法`);
+      } else {
+        if (!hasExtension(entry, [".json"])) errors.push("archiveRules entry 扩展名须为 .json");
+        if (!inPackage(files, entry)) errors.push(`包内缺少文件 '${entry}'`);
+      }
+      if (typeof archiveRules.publicKey !== "string" || !/^[0-9a-fA-F]{64}$/.test(archiveRules.publicKey)) {
+        errors.push("archiveRules publicKey 须为 64 位十六进制 Ed25519 公钥");
+      }
+      if (!hasPermission(permissions, "archive")) errors.push("声明 archiveRules 时 permissions 必须包含 archive");
+      if (archiveRules.updateUrl !== undefined && archiveRules.updateUrl !== null &&
+          (typeof archiveRules.updateUrl !== "string" || !isPublicHttpsUrl(archiveRules.updateUrl))) {
+        errors.push("archiveRules updateUrl 须为无凭据、无片段的公开 HTTPS URL");
+      }
+    }
+  }
 
   checkPageScripts(errors, contributes.pageScripts, files, permissions);
 }
@@ -510,8 +575,9 @@ function checkSetting(errors: string[], field: unknown, seen: Set<string>) {
   const where = `setting '${String(key)}'`;
   unknownKeys(errors, where, field, [
     "key", "title", "description", "type", "widget", "options", "default", "required",
-    "min", "max", "pattern", "helperScript", "helperLabel",
+    "min", "max", "pattern", "helperScript", "helperLabel", "localizations",
   ]);
+  checkSettingLocalizations(errors, field, where);
   if (!nonEmptyString(key)) errors.push("setting key 不可为空");
   else if (seen.has(key)) errors.push(`setting key '${key}' 重复`);
   else seen.add(key);
@@ -597,6 +663,51 @@ function checkSetting(errors: string[], field: unknown, seen: Set<string>) {
   }
 }
 
+const SETTING_LOCALIZATION_FIELDS = ["title", "description", "helperLabel"] as const;
+function checkSettingLocalizations(errors: string[], field: Obj, where: string) {
+  const raw = field.localizations;
+  if (raw === undefined) return;
+  if (!isObject(raw)) return void errors.push(`${where}: localizations 须为对象`);
+  const locales = Object.keys(raw);
+  if (locales.length > 64) errors.push(`${where}: localizations 最多 64 种语言`);
+  const seen = new Set<string>();
+  for (const locale of locales) {
+    const value = raw[locale];
+    if (!/^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/.test(locale)) {
+      errors.push(`${where}: localization locale '${locale}' 非法`);
+    }
+    const normalized = locale.toLowerCase();
+    if (seen.has(normalized)) errors.push(`${where}: localization locale '${locale}' 重复`);
+    seen.add(normalized);
+    if (!isObject(value)) {
+      errors.push(`${where}: localization '${locale}' 须为对象`);
+      continue;
+    }
+    unknownKeys(errors, `${where} localization '${locale}'`, value, [...SETTING_LOCALIZATION_FIELDS, "options"]);
+    for (const key of SETTING_LOCALIZATION_FIELDS) {
+      const text = value[key];
+      if (text !== undefined && text !== null && (typeof text !== "string" || charLength(text) > 4096)) {
+        errors.push(`${where}: localization '${locale}' ${key} 须为 ≤4096 字符的字符串`);
+      }
+    }
+    if (value.helperLabel !== undefined && value.helperLabel !== null && field.helperScript == null) {
+      errors.push(`${where}: localization '${locale}' helperLabel 须与 helperScript 同时出现`);
+    }
+    if (value.options !== undefined) {
+      if (!isObject(value.options)) errors.push(`${where}: localization '${locale}' options 须为对象`);
+      else {
+        const options = Array.isArray(field.options) ? field.options : [];
+        const values = new Set(options.filter(isObject).map((o) => o.value));
+        for (const [option, label] of Object.entries(value.options)) {
+          if (!values.has(option)) errors.push(`${where}: localization '${locale}' 未知 option value '${option}'`);
+          if (typeof label !== "string" || charLength(label) > 4096) {
+            errors.push(`${where}: localization '${locale}' option '${option}' 须为 ≤4096 字符的字符串`);
+          }
+        }
+      }
+    }
+  }
+}
 function utf8Length(s: string): number {
   let n = 0;
   for (const ch of s) {
@@ -776,23 +887,36 @@ export function validateManifest(
 export function riskOf(manifest: { permissions?: readonly string[] | null }): PluginRisk {
   const permissions = manifest.permissions ?? [];
   if (permissions.includes("desktop") || permissions.includes("pageScripts")) return "full";
-  const elevated = ["ffmpeg", "ytdlp", "auth", "tasks", "browserRules", "background", "intercept"];
+  const elevated = ["ffmpeg", "ytdlp", "auth", "tasks", "browserRules", "background", "intercept", "archive"];
   return permissions.some((p) => elevated.includes(p)) ? "elevated" : "standard";
 }
 
-/** Sorted, de-duplicated union of every view's `desktop.networkHosts`. */
+/** Sorted, de-duplicated union of main image, desktop and archive rule update URL hosts. */
 export function networkHostsOf(manifest: {
-  contributes?: { views?: readonly { desktop?: { networkHosts?: readonly string[] | null } | null }[] | null } | null;
+  main?: { imageHosts?: readonly string[] | null } | null;
+  contributes?: {
+    views?: readonly { desktop?: { networkHosts?: readonly string[] | null } | null }[] | null;
+    archiveRules?: { updateUrl?: string | null } | null;
+  } | null;
 }): string[] {
   const hosts = new Set<string>();
+  for (const host of manifest.main?.imageHosts ?? []) hosts.add(host);
   for (const view of manifest.contributes?.views ?? []) {
     for (const host of view.desktop?.networkHosts ?? []) hosts.add(host);
+  }
+  const updateUrl = manifest.contributes?.archiveRules?.updateUrl;
+  if (updateUrl) {
+    try {
+      hosts.add(new URL(updateUrl).hostname);
+    } catch {
+      // Invalid declarations are rejected by manifest validation.
+    }
   }
   // Rust sorts `String`s bytewise; hostnames are ASCII, so code-unit order is identical.
   return [...hosts].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
-/** Files that must exist at install: `main.entry`, each `desktop.entry`, each view `icon`, `sniffRules`, every pageScript `js`. */
+/** Files that must exist at install: `main.entry`, contributions and every pageScript `js`. */
 export function packageFilesOf(manifest: Obj): string[] {
   const files: string[] = [];
   const main = manifest.main;
@@ -816,6 +940,10 @@ export function packageFilesOf(manifest: Obj): string[] {
           for (const file of script.js) if (typeof file === "string") files.push(file);
         }
       }
+    }
+    if (typeof contributes.archive === "string") files.push(contributes.archive);
+    if (isObject(contributes.archiveRules) && typeof contributes.archiveRules.entry === "string") {
+      files.push(contributes.archiveRules.entry);
     }
   }
   return files;
@@ -843,6 +971,66 @@ export function validateSniffPack(content: string | Uint8Array): ValidationResul
     errors.push("sniffRules rules 须为数组");
   } else if (pack.rules.length > SNIFF_PACK_MAX_RULES) {
     errors.push(`sniffRules 至多 ${SNIFF_PACK_MAX_RULES} 条规则`);
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+const ARCHIVE_RULES_MAX_BYTES = 512 * 1024;
+export function validateArchiveRulesPack(content: string | Uint8Array): ValidationResult {
+  const errors: string[] = [];
+  const size = typeof content === "string" ? utf8Length(content) : content.byteLength;
+  if (size > ARCHIVE_RULES_MAX_BYTES) return { ok: false, errors: [`archiveRules 文件超过 ${ARCHIVE_RULES_MAX_BYTES} 字节`] };
+  let envelope: unknown;
+  try {
+    envelope = JSON.parse(typeof content === "string" ? content : new TextDecoder("utf-8", { fatal: true }).decode(content));
+  } catch (err) {
+    return { ok: false, errors: [`archiveRules JSON 解析失败: ${(err as Error).message}`] };
+  }
+  if (!isObject(envelope) || Object.keys(envelope).sort().join(",") !== "payload,signature" ||
+      typeof envelope.payload !== "string" || typeof envelope.signature !== "string" ||
+      !/^[0-9a-fA-F]{128}$/.test(envelope.signature)) {
+    return { ok: false, errors: ["archiveRules 须为包含 payload 与 128 位十六进制 signature 的 JSON envelope"] };
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(envelope.payload);
+  } catch (err) {
+    return { ok: false, errors: [`archiveRules payload JSON 解析失败: ${(err as Error).message}`] };
+  }
+  if (!isObject(payload)) return { ok: false, errors: ["archiveRules payload 须为对象"] };
+  unknownKeys(errors, "archiveRules payload", payload, ["format", "schemaVersion", "sequence", "rules"]);
+  if (payload.format !== "fluxdown-archive-rules" || payload.schemaVersion !== 1 ||
+      !Number.isSafeInteger(payload.sequence) || (payload.sequence as number) < 1 ||
+      !Array.isArray(payload.rules) || payload.rules.length < 1 || payload.rules.length > 500) {
+    errors.push("archiveRules payload 格式、schemaVersion、sequence 或 rules 无效");
+  } else {
+    const seen = new Set<string>();
+    for (const rule of payload.rules) {
+      if (!isObject(rule)) { errors.push("archiveRules rule 须为对象"); continue; }
+      unknownKeys(errors, "archiveRules rule", rule, ["id", "folderName", "match"]);
+      if (typeof rule.id !== "string" || !/^[a-z0-9_-]{1,64}$/.test(rule.id) || seen.has(rule.id)) errors.push("archiveRules rule id 无效或重复");
+      if (typeof rule.id === "string") seen.add(rule.id);
+      if (typeof rule.folderName !== "string" || rule.folderName.length < 1 || utf8Length(rule.folderName) > 180 ||
+          /[\/\\:\u0000-\u001f\u007f]/.test(rule.folderName) || rule.folderName === "." || rule.folderName === "..") {
+        errors.push("archiveRules folderName 非法");
+      }
+      if (!isObject(rule.match)) { errors.push("archiveRules match 须为对象"); continue; }
+      const matcher = rule.match;
+      unknownKeys(errors, "archiveRules match", matcher, ["fileName", "extensions", "metadata", "headerHex"]);
+      if (Object.keys(matcher).length === 0) errors.push("archiveRules match 至少需要一个条件");
+      if (matcher.fileName !== undefined && (typeof matcher.fileName !== "string" || !/^[\x00-\x7f]{1,256}$/.test(matcher.fileName))) errors.push("archiveRules fileName glob 无效");
+      if (matcher.extensions !== undefined && (!Array.isArray(matcher.extensions) || matcher.extensions.length < 1 || matcher.extensions.length > 64 ||
+          matcher.extensions.some((ext) => typeof ext !== "string" || !/^[a-zA-Z0-9]{1,32}$/.test(ext)))) errors.push("archiveRules extensions 无效");
+      if (matcher.headerHex !== undefined && (typeof matcher.headerHex !== "string" || !/^(?:[0-9a-fA-F]{2}){1,4096}$/.test(matcher.headerHex))) errors.push("archiveRules headerHex 无效");
+      if (matcher.metadata !== undefined) {
+        const allowed = ["platform", "mediaKind", "creatorId", "creatorName", "seriesId", "seriesTitle", "collectionId", "collectionTitle"];
+        if (!isObject(matcher.metadata)) errors.push("archiveRules metadata 须为对象");
+        else {
+          unknownKeys(errors, "archiveRules metadata", matcher.metadata, allowed);
+          if (Object.keys(matcher.metadata).length === 0 || Object.values(matcher.metadata).some((v) => typeof v !== "string" || v.length === 0 || utf8Length(v) > 256)) errors.push("archiveRules metadata predicates 无效");
+        }
+      }
+    }
   }
   return { ok: errors.length === 0, errors };
 }
@@ -945,6 +1133,10 @@ export function validatePackage(manifest: unknown, files: PackageFiles): Validat
   // A missing or illegal path is already reported by validateManifest; only present files are read.
   const rules = typeof contributes.sniffRules === "string" ? read(contributes.sniffRules) : undefined;
   if (rules !== undefined) errors.push(...validateSniffPack(rules).errors);
+  const archiveRules = isObject(contributes.archiveRules) && typeof contributes.archiveRules.entry === "string"
+    ? read(contributes.archiveRules.entry)
+    : undefined;
+  if (archiveRules !== undefined) errors.push(...validateArchiveRulesPack(archiveRules).errors);
   for (const view of Array.isArray(contributes.views) ? contributes.views : []) {
     const icon = isObject(view) && typeof view.icon === "string" ? read(view.icon) : undefined;
     if (icon !== undefined) errors.push(...validateViewIcon(String((view as Obj).id), icon).errors);
@@ -961,6 +1153,8 @@ export function validatePackage(manifest: unknown, files: PackageFiles): Validat
 export interface PackageReview {
   permissions: string[];
   risk: PluginRisk;
+  /** Archive handler entry point needing reviewer awareness. */
+  archiveEntry: string | null;
   /** Hosts desktop scripts may reach (`networkHostsOf`). */
   networkHosts: string[];
   /** URL globs whose downloads the plugin handles: resolver, hooks and interceptors `match.urls`. */
@@ -982,6 +1176,7 @@ export function reviewOf(manifest: Obj): PackageReview {
   return {
     permissions: stringArray(manifest.permissions) ? [...manifest.permissions] : [],
     risk: riskOf(manifest as { permissions?: string[] }),
+    archiveEntry: typeof contributes.archive === "string" ? contributes.archive : null,
     networkHosts: networkHostsOf(manifest as Parameters<typeof networkHostsOf>[0]),
     downloadUrls: sortedUnique([...resolvers.flatMap(matchUrls), ...matchUrls(manifest.hooks), ...matchUrls(manifest.interceptors)]),
     pageScriptMatches: sortedUnique(pageScripts.flatMap((s) => (isObject(s) && stringArray(s.matches) ? s.matches : []))),

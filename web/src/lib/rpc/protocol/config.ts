@@ -15,6 +15,20 @@ export interface DaemonConfigPatch {
   values: Record<string, string>;
 }
 
+/** aria2-style supported-options editor preview / export contract. */
+export interface Aria2OptionsRequest {
+  text?: string;
+}
+
+export interface Aria2OptionsResponse {
+  text: string;
+  defaults: string;
+  values: Record<string, string>;
+  revision: number;
+  /** Validation diagnostics remain result data so gateways preserve line/key details. */
+  error?: string;
+}
+
 /** daemon 运行状态投影。 */
 export interface DaemonRuntimeStatsDto {
   activeTasks: number;
@@ -25,6 +39,8 @@ export interface DaemonRuntimeStatsDto {
   saveDir: string;
   /** 「等待自动重试」的任务数（自动重试 / 备用链路 / 插件重试已排程、尚未重新派发）；旧 daemon 不返回。 */
   retryPendingTasks?: number;
+  /** Local verification/finalization jobs; missing or null is unknown, not safe zero. */
+  localWorkCount?: number | null;
 }
 
 export interface ProxyTestRequest {
@@ -39,6 +55,35 @@ export interface ProxyTestRequest {
 
 export interface ProxyTestResponse {
   latencyMs: number;
+}
+
+/** `daemon.config.proxyRoute` 参数：`rules` 缺省 = 用已保存的规则；`url` 为空只做校验。 */
+export interface ProxyRouteRequest {
+  url?: string;
+  rules?: string;
+}
+
+export interface ProxyRuleIssue {
+  /** 规则在数组中的下标（从 0 起）。 */
+  index: number;
+  /** `''` / `id` / `name` / `match` / `pattern` / `action` / `proxy`。 */
+  field: string;
+  code: string;
+  detail: string;
+}
+
+export interface ProxyRouteMatch {
+  index: number;
+  id: string;
+  name: string;
+}
+
+export interface ProxyRouteResponse {
+  issues: ProxyRuleIssue[];
+  matched?: ProxyRouteMatch | null;
+  /** `''` = 未给出 url。 */
+  reason: string;
+  endpoint: string;
 }
 
 /** `daemon.link.probe` 参数：只读 HEAD 探测下载链接。 */
@@ -128,14 +173,36 @@ export interface Ed2kServerSubRefreshResponse {
   error: string;
 }
 
+/** Kad 节点（nodes.dat）订阅刷新结果。 */
+export interface Ed2kNodesSubRefreshResponse {
+  success: boolean;
+  nodeCount: number;
+  okSources: number;
+  totalSources: number;
+  updatedAt: number;
+  error: string;
+}
+
 // ── 配置键目录（镜像 daemon_config.rs 的 DAEMON_CONFIG_FIELDS）──
 
 export const BT_SEED_TIME_UNITS = ['minutes', 'hours', 'days'] as const;
 export const FILE_EXISTS_BEHAVIORS = ['rename', 'overwrite', 'skip', 'ask'] as const;
 export const FILE_MISSING_ACTIONS = ['keep', 'delete'] as const;
+/** 文件哈希算法（`hash_algorithm`、`daemon.task.hash`、任务 `fileHash` 的 `algo`）。 */
+export const HASH_ALGORITHMS = ['md5', 'sha1', 'sha256', 'sha512'] as const;
 export const BT_SEED_LIMIT_OPERATORS = ['or', 'and'] as const;
 export const BT_SEED_THEN_ACTIONS = ['stop', 'delete', 'delete_files'] as const;
 export const BT_MSE_MODES = ['disabled', 'enabled', 'forced'] as const;
+/** 新建 BT 任务的默认选片方式：最稀有优先 / 按顺序下载。 */
+export const BT_PIECE_ORDERS = ['rarest', 'sequential'] as const;
+/** uTP 拥塞控制：LEDBAT（让路给其他流量）/ CUBIC（只按丢包退让）。 */
+export const BT_UTP_CONGESTIONS = ['ledbat', 'cubic'] as const;
+/** BT 代理来源：「代理」页的手动代理服务器 / 系统代理（建 BT 会话时检测）。 */
+export const BT_PROXY_SOURCES = ['manual', 'system'] as const;
+/** 防吸血规则 / 云名单模式。 */
+export const BT_GUARD_MODES = ['off', 'observe', 'enforce'] as const;
+/** 防吸血：下载中任务的动作上限。 */
+export const BT_GUARD_DOWNLOADING_ACTIONS = ['observe', 'throttle', 'choke', 'ban'] as const;
 export const PROXY_MODES = ['none', 'system', 'manual', 'auto'] as const;
 export const PROXY_TYPES = ['http', 'https', 'socks4', 'socks5'] as const;
 
@@ -201,6 +268,8 @@ export const DAEMON_CONFIG_FIELDS: readonly DaemonConfigField[] = [
   oneOf('file_missing_action', 'keep', FILE_MISSING_ACTIONS),
   int('completed_record_retention_days', '0', 0, 3650),
   bool('idle_file_scan', 'false'),
+  bool('hash_after_download', 'false'),
+  oneOf('hash_algorithm', 'sha256', HASH_ALGORITHMS),
   text('global_user_agent'),
   text('default_queue_id'),
   readOnly('domain_conn_caps'),
@@ -212,7 +281,26 @@ export const DAEMON_CONFIG_FIELDS: readonly DaemonConfigField[] = [
   int('bt_port_start', '6881', 1, 65_535),
   int('bt_port_end', '6891', 1, 65_535),
   oneOf('bt_mse_mode', 'enabled', BT_MSE_MODES),
+  int('bt_upload_slots', '0', 0, 512),
+  // BT 连接（设备本地：不进云同步）
+  bool('bt_enable_lsd', 'true'),
+  oneOf('bt_utp_congestion', 'ledbat', BT_UTP_CONGESTIONS),
+  int('bt_max_connections', '0', 0, 65_535),
+  int('bt_max_connections_per_torrent', '512', 1, 4096),
+  bool('bt_enable_webseed', 'true'),
+  bool('bt_announce_all_tiers', 'true'),
+  bool('bt_announce_all_trackers', 'true'),
+  bool('bt_proxy_enabled', 'false'),
+  oneOf('bt_proxy_source', 'manual', BT_PROXY_SOURCES),
+  bool('bt_proxy_peers', 'true'),
+  bool('bt_i2p_enabled', 'false'),
+  text('bt_i2p_sam_host', '127.0.0.1'),
+  int('bt_i2p_sam_port', '7656', 1, 65_535),
+  bool('bt_i2p_mixed', 'false'),
   text('bt_custom_trackers'),
+  oneOf('bt_piece_order', 'rarest', BT_PIECE_ORDERS),
+  bool('bt_first_last_pieces_first', 'false'),
+  bool('bt_selection_auto_default', 'true'),
   bool('bt_tracker_sub_enabled', 'true'),
   text('bt_tracker_sub_urls'),
   readOnly('bt_tracker_sub_cache'),
@@ -228,6 +316,29 @@ export const DAEMON_CONFIG_FIELDS: readonly DaemonConfigField[] = [
   oneOf('bt_seed_inactive_time_limit_unit', 'minutes', BT_SEED_TIME_UNITS),
   oneOf('bt_seed_limit_operator', 'or', BT_SEED_LIMIT_OPERATORS),
   oneOf('bt_seed_then_action', 'stop', BT_SEED_THEN_ACTIONS),
+  // BT 防吸血（热更新）
+  bool('bt_guard_enabled', 'true'),
+  oneOf('bt_guard_rule_excessive', 'observe', BT_GUARD_MODES),
+  oneOf('bt_guard_rule_rerequest', 'observe', BT_GUARD_MODES),
+  oneOf('bt_guard_rule_rewind', 'observe', BT_GUARD_MODES),
+  oneOf('bt_guard_rule_lag', 'observe', BT_GUARD_MODES),
+  oneOf('bt_guard_rule_fingerprint', 'enforce', BT_GUARD_MODES),
+  oneOf('bt_guard_cloud_mode', 'observe', BT_GUARD_MODES),
+  int('bt_guard_excess_ratio_pct', '200', 110, 2000),
+  int('bt_guard_min_torrent_mib', '64', 0, 1_048_576),
+  int('bt_guard_rewind_tolerance_pct', '7', 0, 100),
+  int('bt_guard_throttle_kib', '32', 1, 1_048_576),
+  int('bt_guard_ban_base_hours', '24', 1, 720),
+  int('bt_guard_ban_max_days', '30', 1, 365),
+  oneOf('bt_guard_downloading_max_action', 'throttle', BT_GUARD_DOWNLOADING_ACTIONS),
+  bool('bt_guard_skip_private', 'true'),
+  bool('bt_guard_skip_lan', 'true'),
+  int('bt_guard_ipv6_prefix', '64', 48, 128),
+  text('bt_guard_filter_urls'),
+  text('bt_guard_client_rules'),
+  bool('bt_guard_cloud_enabled', 'true'),
+  // 设备本地：不进云同步
+  bool('bt_guard_report_enabled', 'false'),
   // ED2K
   bool('ed2k_enable_kad', 'true'),
   bool('ed2k_enable_upnp', 'true'),
@@ -237,7 +348,10 @@ export const DAEMON_CONFIG_FIELDS: readonly DaemonConfigField[] = [
   text('ed2k_server_sub_urls'),
   readOnly('ed2k_server_sub_cache'),
   readOnly('ed2k_server_sub_updated_at', '0'),
+  // 设备本地：每行一个 nodes.dat 地址，不进云同步
   text('ed2k_nodes_dat_url'),
+  readOnly('ed2k_nodes_dat_count', '0'),
+  readOnly('ed2k_nodes_dat_updated_at', '0'),
   // 代理
   oneOf('proxy_mode', 'none', PROXY_MODES),
   oneOf('proxy_type', 'http', PROXY_TYPES),
@@ -246,12 +360,13 @@ export const DAEMON_CONFIG_FIELDS: readonly DaemonConfigField[] = [
   text('proxy_username'),
   text('proxy_password'),
   text('proxy_no_list'),
+  text('proxy_rules'),
   // Webhook：JSON 数组字符串（端点列表）
   text('webhook.endpoints'),
   // 受管组件手动路径（空 = 自动解析）
   text('component.ffmpeg.path'),
   text('component.ytdlp.path'),
-  // 组件下载镜像基址（空 = 直连 GitHub）；只接受 https
+  // 组件下载与插件市场（索引 / 插件包）的 GitHub 镜像基址（空 = 直连 GitHub）；只接受 https
   text('component_mirror_base'),
   // 日志目录总大小上限（MB）
   int('log_max_size_mb', '10', 1, 1024),

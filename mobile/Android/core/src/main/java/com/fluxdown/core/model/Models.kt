@@ -65,6 +65,16 @@ data class Task(
     val seedingStatus: SeedingStatus = SeedingStatus.None,
     val seedingMessage: String = "",
     val seedingTimeSecs: Long = 0,
+    /** BT 选片：按顺序下载。缺省 / 旧快照为 false。 */
+    val btSequential: Boolean = false,
+    /** BT 选片：先下载首尾文件块。缺省 / 旧快照为 false。 */
+    val btFirstLastPiecesFirst: Boolean = false,
+    /** 任务级 BT 下载限速（字节/秒，0 = 不限）。缺省 / 旧快照为 0。 */
+    val btDownloadLimitBps: Long = 0,
+    /** 任务级上传限速（字节/秒，0 = 不限；与做种上传限速同一个值）。缺省 / 旧快照为 0。 */
+    val seedUploadLimitBps: Long = 0,
+    /** 超级做种：完成（做种）后才实际生效。缺省 / 旧快照为 false。 */
+    val btSuperSeeding: Boolean = false,
 ) {
     /** 复制链接：读 originUrl，空则回退 url（torrent 任务的 url 是哨兵）。 */
     val shareUrl: String get() = originUrl.ifEmpty { url }
@@ -176,18 +186,26 @@ data class RuntimeStats(
     val retryPendingTasks: Int = 0,
 )
 
-/** 引擎发起的选择请求（X1–X3），到期按 [defaultChoice] 处理。 */
+/** 引擎发起的选择请求（X1–X3），到期按 [defaultChoice] 处理；[NO_DEADLINE] = 不自动处理。 */
 data class SelectionRequest(
     val requestId: String,
     val taskId: String,
     val kind: SelectionKind,
     val defaultChoice: SelectionOutcome,
     val deadlineUnixMs: Long,
-)
+) {
+    /** 有自动按默认项处理的截止时刻（否则不显示倒计时、不自动答复）。 */
+    val hasDeadline: Boolean get() = deadlineUnixMs != NO_DEADLINE
+
+    companion object {
+        /** 「无截止」（protocol `SELECTION_NO_DEADLINE` = i64::MAX）：用户关闭了 BT 选择的自动选择默认项。 */
+        const val NO_DEADLINE: Long = Long.MAX_VALUE
+    }
+}
 
 sealed interface SelectionKind {
     data class Hls(val options: List<HlsOption>) : SelectionKind
-    data class Bt(val files: List<BtFile>) : SelectionKind
+    data class Bt(val files: List<BtFile>, val saveDir: String = "") : SelectionKind
     data class Variant(val options: List<VariantOption>) : SelectionKind
     /** 多个启用插件的解析器都匹配同一 URL：让用户选一个（`candidates` 按 identity 升序）。 */
     data class Plugin(val site: String, val url: String, val candidates: List<PluginCandidate>) : SelectionKind
@@ -225,12 +243,24 @@ data class VariantOption(
 
 sealed interface SelectionOutcome {
     data class Hls(val index: Int) : SelectionOutcome
-    data class Bt(val indices: List<Int>) : SelectionOutcome
+    /** [customName]：改名（单文件 = 文件名，多文件 = 外层目录名）；null = 不改，由引擎清洗。 */
+    data class Bt(val indices: List<Int>, val saveDir: String? = null, val customName: String? = null) : SelectionOutcome
     data class Variant(val index: Int) : SelectionOutcome
     data class Plugin(val identity: String, val remember: Boolean) : SelectionOutcome
     data class FileExists(val action: FileExistsAction) : SelectionOutcome
     data object Cancelled : SelectionOutcome
 }
+
+/**
+ * BT 选择「名称」输入的答复值（对齐 GPUI `bt_name_outcome`）：去空白后为空或与预填名相同 → null（不改名），否则为去空白后的新名。
+ */
+fun btNameOutcome(initial: String, input: String): String? {
+    val name = input.trim()
+    return name.takeIf { it.isNotEmpty() && it != initial.trim() }
+}
+
+/** 选择 Sheet 的「取消」是否删除任务（含文件）：BT 取消 = 不要这个种子；其余类型答复 Cancelled（任务保持暂停）。 */
+val SelectionKind.cancelDeletesTask: Boolean get() = this is SelectionKind.Bt
 
 /** `ServiceHello` 的 UI 相关子集。 */
 data class HostInfo(

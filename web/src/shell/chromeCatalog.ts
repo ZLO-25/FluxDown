@@ -1,5 +1,5 @@
 // Web 外壳条目目录：id / 默认区域 / 可放置的区域族。
-// 默认区域复现改造前的布局（顺序即目录顺序）；文本类条目（速度 / 剩余空间）放不进 48px 活动栏。
+// 默认区域与 GPUI 目录一致（顺序即目录顺序）；文本类条目（速度 / 剩余空间）放不进 48px 活动栏。
 // id 与 GPUI 共用（GPUI 另有 `shutdown`，Web 没有）。
 // `fixed` 条目（下载 / 设置）可移动但不能隐藏，保证主入口始终可达；插件条目可隐藏。
 
@@ -13,12 +13,16 @@ export const CHROME_CATALOG: readonly ChromeItemSpec[] = [
   { id: 'settings', defaultZone: 'railBottom', families: ['rail', 'title', 'status'], fixed: true },
   { id: 'downloadSpeed', defaultZone: 'statusLeading', families: ['title', 'status'] },
   { id: 'uploadSpeed', defaultZone: 'statusLeading', families: ['title', 'status'] },
-  { id: 'pauseAll', defaultZone: 'statusLeading', families: ['rail', 'title', 'status'] },
-  { id: 'resumeAll', defaultZone: 'statusLeading', families: ['rail', 'title', 'status'] },
+  { id: 'pauseAll', defaultZone: 'titleLeading', families: ['rail', 'title', 'status'] },
+  { id: 'resumeAll', defaultZone: 'titleLeading', families: ['rail', 'title', 'status'] },
+  { id: 'retryFailed', defaultZone: 'titleLeading', families: ['rail', 'title', 'status'] },
   { id: 'downloadLimit', defaultZone: 'statusTrailing', families: ['rail', 'title', 'status'] },
   { id: 'uploadLimit', defaultZone: 'statusTrailing', families: ['rail', 'title', 'status'] },
   { id: 'proxy', defaultZone: 'statusTrailing', families: ['rail', 'title', 'status'] },
-  { id: 'diskFree', defaultZone: 'statusTrailing', families: ['title', 'status'] },
+  // 剩余空间默认隐藏（状态栏右侧留给版本条目），可在自定义布局里显示。
+  { id: 'diskFree', defaultZone: 'statusTrailing', families: ['title', 'status'], defaultHidden: true },
+  // 版本号（有更新时兼作更新入口）：默认状态栏最右；文字条目，放不进活动栏。
+  { id: 'appVersion', defaultZone: 'statusTrailing', families: ['title', 'status'] },
 ]
 
 /** 小部件条目的文案键（路由 / 账户条目沿用 `ACTIVITY_ENTRIES` 的 `labelKey`）；编辑态拖动手柄的名称提示用。 */
@@ -27,10 +31,12 @@ export const WIDGET_LABEL_KEY: Readonly<Record<string, string>> = {
   uploadSpeed: 'chromeWidgetUploadSpeed',
   pauseAll: 'pauseAll',
   resumeAll: 'resumeAll',
+  retryFailed: 'retryFailed',
   downloadLimit: 'speedLimitTitle',
   uploadLimit: 'uploadLimit',
   proxy: 'statusBarProxyLabel',
   diskFree: 'chromeWidgetDiskFree',
+  appVersion: 'chromeWidgetVersion',
 }
 
 // ── 动态条目（插件活动页）：与 GPUI `ShellView::set_dynamic_routes` 同 id（`plugin:<identity>:<viewId>`）、同默认位置（railTop）──

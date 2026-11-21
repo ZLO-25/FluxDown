@@ -40,10 +40,40 @@ class NewDownloadStateCategoryTest {
         form.syncAuto()
         assertEquals("/dl/Video", form.saveDir)
 
-        form.saveDir = "/custom"
+        form.setSaveDirManually("/custom")
         form.rename = "setup.exe"
         form.syncAuto()
         assertEquals("/custom", form.saveDir)
+        assertNull(requestOffered(form))
+    }
+
+    @Test fun manuallyChoosingDefaultOrCategoryDirectoryDisablesRoutingUntilAutoSelected() {
+        val form = form("https://x.test/a.exe")
+
+        form.setSaveDirManually("/dl")
+        form.rename = "setup.exe"
+        form.syncAuto()
+        assertEquals("/dl", form.saveDir)
+        assertNull(requestOffered(form))
+
+        form.setSaveDirManually("/dl/Video")
+        form.rename = "movie.mp4"
+        form.syncAuto()
+        assertEquals("/dl/Video", form.saveDir)
+        assertNull(requestOffered(form))
+
+        form.selectMode(SaveDirMode.Auto)
+        assertEquals("/dl/Programs", form.saveDir)
+        assertEquals("/dl", requestOffered(form))
+    }
+
+    @Test fun manuallyChosenOrdinaryDirectoryDoesNotFollowLaterRename() {
+        val form = form("https://x.test/a.exe")
+        form.setSaveDirManually("/custom")
+        form.rename = "movie.mp4"
+        form.syncAuto()
+        assertEquals("/custom", form.saveDir)
+        assertNull(requestOffered(form))
     }
 
     @Test fun unmatchedNameFallsBackToOffered() {
@@ -73,5 +103,62 @@ class NewDownloadStateCategoryTest {
         form.selectMode(SaveDirMode.Auto)
         assertEquals("/dl/Programs", form.saveDir)
         assertEquals("/dl", requestOffered(form))
+    }
+
+    @Test fun manualEditBackToOfferedIsNotOverwrittenAndDoesNotRoute() {
+        val form = form("https://x.test/a.exe")
+        assertEquals("/dl/Programs", form.saveDir)
+        assertEquals("/dl", requestOffered(form))
+
+        // 用户把目录改回默认目录：手改优先，预测输入变化不覆盖，提交不路由
+        form.setSaveDirManually("/dl")
+        form.rename = "movie.mp4"
+        form.syncAuto()
+        assertEquals("/dl", form.saveDir)
+        assertNull(requestOffered(form))
+        assertEquals(true, form.isDirty)
+
+        // 改成另一个分类目录同样视为手改
+        form.setSaveDirManually("/dl/Video")
+        form.rename = "setup.exe"
+        form.syncAuto()
+        assertEquals("/dl/Video", form.saveDir)
+        assertNull(requestOffered(form))
+    }
+    @Test fun noPickerOptionsKeepDefaultDirectoryRoutingAuthorized() {
+        val form = NewDownloadState(
+            prefill = "https://x.test/a.exe",
+            defaultSaveDir = "/dl",
+            offeredSaveDir = "/dl",
+            defaultQueueId = "",
+            defaultSegments = 0,
+            categories = emptyList(),
+        )
+
+        assertEquals(emptyList<CustomCategoryDto>(), form.categoryOptions)
+        assertEquals("/dl", requestOffered(form))
+    }
+
+    @Test fun rememberedModeRestoresDirectoryAndInvalidCategoryFallsBackToAuto() {
+        val category = form("https://x.test/movie.mp4").let {
+            NewDownloadState(
+                prefill = "https://x.test/movie.mp4", defaultSaveDir = "/dl", offeredSaveDir = "/dl",
+                defaultQueueId = "", defaultSegments = 0, categories = categories,
+                rememberedMode = "category:builtin_video",
+            )
+        }
+        assertEquals(SaveDirMode.Category("builtin_video"), category.mode)
+        assertEquals("/dl/Video", category.saveDir)
+        assertNull(requestOffered(category))
+        assertEquals("category:builtin_video", category.rememberedMode())
+
+        val none = NewDownloadState(
+            prefill = "", defaultSaveDir = "/dl", offeredSaveDir = "/dl",
+            defaultQueueId = "", defaultSegments = 0, categories = categories, rememberedMode = "none",
+        )
+        assertEquals(SaveDirMode.None, none.mode)
+        assertEquals("/dl", none.saveDir)
+        assertEquals(SaveDirMode.Auto, NewDownloadState.restoreMode("category:gone", categories))
+        assertEquals(SaveDirMode.Auto, NewDownloadState.restoreMode("invalid", categories))
     }
 }

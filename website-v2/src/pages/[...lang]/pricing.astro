@@ -4,6 +4,7 @@ import Layout from "@/layouts/Layout.astro";
 import PageHeader from "@/components/site/PageHeader.astro";
 import PricingPlans from "@/components/pricing/PricingPlans";
 import CompareTable from "@/components/pricing/CompareTable.astro";
+import CloudPromoBanner from "@/components/site/CloudPromoBanner.astro";
 import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
 import { pricing } from "@/i18n/messages/pricing";
 import { SAME_AS } from "@/lib/seo";
@@ -15,6 +16,7 @@ const serif = (s: string) => s.replace(/<em>(.*?)<\/em>/g, '<span class="serif">
 ---
 
 <Layout lang={lang} title={t.meta.title} description={t.meta.description}>
+  <CloudPromoBanner lang={lang} variant="pricing" />
   <PageHeader eyebrow={t.hero.eyebrow} title={t.hero.title} lede={t.hero.lede}>
     <a class="btn btn-secondary" href={href("/pricing/why", lang)}>
       {t.hero.why}
@@ -32,7 +34,7 @@ const serif = (s: string) => s.replace(/<em>(.*?)<\/em>/g, '<span class="serif">
   </section>
 
   <section class="frame" aria-labelledby="compare-heading">
-    <div class="section grid gap-10 lg:grid-cols-[minmax(0,4fr)_minmax(0,7fr)] lg:gap-14">
+    <div class="section grid grid-cols-1 gap-10 lg:grid-cols-[minmax(0,4fr)_minmax(0,7fr)] lg:gap-14">
       <div class="flex flex-col gap-5 lg:sticky lg:top-[calc(var(--header-h)+32px)] lg:self-start">
         <span class="eyebrow" data-scramble>{t.compare.eyebrow}</span>
         <h2 id="compare-heading" class="h2 text-[clamp(1.8rem,3.2vw,2.6rem)]" data-reveal set:html={serif(t.compare.title)} />
@@ -65,6 +67,10 @@ const serif = (s: string) => s.replace(/<em>(.*?)<\/em>/g, '<span class="serif">
           ))
         }
       </dl>
+      <p class="mt-6 text-sm leading-relaxed text-muted">
+        {t.notes.refund}
+        <a class="link" href={`${href("/terms", lang)}#refunds`}>{t.notes.refundLink}</a>
+      </p>
     </div>
     <div class="rule"></div>
   </section>

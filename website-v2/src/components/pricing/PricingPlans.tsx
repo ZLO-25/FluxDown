@@ -3,11 +3,12 @@ import { ArrowRight, Check, Zap } from "lucide-react";
 import type { Lang } from "@/i18n/config";
 import { pricing } from "@/i18n/messages/pricing";
 import { BrandIcon } from "@/components/icons/brand";
-import { formatDate, formatMinor } from "@/components/pay/money";
+import { formatMinor } from "@/components/pay/money";
 import { PlanBadge, PlanRibbon } from "./PlanBadge";
 import WebPurchase from "./WebPurchase";
 import type { CloudPlan } from "./types";
 import { withBase } from "@/lib/base";
+import { cloudPromoCopy, isCloudPromoActive } from "@/lib/cloud-promo";
 
 interface Props {
   lang: Lang;
@@ -25,6 +26,11 @@ function lgCols(total: number): number {
 }
 
 const LG_GRID: Record<number, string> = { 2: "lg:grid-cols-2", 3: "lg:grid-cols-3", 4: "lg:grid-cols-4" };
+
+/** Periodic membership card: a membership with a positive billing period (missing / null = permanent). */
+function isCard(plan: CloudPlan): boolean {
+  return typeof plan.billingPeriodDays === "number" && plan.billingPeriodDays > 0;
+}
 
 /**
  * Plan columns: the always-free desktop app first, then the live FluxCloud catalog.
@@ -57,8 +63,9 @@ export default function PricingPlans({ lang, downloadHref, sourceHref }: Props) 
   if (catalog.state === "loading") {
     cells.push(<SkeletonCell key="s1" label={t.loading} />, <SkeletonCell key="s2" label={t.loading} />);
   } else if (catalog.state === "ready") {
-    for (const plan of catalog.plans) cells.push(<CloudPlanCell key={plan.code} plan={plan} lang={lang} />);
+    for (const plan of catalog.plans.filter((p) => !isCard(p))) cells.push(<CloudPlanCell key={plan.code} plan={plan} lang={lang} />);
   } else {
+    const promoOn = isCloudPromoActive();
     cells.push(
       <PlanShell key="fb-free" tag={t.cloudTag} name={t.fallback.freeName} price={t.free} desc={t.fallback.freeDesc} />,
       <PlanShell
@@ -67,6 +74,7 @@ export default function PricingPlans({ lang, downloadHref, sourceHref }: Props) 
         name={t.fallback.lifetimeName}
         price={t.tbd}
         period={t.oneTime}
+        note={promoOn ? cloudPromoCopy[lang].badge : undefined}
         desc={t.fallback.lifetimeDesc}
         features={t.fallback.lifetimeFeatures}
         featured
@@ -79,7 +87,11 @@ export default function PricingPlans({ lang, downloadHref, sourceHref }: Props) 
   const mdFill = total % 2;
   const lgFill = (cols - (total % cols)) % cols;
 
+  const cards = catalog.state === "ready" ? catalog.plans.filter(isCard) : [];
+  const cardT = pricing[lang].cards;
+
   return (
+    <>
     <div className="fig">
       <div className="fig-bar">
         <span>{t.figTag}</span>
@@ -96,6 +108,20 @@ export default function PricingPlans({ lang, downloadHref, sourceHref }: Props) 
       </div>
       <p className="border-t border-line px-5 py-3.5 text-center text-[13px] text-muted">{t.freeNote}</p>
     </div>
+    {cards.length > 0 && (
+      <section className="mt-12" aria-label={cardT.title}>
+        <h3 className="h3">{cardT.title}</h3>
+        <p className="mt-2 max-w-2xl text-sm leading-relaxed text-muted">{cardT.lede}</p>
+        <div className="fig mt-5">
+          <div className="cells grid-cols-1 md:grid-cols-2 lg:grid-cols-3">
+            {cards.map((plan) => (
+              <CloudPlanCell key={plan.code} plan={plan} lang={lang} />
+            ))}
+          </div>
+        </div>
+      </section>
+    )}
+    </>
   );
 }
 
@@ -142,8 +168,7 @@ function CloudPlanCell({ plan, lang }: { plan: CloudPlan; lang: Lang }) {
       ribbon={<PlanRibbon plan={plan} />}
       price={priceMinor === 0 ? t.free : formatMinor(priceMinor, plan.currency, lang)}
       strike={c != null && c.effectivePriceMinor < plan.priceMinor ? formatMinor(plan.priceMinor, plan.currency, lang) : undefined}
-      period={priceMinor > 0 ? t.oneTime : undefined}
-      note={c?.endAt ? t.campaignEnds(formatDate(c.endAt, lang)) : undefined}
+      period={priceMinor > 0 ? (isCard(plan) ? pricing[lang].cards.period(plan.billingPeriodDays ?? 0) : t.oneTime) : undefined}
       campaign={
         c && (
           <div className="mb-5 mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 border border-accent/30 bg-accent-soft px-3 py-2 text-xs">
@@ -164,7 +189,7 @@ function CloudPlanCell({ plan, lang }: { plan: CloudPlan; lang: Lang }) {
         (plan.purchasable !== false ? (
           <>
             {/* USDT checkout hidden on the mainland-filed site (crypto payments are not allowed in mainland China); FluxCloud still supports it. */}
-            <WebPurchase plan={{ code: plan.code, name: plan.name, priceMinor, currency: plan.currency, basePriceMinor: plan.priceMinor, priceUsdtMicros: null }} lang={lang} />
+            <WebPurchase plan={{ code: plan.code, name: plan.name, priceMinor, currency: plan.currency, basePriceMinor: plan.priceMinor, priceUsdtMicros: null, waffoPriceMinor: plan.waffoPriceMinor ?? null }} lang={lang} />
             <p className="mt-2.5 text-center text-xs text-subtle">{t.buyInApp}</p>
           </>
         ) : (

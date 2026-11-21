@@ -15,6 +15,11 @@ import { href } from "../../i18n/routing";
 import type { Lang } from "../../i18n/config";
 import { GITHUB_URL } from "../../lib/site-nav";
 import { withBase } from "../../lib/base";
+import {
+  CLOUD_PROMO,
+  cloudPromoCopy,
+  isCloudPromoActive,
+} from "../../lib/cloud-promo";
 
 interface Props {
   lang: Lang;
@@ -22,6 +27,8 @@ interface Props {
 const { lang } = Astro.props;
 const t = home[lang].hero;
 const actions = common[lang].actions;
+const promoOn = isCloudPromoActive();
+const promo = promoOn ? cloudPromoCopy[lang] : null;
 
 const osLabels = {
   mac: actions.downloadFor("macOS"),
@@ -36,6 +43,7 @@ const versions = [
   { id: "linux", brand: "linux", label: t.moreItems.linux, hint: "AppImage · deb · Arch" },
   { id: "server", brand: "docker", label: t.moreItems.server, hint: "Docker · NAS" },
   { id: "android", brand: "android", label: t.moreItems.android, hint: "APK" },
+  { id: "ios", brand: "apple", label: t.moreItems.ios, hint: "TestFlight · IPA" },
   { id: "cli", icon: Terminal, label: t.moreItems.cli, hint: "CLI" },
   { id: "extension", icon: Puzzle, label: t.moreItems.extension, hint: "Chrome · Edge · Firefox" },
 ] as const;
@@ -52,20 +60,36 @@ const versions = [
     <canvas class="hero-layer hero-particles" aria-hidden="true" data-flux></canvas>
 
     <div class="hero-copy">
-      <a href={href("/announcements/gpui-client", lang)} class="hero-badge" data-reveal>
-        <span class="hero-badge-tag">{t.badge}</span>
-        <span>{t.badgeText}</span>
-        <ArrowRight size={13} strokeWidth={2} />
-      </a>
+      {
+        promo ? (
+          <a
+            href={href(CLOUD_PROMO.planPath, lang)}
+            class="hero-badge hero-badge--promo"
+            data-cloud-promo
+            data-ends-at={CLOUD_PROMO.endAt}
+            data-promo-fill="heroBadge"
+          >
+            <span class="hero-badge-tag">{promo.badge}</span>
+            <span data-promo-text>{promo.product}</span>
+            <ArrowRight size={13} strokeWidth={2} />
+          </a>
+        ) : (
+          <a href={href("/changelog", lang)} class="hero-badge">
+            <span class="hero-badge-tag">{t.badge}</span>
+            <span>{t.badgeText}</span>
+            <ArrowRight size={13} strokeWidth={2} />
+          </a>
+        )
+      }
 
-      <h1 class="display hero-title" data-reveal style="--d:1">
+      <h1 class="display hero-title">
         <span class="block">{t.titleA}</span>
         <span class="block serif accent-gradient pr-[0.08em]">{t.titleB}</span>
       </h1>
 
-      <p class="lede mx-auto max-w-[60ch]" data-reveal style="--d:2">{t.lede}</p>
+      <p class="lede mx-auto max-w-[60ch]">{t.lede}</p>
 
-      <div class="flex flex-wrap items-center justify-center gap-3" data-reveal style="--d:3">
+      <div class="flex flex-wrap items-center justify-center gap-3">
         <a href={href("/download", lang)} class="btn btn-primary btn-lg" data-hero-download data-labels={JSON.stringify(osLabels)}>
           <span data-hero-download-label>{actions.download}</span>
           <span class="kbd">D</span>
@@ -104,7 +128,7 @@ const versions = [
         </a>
       </div>
 
-      <div class="mono flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[12px] text-subtle" data-reveal style="--d:4">
+      <div class="mono flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[12px] text-subtle">
         <span class="flex items-center gap-2">
           <BrandIcon name="apple" size={12} />
           <BrandIcon name="windows" size={11} />
@@ -122,7 +146,7 @@ const versions = [
     </div>
   </div>
 
-  <div class="hero-figure" data-reveal style="--d:4">
+  <div class="hero-figure">
     <div class="hero-tilt">
       <div class="fig hero-fig">
         <div class="fig-bar">
@@ -142,8 +166,7 @@ const versions = [
 </section>
 
 <script>
-  import { mountStage } from "../../scripts/particle-stage";
-  import { FluxField } from "./flux-field";
+  import { whenIdle } from "../../scripts/idle";
 
   // 按系统改写主按钮文案(不改链接:下载页负责精确匹配架构)
   const btn = document.querySelector<HTMLElement>("[data-hero-download]");
@@ -177,15 +200,19 @@ const versions = [
     });
   }
 
+  // 粒子数据流属装饰:首屏 UI 绘制后的空闲时段再下载并挂载
   const head = document.querySelector<HTMLElement>(".hero-head");
   const canvas = head?.querySelector<HTMLCanvasElement>("[data-flux]");
   if (head && canvas) {
-    const field = new FluxField();
-    mountStage(canvas, head, field);
-    // 悬停 / 聚焦下载按钮:数据流加速汇聚
-    for (const [type, on] of [["pointerenter", true], ["pointerleave", false], ["focus", true], ["blur", false]] as const) {
-      btn?.addEventListener(type, () => field.setSurge(on));
-    }
+    whenIdle(async () => {
+      const [{ mountStage }, { FluxField }] = await Promise.all([import("../../scripts/particle-stage"), import("./flux-field")]);
+      const field = new FluxField();
+      mountStage(canvas, head, field);
+      // 悬停 / 聚焦下载按钮:数据流加速汇聚
+      for (const [type, on] of [["pointerenter", true], ["pointerleave", false], ["focus", true], ["blur", false]] as const) {
+        btn?.addEventListener(type, () => field.setSurge(on));
+      }
+    });
   }
 </script>
 
@@ -354,6 +381,10 @@ const versions = [
   }
   .hero-badge:hover :global(svg) {
     transform: translateX(3px);
+  }
+  /* 促销角标与默认 badge 同壳，仅文案换价，避免再叠一层实心促销块 */
+  .hero-badge--promo {
+    color: var(--fg-muted);
   }
   .hero-badge-tag {
     position: relative;

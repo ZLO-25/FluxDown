@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, Path as AxumPath, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -44,8 +44,9 @@ use crate::lifecycle::Lifecycle;
 use crate::link::LinkService;
 use crate::platform::PlatformError;
 use crate::power::PowerService;
+use crate::private_plugin::PrivatePluginService;
 use crate::remote::{RemoteError, RemoteTaskService};
-use crate::server_mode::ServerHandle;
+use crate::server_mode::{AuthThrottle, ServerHandle};
 use crate::shell::ShellState;
 use crate::sync::SyncService;
 use crate::update::{UpdateError, UpdateService};
@@ -71,6 +72,7 @@ pub struct GatewayService {
     notify: Arc<CloudNotifyService>,
     capture: Arc<CaptureService>,
     blobs: Arc<DaemonBlobClient>,
+    private_plugins: PrivatePluginService,
     diagnostics: Arc<DiagnosticsService>,
     update: Arc<UpdateService>,
     state: Arc<tokio::sync::Mutex<crate::state::AgentState>>,
@@ -118,6 +120,8 @@ impl GatewayService {
             events.clone(),
             Arc::clone(&local.notifier),
         );
+        let private_plugins =
+            PrivatePluginService::new(Arc::clone(&cloud), Arc::clone(&daemon), Arc::clone(&blobs));
         Self {
             daemon,
             events,
@@ -128,6 +132,7 @@ impl GatewayService {
             notify,
             capture,
             blobs,
+            private_plugins,
             diagnostics,
             update,
             state,
@@ -248,6 +253,9 @@ impl GatewayService {
         if self.server_mode && server_mode_denies(&request, self.local_log_export) {
             return Err(RpcErrorData::new(ApplicationErrorCode::Unsupported, false));
         }
+        if internal_daemon_method(&request.method) {
+            return Err(RpcErrorData::new(ApplicationErrorCode::Unsupported, false));
+        }
         match request.method.as_str() {
             method::SYSTEM_PING => Ok(serde_json::json!({ "ok": true })),
             // 线上快照只带头；任务表与队列位置表经 `system.taskPage` 分页（协议 `table_sync`）。
@@ -269,10 +277,14 @@ impl GatewayService {
             }
             method::AGENT_POWER_ARM => {
                 let params = parse_params::<fluxdown_protocol::PowerArmParams>(request.params)?;
-                let armed = self
-                    .local
-                    .power
-                    .arm(std::time::Duration::from_secs(params.delay_secs));
+                let armed = if let Some(condition) = params.low_speed {
+                    self.local.power.arm_low_speed(condition, params.action)
+                } else {
+                    self.local.power.arm(
+                        std::time::Duration::from_secs(params.delay_secs),
+                        params.action,
+                    )
+                };
                 Ok(serde_json::json!({ "armed": armed }))
             }
             method::AGENT_POWER_DISARM => {
@@ -454,6 +466,17 @@ impl GatewayService {
                 let request =
                     parse_params::<fluxdown_protocol::PluginFavoriteSetRequest>(request.params)?;
                 cloud_value(self.cloud.set_plugin_favorite(request).await)
+            }
+            method::AGENT_PRIVATE_PLUGIN_LIST => {
+                self.private_plugins.list().await.and_then(to_value)
+            }
+            method::AGENT_PRIVATE_PLUGIN_INSTALL => {
+                let request =
+                    parse_params::<fluxdown_protocol::PrivatePluginInstallRequest>(request.params)?;
+                self.private_plugins
+                    .install(request)
+                    .await
+                    .and_then(to_value)
             }
             method::AGENT_REFERRAL_SUMMARY => {
                 cloud_value(self.cloud.referral("/summary", Method::GET, None).await)
@@ -638,6 +661,11 @@ impl GatewayService {
                 self.platform_task(params_or_empty(request.params), true)
                     .await
             }
+            method::AGENT_PLATFORM_COPY_TASK_FILES => {
+                let params =
+                    parse_params::<fluxdown_protocol::PlatformCopyTaskFilesParams>(request.params)?;
+                self.platform_copy_task_files(params).await
+            }
             method::AGENT_PLATFORM_OPEN_PATH => {
                 let params =
                     parse_params::<fluxdown_protocol::PlatformOpenPathParams>(request.params)?;
@@ -658,6 +686,19 @@ impl GatewayService {
                     png: base64::engine::general_purpose::STANDARD.encode(png),
                 })
             }
+            method::AGENT_PLATFORM_SET_APP_ICON => {
+                let params = parse_params::<fluxdown_protocol::app_icon::PlatformSetAppIconParams>(
+                    request.params,
+                )?;
+                self.platform_set_app_icon(params).await
+            }
+            method::AGENT_PLATFORM_APP_ICON_IMAGE => {
+                let params = parse_params::<fluxdown_protocol::app_icon::PlatformAppIconImageParams>(
+                    request.params,
+                )?;
+                self.platform_app_icon_image(params).await
+            }
+            method::AGENT_PLATFORM_SYNC_WINDOW_ICONS => self.platform_sync_window_icons().await,
             method::AGENT_SOUND_PREVIEW => {
                 let params =
                     parse_params::<fluxdown_protocol::sound::SoundPreviewParams>(request.params)?;
@@ -1121,7 +1162,8 @@ impl GatewayService {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, RpcErrorData> {
         let order_no = required_string(&params, "orderNo")?;
-        cloud_value(self.cloud.order(&order_no).await)
+        let result = self.cloud.order(&order_no).await;
+        cloud_value(result)
     }
 
     async fn referral_list_codes(
@@ -1204,14 +1246,15 @@ impl GatewayService {
             tracing::debug!(error = %error, "rejected capture request");
             RpcErrorData::new(ApplicationErrorCode::InvalidArgument, false)
         })?;
-        // 本机调用方：`silent=true`（系统打开链接 / 拖入）直接建任务；否则（剪贴板监听）
-        // 恒请用户确认。外部接管走 HTTP / NMH，由 `CaptureOrigin::External` 按免打扰偏好分流。
+        // 本机调用方：`silent=true` 是系统打开的链接（桌面 / 外壳交来），按「免打扰下载」偏好
+        // 直接建任务或排入确认队列（`SystemOpen`）；否则（剪贴板监听）恒请用户确认。外部接管走
+        // HTTP / NMH，由 `CaptureOrigin::External` 分流。
         let silent = params
             .get("silent")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let origin = if silent {
-            crate::capture::CaptureOrigin::Direct
+            crate::capture::CaptureOrigin::SystemOpen
         } else {
             crate::capture::CaptureOrigin::Prompt
         };
@@ -1229,7 +1272,12 @@ impl GatewayService {
             })?;
         capture_value(
             self.capture
-                .resolve(&params.transaction_id, params.accepted, params.request)
+                .resolve(
+                    &params.transaction_id,
+                    params.accepted,
+                    params.disable_category_route,
+                    params.request,
+                )
                 .await,
         )
     }
@@ -1377,6 +1425,132 @@ impl GatewayService {
         })
         .await
         .map(|()| serde_json::json!({ "ok": true }))
+    }
+
+    /// `agent.platform.copyTaskFiles`：逐个向 daemon 取任务事实（与打开 / 定位同一来源），再在阻塞
+    /// 线程上整体写入系统剪贴板。
+    async fn platform_copy_task_files(
+        &self,
+        params: fluxdown_protocol::PlatformCopyTaskFilesParams,
+    ) -> Result<serde_json::Value, RpcErrorData> {
+        let mut task_ids = params.task_ids;
+        if task_ids.is_empty()
+            || task_ids.len() > fluxdown_protocol::PLATFORM_COPY_TASK_FILES_MAX
+            || task_ids.iter().any(String::is_empty)
+        {
+            return Err(invalid_field("taskIds"));
+        }
+        if !crate::platform::copies_files_to_clipboard() {
+            return Err(RpcErrorData::new(ApplicationErrorCode::Unsupported, false));
+        }
+        // 剪贴板里的文件顺序无意义（文件管理器粘贴时自行排序），排序去重即可。
+        task_ids.sort_unstable();
+        task_ids.dedup();
+        let mut tasks = Vec::with_capacity(task_ids.len());
+        for task_id in task_ids {
+            let task: fluxdown_protocol::TaskDto = self
+                .daemon
+                .call(
+                    fluxdown_protocol::method::DAEMON_TASK_GET,
+                    Some(serde_json::json!({ "taskId": task_id })),
+                )
+                .await?;
+            tasks.push(task);
+        }
+        platform_blocking(move || crate::platform::copy_task_files(&tasks))
+            .await
+            .map(|()| serde_json::json!({ "ok": true }))
+    }
+
+    /// 导入 / 校验应用图标图片，再写设备本地偏好 `desktop.app_icon`（偏好永远指向已落盘的图片）；
+    /// 之后由 `app_icon` 服务按偏好变化落实托盘、窗口、快捷方式。偏好已是目标值时不写。
+    #[cfg(feature = "desktop")]
+    async fn platform_set_app_icon(
+        &self,
+        params: fluxdown_protocol::app_icon::PlatformSetAppIconParams,
+    ) -> Result<serde_json::Value, RpcErrorData> {
+        use fluxdown_protocol::app_icon::{APP_ICON_PREF_KEY, AppIconStateDto};
+
+        // 导入与写偏好对 `app_icon` 服务的「回落默认」互斥（见 `app_icon::preference_lock`）。
+        let _guard = crate::app_icon::preference_lock().await;
+        let store = crate::app_icon::IconStore::new(self.store.data_dir());
+        let choice =
+            platform_blocking(move || crate::app_icon::resolve_request(&store, &params)).await?;
+        let value = choice.to_preference();
+        let unchanged = self.events.inspect(|snapshot| {
+            snapshot
+                .preferences
+                .values
+                .get(APP_ICON_PREF_KEY)
+                .and_then(serde_json::Value::as_str)
+                == Some(value.as_str())
+        });
+        if !unchanged {
+            self.sync
+                .set_local_preference(
+                    APP_ICON_PREF_KEY.to_owned(),
+                    serde_json::Value::String(value.clone()),
+                    false,
+                )
+                .await
+                .map_err(sync_error_data)?;
+        }
+        to_value(AppIconStateDto { value })
+    }
+
+    #[cfg(not(feature = "desktop"))]
+    async fn platform_set_app_icon(
+        &self,
+        _params: fluxdown_protocol::app_icon::PlatformSetAppIconParams,
+    ) -> Result<serde_json::Value, RpcErrorData> {
+        Err(platform_error_data(PlatformError::Unsupported(
+            "app icons require the desktop build",
+        )))
+    }
+
+    /// 当前自定义应用图标母版缩放后的 PNG（设置页预览 / GPUI 贴图用）。
+    #[cfg(feature = "desktop")]
+    async fn platform_app_icon_image(
+        &self,
+        params: fluxdown_protocol::app_icon::PlatformAppIconImageParams,
+    ) -> Result<serde_json::Value, RpcErrorData> {
+        let store = crate::app_icon::IconStore::new(self.store.data_dir());
+        platform_blocking(move || crate::app_icon::icon_image(&store, params.size))
+            .await
+            .and_then(to_value)
+    }
+
+    #[cfg(not(feature = "desktop"))]
+    async fn platform_app_icon_image(
+        &self,
+        _params: fluxdown_protocol::app_icon::PlatformAppIconImageParams,
+    ) -> Result<serde_json::Value, RpcErrorData> {
+        Err(platform_error_data(PlatformError::Unsupported(
+            "app icons require the desktop build",
+        )))
+    }
+
+    /// 给桌面进程现有窗口补设当前图标（Windows / X11；其余平台无操作）。只做窗口这一步，
+    /// 托盘 / 快捷方式 / 通知由偏好变化触发。
+    #[cfg(feature = "desktop")]
+    async fn platform_sync_window_icons(&self) -> Result<serde_json::Value, RpcErrorData> {
+        use fluxdown_protocol::app_icon::{APP_ICON_PREF_KEY, AppIconChoice};
+
+        let store = crate::app_icon::IconStore::new(self.store.data_dir());
+        let stored = self
+            .events
+            .inspect(|snapshot| snapshot.preferences.values.get(APP_ICON_PREF_KEY).cloned());
+        let choice = AppIconChoice::from_preference(stored.as_ref());
+        platform_blocking(move || crate::app_icon::sync_window_icons(&store, &choice))
+            .await
+            .map(|()| serde_json::json!({ "ok": true }))
+    }
+
+    /// headless 构建没有桌面进程窗口可补设：与「其余平台无操作」一致，直接成功。
+    #[cfg(not(feature = "desktop"))]
+    #[allow(clippy::unused_async, reason = "与桌面构建的处理器签名一致")]
+    async fn platform_sync_window_icons(&self) -> Result<serde_json::Value, RpcErrorData> {
+        Ok(serde_json::json!({ "ok": true }))
     }
 
     async fn ui_connected(&self) {
@@ -1779,6 +1953,8 @@ struct GatewayState {
     cancel: CancellationToken,
     /// server 模式：浏览器鉴权与访问密钥；桌面形态为 `None`。
     server: Option<Arc<ServerHandle>>,
+    /// 桌面形态 `/rpc` 的按来源失败节流（server 模式用 [`ServerHandle`] 自己的那份）。
+    throttle: Arc<AuthThrottle>,
 }
 
 /// 在同一 listener 合并兼容 API 与官方 `/rpc`；server 模式再合并初始化 / 文件面 / SPA。
@@ -1801,9 +1977,11 @@ pub async fn serve(
         bearer: Arc::from(bearer.as_str()),
         cancel: cancel.clone(),
         server: server.clone(),
+        throttle: Arc::new(AuthThrottle::default()),
     };
     let rpc = Router::new()
         .route("/rpc", get(rpc_upgrade))
+        .route("/api/web/plugin-images/{session}/{id}", get(plugin_image))
         .with_state(state);
     let app = fluxdown_api::server::api_router(api_host, api_config).merge(rpc);
     // SPA fallback 只在 server 模式挂载，且 API / `/rpc` 路由优先。
@@ -1815,6 +1993,61 @@ pub async fn serve(
         .listener_control
         .run(listener, app, bearer, cancel, endpoint_dir)
         .await
+}
+
+async fn plugin_image(
+    State(state): State<GatewayState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    AxumPath((session, id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    // Binary resources use headers only: never place access keys in an image URL.
+    if crate::server_mode::bearer_token(&headers).is_none()
+        || !crate::server_mode::origin_allowed(&headers)
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.server.as_deref() {
+        Some(server) => {
+            if let Err(status) = server
+                .authorize_rpc_from(peer.ip(), &headers, &state.bearer)
+                .await
+            {
+                return status.into_response();
+            }
+        }
+        None => {
+            if let Err(status) = authorize_desktop_rpc(
+                &state.service,
+                &state.throttle,
+                &state.bearer,
+                peer.ip(),
+                &headers,
+            )
+            .await
+            {
+                return status.into_response();
+            }
+        }
+    }
+    match state.service.blobs.plugin_image(&session, &id).await {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, "image/png"),
+                (header::CACHE_CONTROL, "no-store"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(BlobError::Status(status)) => StatusCode::from_u16(status)
+            .unwrap_or(StatusCode::BAD_GATEWAY)
+            .into_response(),
+        Err(error) => {
+            tracing::warn!(error = %error, "plugin image proxy failed");
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+    }
 }
 
 pub async fn load_or_create_bearer(
@@ -1862,7 +2095,7 @@ async fn rpc_upgrade(
 ) -> Response {
     // 凭据种类与「本机来源」都在建连时一次判定，整条连接沿用：桌面宿主的 `agent.token` 本就在
     // 本机；server 模式见 `ServerHandle::local_platform_permitted`（字面本机来源或显式 env 放行）。
-    // 设备控制凭据（局域网配对的远程设备）两种模式下都不是本机来源。
+    // 设备控制凭据两种模式下都不是本机来源；桌面形态的访问密钥同样不是（远端客户端用它连接）。
     let (upgrade, session) = match state.server.as_deref() {
         Some(server) => {
             let credential = match server
@@ -1881,15 +2114,23 @@ async fn rpc_upgrade(
             )
         }
         None => {
-            let session = if authorized(&headers, &state.bearer) {
-                SessionContext::new(true, RpcCredential::Agent)
-            } else {
-                match authorize_device(&state.service, &headers).await {
-                    Some(credential) => SessionContext::new(false, credential),
-                    None => return StatusCode::UNAUTHORIZED.into_response(),
-                }
+            let credential = match authorize_desktop_rpc(
+                &state.service,
+                &state.throttle,
+                &state.bearer,
+                peer.ip(),
+                &headers,
+            )
+            .await
+            {
+                Ok(credential) => credential,
+                Err(status) => return status.into_response(),
             };
-            (upgrade, session)
+            let allow_local_platform = matches!(credential, RpcCredential::Agent);
+            (
+                upgrade,
+                SessionContext::new(allow_local_platform, credential),
+            )
         }
     };
     upgrade
@@ -1897,10 +2138,46 @@ async fn rpc_upgrade(
         .into_response()
 }
 
-/// 桌面模式：`Authorization: Bearer` 携带设备控制凭据，且互联服务校验通过（名册里该设备被授权
-/// 控制本机、未被撤销、HMAC 一致）才接受。
-async fn authorize_device(service: &GatewayService, headers: &HeaderMap) -> Option<RpcCredential> {
-    let token = crate::server_mode::bearer_token(headers)?;
+/// 桌面形态 `/rpc` 升级鉴权，凭据只认 `Authorization: Bearer`：`agent.token`、访问密钥（开启局域网
+/// 访问后远端客户端——如原生移动端「访问密钥」模式——用它连接），以及互联服务校验通过（名册里该
+/// 设备被授权控制本机、未被撤销、HMAC 一致）的设备控制凭据。浏览器无法给 WebSocket 设
+/// `Authorization`，跨站网页因此出示不了任何凭据。与 server 模式一样按来源节流：同一来源连续失败
+/// 过多后锁定（429），回环来源不计。
+async fn authorize_desktop_rpc(
+    service: &GatewayService,
+    throttle: &AuthThrottle,
+    agent_bearer: &str,
+    peer: std::net::IpAddr,
+    headers: &HeaderMap,
+) -> Result<RpcCredential, StatusCode> {
+    let now = std::time::Instant::now();
+    if throttle.is_locked(peer, now) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let Some(presented) = crate::server_mode::bearer_token(headers) else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    let credential = if constant_time_eq(presented.as_bytes(), agent_bearer.as_bytes()) {
+        Some(RpcCredential::Agent)
+    } else if crate::server_mode::key_matches(&service.api_token, presented) {
+        Some(RpcCredential::AccessKey(presented.to_owned()))
+    } else {
+        authorize_device(service, presented).await
+    };
+    match credential {
+        Some(credential) => {
+            throttle.record_success(peer);
+            Ok(credential)
+        }
+        None => {
+            throttle.record_failure(peer, now);
+            Err(StatusCode::UNAUTHORIZED)
+        }
+    }
+}
+
+/// 设备控制凭据：互联服务存在且按名册校验通过才接受。
+async fn authorize_device(service: &GatewayService, token: &str) -> Option<RpcCredential> {
     let fingerprint = service
         .link
         .as_ref()?
@@ -2110,7 +2387,7 @@ impl GatewayService {
         self: &Arc<Self>,
         session: &SessionContext,
     ) -> (
-        tokio::sync::broadcast::Receiver<EventFrame>,
+        tokio::sync::broadcast::Receiver<Arc<EventFrame>>,
         RequestLanes,
         tokio::sync::mpsc::Receiver<RpcResponse>,
     ) {
@@ -2138,7 +2415,8 @@ impl GatewayService {
 
     /// 本连接的 `system.hello` 应答：在服务级能力之外，只有可在主机上打开 / 定位任务产物的
     /// 连接（本机来源且本构建能启动系统打开器）才带 `agent.openTaskFiles`，客户端据此决定
-    /// 是否展示「打开文件 / 在文件夹中显示」。
+    /// 是否展示「打开文件 / 在文件夹中显示」；同为本机来源且本构建 / 会话有系统剪贴板时才带
+    /// `agent.copyTaskFiles`（「复制文件」）。
     fn session_hello(&self, allow_local_platform: bool) -> ServiceHello {
         let mut hello = self.hello.clone();
         if allow_local_platform && crate::platform::LAUNCHES_PATHS {
@@ -2146,13 +2424,38 @@ impl GatewayService {
                 .capabilities
                 .push(method::CAPABILITY_AGENT_OPEN_TASK_FILES.to_owned());
         }
+        if allow_local_platform && crate::platform::copies_files_to_clipboard() {
+            hello
+                .capabilities
+                .push(method::CAPABILITY_AGENT_COPY_TASK_FILES.to_owned());
+        }
         hello
     }
 }
 
+/// 只供 agent 自身调用的 `daemon.*` 方法：UI Gateway 与远端 `/rpc` 的 `daemon.*` 透传一律拒绝。
+///
+/// - `daemon.bt.guard.cloud.apply`：参数是「agent 已验签」的云名单；放开它等于让任意客户端
+///   绕过签名替换封禁名单。
+/// - `daemon.bt.guard.evidence.drain`：弹出待上报证据；证据只能经 `bt_guard` 模块（遥测红线例外）
+///   上报，任意客户端取走会让证据丢失，且泄露对端 IP 与 infohash。
+/// - `daemon.plugin.installPrivate`：来源标记 `private` 只能由 agent 在校验过 FluxCloud 票据包的
+///   sha256 之后写入；放开它等于让任意客户端把任意包标成「私有商店」来源。
+/// - `daemon.plugin.revokePrivate`：撤回清单与授权范围来自 FluxCloud 私有目录；任意客户端可借它把已装
+///   私有插件封锁为 `Revoked`（升级前不可再启用），或伪造 `scope` 解除既有封锁。
+fn internal_daemon_method(method_name: &str) -> bool {
+    matches!(
+        method_name,
+        method::DAEMON_BT_GUARD_CLOUD_APPLY
+            | method::DAEMON_BT_GUARD_EVIDENCE_DRAIN
+            | method::DAEMON_PLUGIN_INSTALL_PRIVATE
+            | method::DAEMON_PLUGIN_REVOKE_PRIVATE
+    )
+}
+
 /// 允许「本机来源」在 server 模式下调用的 `agent.platform.*` 子集。
 ///
-/// 只放行「与本机文件系统交互、但无系统级副作用」的两个打开动作。**不含**
+/// 只放行「与本机文件系统交互、但无系统级副作用」的打开 / 定位 / 复制任务产物到剪贴板。**不含**
 /// 自启 / 文件关联 / 协议注册 / `openPath` 之类可写注册表或任意路径的动作——那些仍
 /// 一律拒绝，即使来源是本机。
 fn local_platform_method_allowed(method: &str) -> bool {
@@ -2160,6 +2463,7 @@ fn local_platform_method_allowed(method: &str) -> bool {
         method,
         fluxdown_protocol::method::AGENT_PLATFORM_OPEN_TASK
             | fluxdown_protocol::method::AGENT_PLATFORM_REVEAL_TASK
+            | fluxdown_protocol::method::AGENT_PLATFORM_COPY_TASK_FILES
     )
 }
 
@@ -2226,16 +2530,25 @@ fn lane_for(method_name: &str) -> Lane {
             Lane::Daemon
         };
     }
-    if method_name == method::AGENT_CAPTURE_PREVIEW {
+    // 私有包安装 = 云端目录 + 下载（分钟级）+ daemon 安装：与慢 daemon 调用同道并发下发，
+    // 不占用串行的 Cloud 通道（登录 / 设备 / 同步等不能被它堵住）。目录 `list` 仍走 Cloud。
+    if matches!(
+        method_name,
+        method::AGENT_CAPTURE_PREVIEW | method::AGENT_PRIVATE_PLUGIN_INSTALL
+    ) {
         return Lane::DaemonSlow;
     }
     if method_name == method::AGENT_CAPTURE_CREATE_GROUP {
         return Lane::Daemon;
     }
-    if method_name == fluxdown_protocol::method::AGENT_PLATFORM_FILE_ICON {
+    if matches!(
+        method_name,
+        fluxdown_protocol::method::AGENT_PLATFORM_FILE_ICON
+            | fluxdown_protocol::method::AGENT_PLATFORM_APP_ICON_IMAGE
+    ) {
         return Lane::Icon;
     }
-    const CLOUD_PREFIXES: [&str; 10] = [
+    const CLOUD_PREFIXES: [&str; 11] = [
         "agent.auth.",
         "agent.profile.",
         "agent.device.",
@@ -2243,6 +2556,7 @@ fn lane_for(method_name: &str) -> Lane {
         "agent.order.",
         "agent.referral.",
         "agent.pluginFavorite.",
+        "agent.privatePlugin.",
         "agent.remote.",
         "agent.sync.",
         "agent.update.",
@@ -2407,18 +2721,6 @@ async fn receive_lane_exit(
     }
 }
 
-fn authorized(headers: &HeaderMap, expected: &str) -> bool {
-    let Some(value) = headers.get(header::AUTHORIZATION) else {
-        return false;
-    };
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    value
-        .strip_prefix("Bearer ")
-        .is_some_and(|value| constant_time_eq(value.as_bytes(), expected.as_bytes()))
-}
-
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -2452,7 +2754,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     use super::{
-        GatewayService, GatewayShell, Lane, authorized, ensure_exposed_auth_token, lane_for,
+        GatewayService, GatewayShell, Lane, ensure_exposed_auth_token, lane_for,
         load_or_create_bearer,
     };
     #[tokio::test]
@@ -2472,13 +2774,8 @@ mod tests {
             .await
             .expect("reload token");
         assert_eq!(first, second);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {first}")).expect("header"),
-        );
-        assert!(authorized(&headers, &first));
-        assert!(!authorized(&headers, "different"));
+        assert!(!first.is_empty());
+        assert_eq!(first, first.trim());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2580,6 +2877,7 @@ mod tests {
                     entitlements: session.entitlements.clone(),
                     current_plan: session.current_plan.clone(),
                     purchase_credit_minor: 0,
+                    active_subscription: session.active_subscription.clone(),
                 })
                 .expect("decoded profile fixture")
             };
@@ -3012,6 +3310,87 @@ mod tests {
             assert_eq!(self.user_token().await, "original-token");
             assert_eq!(&*self.api_token.get(), "original-token");
             assert_eq!(self.service.events.snapshot().sequence, sequence);
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_images_require_header_auth_and_recheck_rotated_access_keys() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for server_mode in [false, true] {
+            let gateway = TestGateway::new_mode("plugin-image-auth", server_mode).await;
+            let address = gateway.address().await;
+            let url = format!("http://{address}/api/web/plugin-images/session/id");
+            for request in [
+                client.get(&url),
+                client.get(format!("{url}?token=test-official-bearer")),
+                client.get(&url).header(
+                    "Sec-WebSocket-Protocol",
+                    "fluxdown.rpc.v1, fluxdown.token.test-official-bearer",
+                ),
+                client.get(&url).bearer_auth("wrong"),
+                client
+                    .get(&url)
+                    .bearer_auth("test-official-bearer")
+                    .header("Origin", "https://untrusted.example"),
+            ] {
+                assert_eq!(
+                    request.send().await.unwrap().status(),
+                    axum::http::StatusCode::UNAUTHORIZED
+                );
+            }
+            // Valid auth reaches the unavailable daemon; it is not rejected by the gateway.
+            assert_eq!(
+                client
+                    .get(&url)
+                    .bearer_auth("test-official-bearer")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            );
+            // 两种形态都认访问密钥；改密钥后旧密钥立即失效。
+            gateway
+                .patch_gateway(serde_json::json!({ "userToken": "images2026old" }))
+                .await;
+            assert_eq!(
+                client
+                    .get(&url)
+                    .bearer_auth("images2026old")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            );
+            gateway
+                .patch_gateway(serde_json::json!({ "userToken": "images2026new" }))
+                .await;
+            assert_eq!(
+                client
+                    .get(&url)
+                    .bearer_auth("images2026old")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+            );
+            assert_eq!(
+                client
+                    .get(&url)
+                    .bearer_auth("images2026new")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            );
+            gateway.finish().await;
         }
     }
 
@@ -4019,6 +4398,26 @@ mod tests {
     #[tokio::test]
     async fn every_canonical_agent_method_reaches_a_real_dispatch_branch() {
         let harness = TestGateway::new("dispatch").await;
+        // An accepting loopback server avoids platform-dependent refused-connect latency.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind cloud fixture");
+        let address = listener.local_addr().expect("cloud fixture address");
+        let cloud_base = format!("http://{address}");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stop = shutdown.clone();
+        let cloud_server = tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new())
+                .with_graceful_shutdown(stop.cancelled_owned())
+                .await
+                .expect("serve cloud fixture");
+        });
+        harness
+            .service
+            .cloud
+            .set_endpoint(&cloud_base)
+            .await
+            .expect("set cloud fixture endpoint");
         let service = &harness.service;
 
         for (index, method_name) in fluxdown_protocol::method::ALL_METHODS
@@ -4030,6 +4429,8 @@ mod tests {
             // 版本检查会真的访问官方站点；用非法渠道让它在触网前返回 InvalidArgument。
             let params = if method_name == fluxdown_protocol::method::AGENT_UPDATE_CHECK {
                 serde_json::json!({ "channel": "offline-test" })
+            } else if method_name == fluxdown_protocol::method::AGENT_CLOUD_ENDPOINT_SET {
+                serde_json::json!({ "baseUrl": &cloud_base })
             } else {
                 serde_json::json!({})
             };
@@ -4054,6 +4455,85 @@ mod tests {
             }
         }
         harness.finish().await;
+        shutdown.cancel();
+        cloud_server.await.expect("join cloud fixture");
+    }
+
+    /// `daemon.bt.guard.cloud.apply` 携带「agent 已验签」的云名单、`daemon.bt.guard.evidence.drain` 弹出
+    /// 待上报证据、`daemon.plugin.{installPrivate,revokePrivate}` 只接受 agent 校验过的 FluxCloud 私有包 /
+    /// 撤回清单：它们只有 agent 自己的模块调用，经 Gateway 的任何会话（本机 UI、访问密钥、
+    /// 配对设备）一律拒绝；其余 `daemon.bt.guard.*` 照常透传给 daemon。
+    #[tokio::test]
+    async fn bt_guard_internal_daemon_methods_are_denied_to_every_session_kind() {
+        use super::session_auth::RpcCredential;
+        use fluxdown_protocol::method;
+
+        let internal = [
+            method::DAEMON_BT_GUARD_CLOUD_APPLY,
+            method::DAEMON_BT_GUARD_EVIDENCE_DRAIN,
+            method::DAEMON_PLUGIN_INSTALL_PRIVATE,
+            method::DAEMON_PLUGIN_REVOKE_PRIVATE,
+        ];
+        let forwarded = [
+            method::DAEMON_BT_GUARD_STATE,
+            method::DAEMON_BT_GUARD_ENTRIES_LIST,
+            method::DAEMON_BT_GUARD_ENTRIES_ADD,
+            method::DAEMON_BT_GUARD_ENTRIES_REMOVE,
+            method::DAEMON_BT_GUARD_EVENTS_LIST,
+            method::DAEMON_BT_GUARD_EXPORT,
+            method::DAEMON_BT_GUARD_FILTER_SOURCES_REFRESH,
+        ];
+        for server_mode in [false, true] {
+            let harness = TestGateway::new_mode("bt_guard_internal", server_mode).await;
+            let sessions = [
+                ("local agent", super::SessionContext::local(true)),
+                (
+                    "access key",
+                    super::SessionContext::new(false, RpcCredential::AccessKey("key".to_owned())),
+                ),
+                (
+                    "paired device",
+                    super::SessionContext::new(
+                        false,
+                        RpcCredential::Device {
+                            token: "token".to_owned(),
+                            fingerprint: "fingerprint".to_owned(),
+                        },
+                    ),
+                ),
+            ];
+            for (label, session) in &sessions {
+                for method_name in internal.iter().chain(forwarded.iter()).copied() {
+                    let response = harness
+                        .service
+                        .call_with(
+                            session,
+                            RpcRequest::new(
+                                RequestId::Integer(1),
+                                method_name,
+                                Some(serde_json::json!({})),
+                            ),
+                        )
+                        .await;
+                    let RpcResponse::Failure(failure) = response else {
+                        panic!("{method_name} must fail against the disconnected test daemon");
+                    };
+                    let data = failure.error.data.expect("application error data");
+                    let expected = if internal.contains(&method_name) {
+                        // 网关直接拒绝，根本不会触达 daemon。
+                        ApplicationErrorCode::Unsupported
+                    } else {
+                        // 透传给（未连接的）daemon：失败原因是 daemon 不可用，而不是被网关拒绝。
+                        ApplicationErrorCode::Unavailable
+                    };
+                    assert_eq!(
+                        data.code, expected,
+                        "{method_name} for {label} (server mode: {server_mode})"
+                    );
+                }
+            }
+            harness.finish().await;
+        }
     }
 
     #[tokio::test]
@@ -4270,9 +4750,15 @@ mod tests {
         for name in [
             fluxdown_protocol::method::AGENT_PLUGIN_FAVORITE_LIST,
             fluxdown_protocol::method::AGENT_PLUGIN_FAVORITE_SET,
+            fluxdown_protocol::method::AGENT_PRIVATE_PLUGIN_LIST,
         ] {
             assert!(matches!(lane_for(name), Lane::Cloud), "{name}");
         }
+        // 分钟级的私有包安装不占用串行的 Cloud 通道。
+        assert!(matches!(
+            lane_for(fluxdown_protocol::method::AGENT_PRIVATE_PLUGIN_INSTALL),
+            Lane::DaemonSlow
+        ));
     }
 
     #[tokio::test]
@@ -4446,6 +4932,7 @@ mod tests {
             let requests = [
                 fluxdown_protocol::method::AGENT_PLATFORM_OPEN_TASK,
                 fluxdown_protocol::method::AGENT_PLATFORM_REVEAL_TASK,
+                fluxdown_protocol::method::AGENT_PLATFORM_COPY_TASK_FILES,
                 fluxdown_protocol::method::AGENT_PLATFORM_OPEN_PATH,
                 fluxdown_protocol::method::AGENT_PLATFORM_INTEGRATION_GET,
                 fluxdown_protocol::method::AGENT_PLATFORM_SET_AUTOSTART,
@@ -4467,14 +4954,14 @@ mod tests {
                     failure.error.data.map(|data| data.code),
                 );
             }
-            // 本机来源：打开 / 定位任务产物进入参数校验（缺 taskId）；远程来源一律 Unsupported。
+            // 本机来源：打开 / 定位 / 复制任务产物进入参数校验（缺 taskId / taskIds）；远程来源一律 Unsupported。
             let task_files = if local {
                 ApplicationErrorCode::InvalidArgument
             } else {
                 ApplicationErrorCode::Unsupported
             };
             for (id, name) in (1..).zip(requests) {
-                let expected = if id <= 2 {
+                let expected = if id <= 3 {
                     task_files
                 } else {
                     ApplicationErrorCode::Unsupported
@@ -4487,16 +4974,19 @@ mod tests {
             }
             lanes.shutdown().await;
         }
-        assert!(
-            !harness
-                .service
-                .session_hello(false)
-                .capabilities
-                .iter()
-                .any(|capability| capability
-                    == fluxdown_protocol::method::CAPABILITY_AGENT_OPEN_TASK_FILES),
-            "remote connections must not advertise task file actions"
-        );
+        let remote_hello = harness.service.session_hello(false);
+        for capability in [
+            fluxdown_protocol::method::CAPABILITY_AGENT_OPEN_TASK_FILES,
+            fluxdown_protocol::method::CAPABILITY_AGENT_COPY_TASK_FILES,
+        ] {
+            assert!(
+                !remote_hello
+                    .capabilities
+                    .iter()
+                    .any(|item| item == capability),
+                "remote connections must not advertise {capability}"
+            );
+        }
         harness.finish().await;
     }
 
@@ -4528,14 +5018,21 @@ mod tests {
         let RpcResponse::Success(hello) = hello else {
             panic!("hello failed: {hello:?}");
         };
-        let advertised = hello.result["capabilities"]
-            .as_array()
-            .expect("capabilities")
-            .iter()
-            .any(|capability| {
-                capability == fluxdown_protocol::method::CAPABILITY_AGENT_OPEN_TASK_FILES
-            });
-        assert_eq!(advertised, crate::platform::LAUNCHES_PATHS);
+        let advertises = |name: &str| {
+            hello.result["capabilities"]
+                .as_array()
+                .expect("capabilities")
+                .iter()
+                .any(|capability| capability == name)
+        };
+        assert_eq!(
+            advertises(fluxdown_protocol::method::CAPABILITY_AGENT_OPEN_TASK_FILES),
+            crate::platform::LAUNCHES_PATHS
+        );
+        assert_eq!(
+            advertises(fluxdown_protocol::method::CAPABILITY_AGENT_COPY_TASK_FILES),
+            crate::platform::copies_files_to_clipboard()
+        );
         assert!(
             !harness
                 .service
@@ -5103,6 +5600,112 @@ mod tests {
             .expect_err("revoked");
         assert!(rejected_with(&error, 401), "{error:?}");
         assert_rpc_alive(&mut local, 3).await;
+
+        host.finish().await;
+    }
+
+    #[tokio::test]
+    async fn desktop_host_accepts_the_access_key_as_a_remote_session() {
+        let host = TestGateway::new("access_key_desktop").await;
+        host.patch_gateway(serde_json::json!({ "userToken": "flux2026abc" }))
+            .await;
+        let address = host.address().await;
+
+        // 原生移动端「访问密钥」模式：Bearer 携带访问密钥连开启局域网访问的桌面主机。
+        let mut keyed = connect_rpc(address, "flux2026abc")
+            .await
+            .expect("desktop mode accepts the access key");
+        let capabilities = rpc_hello(&mut keyed, 1).await;
+        assert!(
+            !capabilities.iter().any(|capability| capability
+                == fluxdown_protocol::method::CAPABILITY_AGENT_OPEN_TASK_FILES)
+        );
+        let denied = socket_request(
+            &mut keyed,
+            2,
+            fluxdown_protocol::method::AGENT_PLATFORM_OPEN_TASK,
+            serde_json::json!({}),
+        )
+        .await;
+        let RpcResponse::Failure(denied) = denied else {
+            panic!("platform methods must be denied for access-key sessions");
+        };
+        assert_eq!(
+            denied.error.data.map(|data| data.code),
+            Some(ApplicationErrorCode::Unsupported)
+        );
+        for wrong in ["flux2026abd", ""] {
+            let error = connect_rpc(address, wrong).await.expect_err("wrong key");
+            assert!(rejected_with(&error, 401), "{wrong:?}: {error:?}");
+        }
+
+        // 改密钥：旧密钥会话断开、旧密钥不能重连，新密钥可连。
+        host.patch_gateway(serde_json::json!({ "userToken": "rotated2026key" }))
+            .await;
+        expect_revoked_close(&mut keyed).await;
+        let error = connect_rpc(address, "flux2026abc")
+            .await
+            .expect_err("old key");
+        assert!(rejected_with(&error, 401), "{error:?}");
+        let mut rotated = connect_rpc(address, "rotated2026key")
+            .await
+            .expect("new key");
+        rpc_hello(&mut rotated, 1).await;
+
+        host.finish().await;
+    }
+
+    #[tokio::test]
+    async fn desktop_rpc_locks_a_remote_source_after_repeated_failures() {
+        use axum::http::StatusCode;
+
+        let host = TestGateway::new("access_key_desktop_throttle").await;
+        host.patch_gateway(serde_json::json!({ "userToken": "flux2026abc" }))
+            .await;
+        let throttle = crate::server_mode::AuthThrottle::default();
+        let bearer = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {value}")).expect("bearer header"),
+            );
+            headers
+        };
+        let authorize = |peer: &str, value: &str| {
+            let peer: std::net::IpAddr = peer.parse().expect("peer address");
+            let headers = bearer(value);
+            let service = host.service.clone();
+            let throttle = &throttle;
+            async move {
+                super::authorize_desktop_rpc(
+                    &service,
+                    throttle,
+                    "test-official-bearer",
+                    peer,
+                    &headers,
+                )
+                .await
+            }
+        };
+        for _ in 0..crate::server_mode::THROTTLE_MAX_FAILURES {
+            assert_eq!(
+                authorize("203.0.113.9", "guess2026key").await,
+                Err(StatusCode::UNAUTHORIZED)
+            );
+        }
+        // 锁定期内连正确的访问密钥也不受理；其它来源与本机回环不受影响。
+        assert_eq!(
+            authorize("203.0.113.9", "flux2026abc").await,
+            Err(StatusCode::TOO_MANY_REQUESTS)
+        );
+        assert_eq!(
+            authorize("203.0.113.10", "flux2026abc").await,
+            Ok(super::RpcCredential::AccessKey("flux2026abc".to_owned()))
+        );
+        assert_eq!(
+            authorize("127.0.0.1", "test-official-bearer").await,
+            Ok(super::RpcCredential::Agent)
+        );
 
         host.finish().await;
     }

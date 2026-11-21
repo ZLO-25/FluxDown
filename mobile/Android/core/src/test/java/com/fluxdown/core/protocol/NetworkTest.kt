@@ -52,33 +52,25 @@ class NetworkTest {
         )
         assertEquals(
             ProxyTestRequest("socks5", "10.0.0.2", "1080", "u", "p"),
-            NetworkProxyTest.request(NetworkProxyMode.Manual, f, null),
+            NetworkProxyTest.manual(f),
         )
     }
 
     @Test
     fun manualRequestDefaultsTypeToHttp() {
         val f = form(mapOf("proxy_host" to "h", "proxy_port" to "1"))
-        assertEquals("http", NetworkProxyTest.request(NetworkProxyMode.Manual, f, null)?.proxyType)
+        assertEquals("http", NetworkProxyTest.manual(f).proxyType)
     }
 
     @Test
     fun systemRequestNeedsADetectedProxyAndSendsNoCredentials() {
-        val f = form(mapOf("proxy_username" to "u", "proxy_password" to "p"))
         val detected = SystemProxyDto(true, "http", "192.168.1.2", 7890, "localhost")
         assertEquals(
             ProxyTestRequest("http", "192.168.1.2", "7890"),
-            NetworkProxyTest.request(NetworkProxyMode.System, f, detected),
+            NetworkProxyTest.system(detected),
         )
-        assertNull(NetworkProxyTest.request(NetworkProxyMode.System, f, SystemProxyDto()))
-        assertNull(NetworkProxyTest.request(NetworkProxyMode.System, f, null))
-    }
-
-    @Test
-    fun noneAndAutoHaveNothingToTest() {
-        val f = form(mapOf("proxy_host" to "h", "proxy_port" to "1"))
-        assertNull(NetworkProxyTest.request(NetworkProxyMode.None, f, null))
-        assertNull(NetworkProxyTest.request(NetworkProxyMode.Auto, f, null))
+        assertNull(NetworkProxyTest.system(SystemProxyDto()))
+        assertNull(NetworkProxyTest.system(null))
     }
 
     @Test
@@ -94,17 +86,52 @@ class NetworkTest {
     // ── 行目录 ──
 
     @Test
-    fun rowVisibilityFollowsModeAndConfigLoad() {
+    fun rowVisibilityFollowsConfigLoad() {
         val siteAuth = listOf(NetworkRow.SiteAuth, NetworkRow.SiteAuthAdd, NetworkRow.SiteAuthClear)
-        assertEquals(siteAuth, NetworkRow.visible(NetworkProxyMode.None, false))
+        assertEquals(siteAuth, NetworkRow.visible(form(emptyMap())))
 
-        val none = NetworkRow.visible(NetworkProxyMode.None, true)
-        assertEquals(listOf(NetworkRow.Mode) + siteAuth, none)
-        assertEquals(none, NetworkRow.visible(NetworkProxyMode.System, true))
-        assertEquals(none, NetworkRow.visible(NetworkProxyMode.Auto, true))
+        val loaded = listOf(
+            NetworkRow.Mode,
+            NetworkRow.Type, NetworkRow.Host, NetworkRow.Port,
+            NetworkRow.Username, NetworkRow.Password, NetworkRow.NoList, NetworkRow.Test,
+            NetworkRow.BtProxyEnabled,
+            NetworkRow.Rules, NetworkRow.RulesAdd, NetworkRow.RulesTest,
+        ) + siteAuth
+        // bt_proxy_enabled 缺省（旧 daemon）按目录默认 false：「代理来源」「节点连接也走代理」隐藏
+        assertEquals(loaded, NetworkRow.visible(form(mapOf("proxy_mode" to "none"))))
+        assertTrue(NetworkRow.Host in loaded && NetworkRow.Test in loaded)
 
-        val manual = NetworkRow.visible(NetworkProxyMode.Manual, true)
-        assertTrue(NetworkRow.Host in manual && NetworkRow.Password in manual && NetworkRow.Test in manual)
+        val btProxy = NetworkRow.visible(form(mapOf("proxy_mode" to "none", "bt_proxy_enabled" to "true")))
+        assertEquals(
+            listOf(NetworkRow.BtProxyEnabled, NetworkRow.BtProxySource, NetworkRow.BtProxyPeers),
+            btProxy.filter { it.group == NetworkRow.Group.BtProxy },
+        )
+        // 分组顺序：BitTorrent 在手动代理之后、站点规则之前
+        assertEquals(btProxy.indexOf(NetworkRow.Test) + 1, btProxy.indexOf(NetworkRow.BtProxyEnabled))
+        assertEquals(btProxy.indexOf(NetworkRow.BtProxyPeers) + 1, btProxy.indexOf(NetworkRow.Rules))
+    }
+
+    @Test
+    fun btProxyHintMirrorsGpui() {
+        val manual = { type: String, host: String, port: String -> BtProxyHint.of("manual", type, host, port) }
+        assertEquals(BtProxyHint.NoServer, manual("socks5", "", "1080"))
+        assertEquals(BtProxyHint.NoServer, manual("https", "proxy.lan", " "))
+        assertEquals(BtProxyHint.UnsupportedType, manual("https", "proxy.lan", "443"))
+        assertEquals(BtProxyHint.NoUdp, manual("http", "proxy.lan", "8080"))
+        assertEquals(BtProxyHint.NoUdp, manual("socks4", "proxy.lan", "1080"))
+        assertNull(manual("socks5", "proxy.lan", "1080"))
+        assertEquals(BtProxyHint.SystemNote, BtProxyHint.of("system", "https", "", ""))
+
+        val server = mapOf("proxy_type" to "socks4", "proxy_host" to "proxy.lan", "proxy_port" to "1080")
+        assertNull(BtProxyHint.of(form(server)))
+        assertNull(BtProxyHint.of(form(server + ("bt_proxy_enabled" to "false"))))
+        assertEquals(BtProxyHint.NoUdp, BtProxyHint.of(form(server + ("bt_proxy_enabled" to "true"))))
+        assertEquals(BtProxyHint.NoServer, BtProxyHint.of(form(mapOf("bt_proxy_enabled" to "true"))))
+        assertEquals(
+            BtProxyHint.SystemNote,
+            BtProxyHint.of(form(server + ("bt_proxy_enabled" to "true") + ("bt_proxy_source" to "system"))),
+        )
+        assertEquals(false, SettingsCatalog.isSynced("bt_proxy_peers"))
     }
 
     @Test

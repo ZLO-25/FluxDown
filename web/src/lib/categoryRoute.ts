@@ -5,8 +5,8 @@ import { categoriesFromPreference } from '../pages/downloads/model/categories'
 import { compileEngineRegex } from '../pages/rss/filter'
 import type { CategoryRouteDto, CustomCategoryDto } from './rpc'
 
-/** 由分类列表（已按 position 排序）构建路由；没有任何分类配置目录时为 null。 */
-export function routeFromCategories(categories: readonly CustomCategoryDto[]): CategoryRouteDto | null {
+/** 由分类列表构建已授权路由；没有分类目录时也返回空规则路由，供插件归档分类使用。 */
+export function routeFromCategories(categories: readonly CustomCategoryDto[]): CategoryRouteDto {
   const visible = categories.filter((category) => category.visible)
   const otherDir = visible.find((category) => category.builtinType === 'other')?.saveDir.trim() ?? ''
   const rules = visible
@@ -20,13 +20,18 @@ export function routeFromCategories(categories: readonly CustomCategoryDto[]): C
       if (dir !== '') rule.saveDir = dir
       return rule
     })
-  const routes = otherDir !== '' || rules.some((rule) => (rule.saveDir ?? '') !== '')
-  if (!routes) return null
-  return otherDir !== '' ? { rules, otherDir } : { rules }
+  const archiveCategories = Object.fromEntries(visible
+    .filter((category) => category.builtinType && category.builtinType !== 'all' && category.saveDir.trim() !== '')
+    .map((category) => [category.builtinType!, category.saveDir.trim()]))
+  return {
+    rules,
+    ...(otherDir !== '' ? { otherDir } : {}),
+    ...(Object.keys(archiveCategories).length ? { archiveCategories } : {}),
+  }
 }
 
 /** 由 `custom_categories` 偏好值构建路由。 */
-export function routeFromPreference(value: unknown): CategoryRouteDto | null {
+export function routeFromPreference(value: unknown): CategoryRouteDto {
   return routeFromCategories(categoriesFromPreference(value))
 }
 
@@ -144,6 +149,21 @@ export function routeSaveDir(route: CategoryRouteDto, fileName: string, url: str
 /** 分类下拉的模式：自动 / 不分类 / 指定分类 id。 */
 export type CategoryPickMode = { kind: 'auto' } | { kind: 'none' } | { kind: 'category'; id: string }
 
+/** 设备本地偏好：新建下载分类模式记忆（`auto` / `none` / `category:<id>`，不进云同步）。 */
+export const LAST_CATEGORY_MODE_PREF = 'download.last_category_mode'
+
+/** Device-local remembered picker mode; malformed or stale category ids fall back to Auto. */
+export function categoryModeFromPreference(value: unknown, categories: readonly CustomCategoryDto[]): CategoryPickMode {
+  if (value === 'none') return { kind: 'none' }
+  if (typeof value !== 'string' || !value.startsWith('category:')) return { kind: 'auto' }
+  const id = value.slice('category:'.length)
+  return pickableCategories(categories).some((category) => category.id === id) ? { kind: 'category', id } : { kind: 'auto' }
+}
+
+export function categoryModePreference(mode: CategoryPickMode): string {
+  return mode.kind === 'category' ? `category:${mode.id}` : mode.kind
+}
+
 /** 可选分类：visible、非 all、目录非空，按 position 排序（`categories` 已排序）。 */
 export function pickableCategories(categories: readonly CustomCategoryDto[]): CustomCategoryDto[] {
   return categories.filter((category) => category.visible && category.builtinType !== 'all' && category.saveDir.trim() !== '')
@@ -156,13 +176,22 @@ export function matchedCategory(options: readonly CustomCategoryDto[], predicted
 }
 
 /**
- * Auto 模式下预测输入变化时目录框应改写成的值；不应覆盖（用户手改过）返回 null。
- * 目录框为空、等于 offered、或等于上一次自动写入值才跟随。
+ * 目录框是否仍是「程序给的」（未被用户手改）：空、等于程序最近一次写入值；
+ * 表单尚未写过目录框（lastWritten 为空）时等于 offered。
  */
-export function autoFollowDir(current: string, offered: string, lastAuto: string | null, predicted: string | null): string | null {
+export function dirUntouched(current: string, offered: string, lastWritten: string | null): boolean {
   const dir = current.trim()
-  if (dir !== '' && dir !== offered.trim() && dir !== lastAuto) return null
-  return predicted ?? offered
+  if (dir === '') return true
+  if (lastWritten !== null && lastWritten !== '') return dir === lastWritten
+  return dir === offered.trim()
+}
+
+/**
+ * Auto 模式下预测输入变化时目录框应改写成的值；用户手改过（非 `dirUntouched`）返回 null。
+ */
+export function autoFollowDir(current: string, offered: string, lastWritten: string | null, predicted: string | null, manuallyChosen = false): string | null {
+  if (manuallyChosen || !dirUntouched(current, offered, lastWritten)) return null
+  return predicted ?? offered.trim()
 }
 
 /** 模式对应的目录框值（Auto 取预测或 offered）。 */
@@ -171,4 +200,14 @@ export function modeDir(mode: CategoryPickMode, categories: readonly CustomCateg
   if (mode.kind === 'none') return offered
   const category = categories.find((item) => item.id === mode.id)
   return category ? category.saveDir.trim() : offered
+}
+/** Route is submitted only while Auto is active and the directory still follows the offered/category route. */
+export function eligibleRoute(
+  route: CategoryRouteDto | null,
+  mode: CategoryPickMode,
+  manuallyChosen: boolean,
+  submitted: string,
+  offered: string,
+): CategoryRouteDto | null {
+  return route !== null && mode.kind === 'auto' && !manuallyChosen && routeFollows(route, submitted, offered) ? route : null
 }

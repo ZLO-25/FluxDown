@@ -77,6 +77,30 @@ public extension HostSession {
     func callVoid(_ method: String) async throws(HostError) {
         _ = try await call(method, params: nil)
     }
+    /// Creates a manifest group. `offeredSaveDir` is non-wire authorization context: Rust
+    /// applies the host's current category routing only when the submitted directory follows it.
+    func createGroup(_ request: CreateGroupRequest, offeredSaveDir: String?) async throws(HostError) -> CreateGroupResponse {
+        let encoded = try ProtocolJSON.encode(request, what: "daemon.group.create params")
+        var object = try ProtocolJSON.decode(JSONValue.self, from: encoded, what: "daemon.group.create params")
+        guard case var .object(fields) = object else {
+            throw HostError(.internal, message: "group request must encode as an object")
+        }
+        if let offeredSaveDir {
+            fields["_offeredSaveDir"] = .string(offeredSaveDir)
+        }
+        object = .object(fields)
+        let data = try ProtocolJSON.encode(object, what: "daemon.group.create params")
+        let responseData = try await call(HostMethod.daemonGroupCreate, params: data)
+        return try ProtocolJSON.decode(CreateGroupResponse.self, from: responseData, what: "daemon.group.create result")
+    }
+
+    /// 只由当前主机下载提交成功路径调用；与下发到其它设备、取消和自动预测无关。
+    func rememberCategoryMode(_ mode: SaveDirCategoryMode) async {
+        let params = PreferencesPatchParams(values: [SaveDirCategoryMode.preferenceKey: mode.preferenceValue], sync: false)
+        // 偏好写回为 best effort，不将已成功创建的下载误报为失败。
+        let _: PreferencesPatchResult? = try? await call(HostMethod.agentPreferencesPatch, params: params)
+    }
+
 }
 
 private func encodeParams(_ params: (some Encodable)?, method: String) throws(HostError) -> Data? {

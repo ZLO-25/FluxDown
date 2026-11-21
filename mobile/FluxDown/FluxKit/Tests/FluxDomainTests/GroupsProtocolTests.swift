@@ -18,20 +18,30 @@ struct GroupsProtocolTests {
         #expect(!empty.hasManifest && empty.items.isEmpty && empty.error.isEmpty)
         let failed = try ProtocolJSON.decode(ResolvePreviewResponse.self, from: Data(#"{"name":"","sourceUrl":"u","error":"login expired","items":[{"id":"1","name":"n","path":"","size":1,"variants":[]}]}"#.utf8), what: "preview")
         #expect(!failed.hasManifest)
+        #expect(empty.pluginId.isEmpty)
+        let withPlugin = try ProtocolJSON.decode(ResolvePreviewResponse.self, from: Data(#"{"name":"A","sourceUrl":"u","pluginId":"com.x.p","items":[]}"#.utf8), what: "preview")
+        #expect(withPlugin.pluginId == "com.x.p")
     }
 
     @Test func createGroupRequestEncodesWireNames() throws {
         let request = CreateGroupRequest(
             sourceUrl: "https://x/s/1", groupName: "Album", saveDir: "/d", queueId: "q", segments: 2,
             extraHeaders: ["A": "B"], startPaused: true,
-            items: [GroupItemRequest(resolverItem: "v@hd", fileName: "v.mp4", relPath: "p", size: 9)]
+            items: [GroupItemRequest(resolverItem: "v@hd", fileName: "v.mp4", relPath: "p", size: 9)],
+            resolverPluginId: "com.example.archive",
+            archiveMetadata: ArchiveMetadataDto(platform: "example", seriesTitle: "Album"),
+            categoryRoute: CategoryRouteDto(
+                rules: [CategoryRuleDto(matchMode: "extension", extensions: ["mp4"], saveDir: "/video")]
+            )
         )
         let json = try ProtocolJSON.decode(JSONValue.self, from: ProtocolJSON.encode(request, what: "g"), what: "g")
         #expect(json["groupName"]?.stringValue == "Album")
         #expect(json["startPaused"]?.boolValue == true)
         #expect(json["extraHeaders"]?["A"]?.stringValue == "B")
+        #expect(json["resolverPluginId"]?.stringValue == "com.example.archive")
         #expect(json["items"]?.arrayValue?.first?["resolverItem"]?.stringValue == "v@hd")
-        #expect(json["items"]?.arrayValue?.first?["relPath"]?.stringValue == "p")
+        #expect(json["categoryRoute"]?["rules"]?.arrayValue?.first?["saveDir"]?.stringValue == "/video")
+        #expect(json["archiveMetadata"]?["seriesTitle"]?.stringValue == "Album")
 
         let capture = try ProtocolJSON.decode(JSONValue.self, from: ProtocolJSON.encode(CaptureCreateGroupParams(transactionId: "tx", request: request), what: "c"), what: "c")
         #expect(capture["transactionId"]?.stringValue == "tx")

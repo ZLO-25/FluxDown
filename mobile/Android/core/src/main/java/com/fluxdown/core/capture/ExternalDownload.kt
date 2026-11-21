@@ -66,15 +66,26 @@ object ExternalIntake {
     /**
      * VIEW 的 data：`fluxdown://download?url=…&filename=…&cookies=…&referrer=…&headers=<JSON>` 走协议解析；
      * 其余（http(s) 直链 / magnet / ed2k）原样作为链接，X 浏览器等经 extra 附带的 [userAgent] / [cookie] /
-     * [referer] 随之带上。
+     * [referer] 随之带上；浏览器扩展的 Android Intent 另带 [fileName] 与完整请求头 [headersJson]
+     * （[userAgent] 只在请求头里没有 User-Agent 时补上）。
      */
-    fun fromView(data: String?, userAgent: String? = null, cookie: String? = null, referer: String? = null): ExternalDownload? {
+    fun fromView(
+        data: String?,
+        userAgent: String? = null,
+        cookie: String? = null,
+        referer: String? = null,
+        fileName: String? = null,
+        headersJson: String? = null,
+    ): ExternalDownload? {
         val raw = data?.trim().orEmpty()
         if (raw.isEmpty()) return null
         if (raw.startsWith(PROTOCOL_PREFIX, ignoreCase = true)) return fromProtocol(raw)
+        val headers = LinkedHashMap(decodeHeaders(headersJson))
         val ua = userAgent?.trim().orEmpty()
-        val headers = if (ua.isEmpty()) emptyMap() else mapOf("User-Agent" to ua.take(MAX_HEADER_VALUE_LEN))
-        return normalize(raw, "", cookie.orEmpty(), referer.orEmpty(), headers)
+        if (ua.isNotEmpty() && headers.keys.none { it.equals("User-Agent", ignoreCase = true) } && headers.size < MAX_HEADERS) {
+            headers["User-Agent"] = ua.take(MAX_HEADER_VALUE_LEN)
+        }
+        return normalize(raw, fileName.orEmpty(), cookie.orEmpty(), referer.orEmpty(), headers)
     }
 
     /** 从文本中提取首个可下载链接；无匹配返回 null。 */
@@ -140,8 +151,9 @@ object ExternalIntake {
 
 /**
  * 「免打扰下载」（偏好 `download.silent_download`）下外部请求直接建任务的参数，规则同 agent
- * `capture.rs::ExternalPolicy`：保存目录 = 跟随上次保存位置 > 主机默认目录，并把它作为
- * `offeredSaveDir` 交给 Rust 按分类规则路由；队列 / 分段取主机默认；[unattended] = 设备偏好
+ * `capture.rs::ExternalPolicy`：保存目录 = 跟随上次保存位置 > 主机默认目录；免打扰自动分类开启（偏好
+ * `download.silent_auto_category`，缺省开）时再把它作为 `offeredSaveDir` 交给 Rust 按分类规则路由，
+ * 关闭时只用该目录。队列 / 分段取主机默认；[unattended] = 设备偏好
  * `download.silent_skip_selection`（跳过 BT 文件 / 画质 / 变体二次选择）。
  */
 data class SilentCapture(val request: CreateTaskRequest) {
@@ -150,6 +162,7 @@ data class SilentCapture(val request: CreateTaskRequest) {
     companion object {
         const val SILENT_PREF = "download.silent_download"
         const val SKIP_SELECTION_PREF = "download.silent_skip_selection"
+        const val AUTO_CATEGORY_PREF = "download.silent_auto_category"
         private const val REMEMBER_LAST_SAVE_DIR_PREF = "download.remember_last_save_dir"
         private const val LAST_SAVE_DIR_PREF = "download.last_save_dir"
 
@@ -165,7 +178,7 @@ data class SilentCapture(val request: CreateTaskRequest) {
                     url = download.url,
                     fileName = download.fileName,
                     saveDir = saveDir,
-                    offeredSaveDir = saveDir,
+                    offeredSaveDir = saveDir.takeIf { prefs.bool(AUTO_CATEGORY_PREF, true) },
                     unattended = prefs.bool(SKIP_SELECTION_PREF, false),
                     segments = state.config["default_segments"]?.trim()?.toIntOrNull() ?: 0,
                     queueId = state.defaultQueueId(),

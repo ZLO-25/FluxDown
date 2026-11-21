@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import type { PluginDto } from '../../lib/rpc'
 import {
+  activeAuthViewOf,
+  authViewOf,
   deriveActivityEntries,
   deriveChromeSpecs,
   deriveDetailTabs,
@@ -31,7 +33,7 @@ function plugin(over: Partial<PluginDto> & { identity: string }): PluginDto {
     resolverUrls: [],
     loadStatus: 'Loaded',
     loadError: '',
-    contributions: { views: [], commands: [], sniffRules: false, pageScripts: [] },
+    contributions: { views: [], commands: [], sniffRules: false, archiveRules: false, pageScripts: [] },
     risk: 'standard',
     consentPending: [],
     consentPendingHosts: [],
@@ -52,6 +54,7 @@ const good = plugin({
       { id: 'send', title: 'Send', palette: false, taskMenu: true },
     ],
     sniffRules: false,
+    archiveRules: false,
     pageScripts: [],
   },
 })
@@ -120,6 +123,7 @@ describe('plugin contributions', () => {
         views: [view('panel', 'activity', false), view('info', 'taskDetail', false), view('cfg', 'settings', false)],
         commands: [],
         sniffRules: false,
+        archiveRules: false,
         pageScripts: [],
       },
     })
@@ -135,5 +139,18 @@ describe('plugin contributions', () => {
     expect(hasPluginSettings(plugin({ identity: 'f@x', settings: [field] }))).toBe(true)
     expect(hasPluginSettings(disabled)).toBe(false) // 视图不可运行且无字段
     expect(hasPluginSettings(plugin({ ...disabled, settings: [field] }))).toBe(true)
+  })
+
+  test('auth view: portable auth location, usable plugin only', () => {
+    const withAuth = plugin({
+      identity: 'g@x',
+      contributions: { views: [view('login', 'auth'), view('deskLogin', 'auth', false)], commands: [], sniffRules: false, archiveRules: false, pageScripts: [] },
+    })
+    expect(authViewOf(withAuth)?.id).toBe('login')
+    expect(activeAuthViewOf(withAuth)?.id).toBe('login')
+    expect(activeAuthViewOf(plugin({ ...withAuth, enabled: false }))).toBeUndefined()
+    expect(activeAuthViewOf(plugin({ ...withAuth, consentPending: ['tasks'] }))).toBeUndefined()
+    expect(authViewOf(good)).toBeUndefined()
+    expect(authViewOf(plugin({ identity: 'h@x', contributions: { views: [view('login', 'auth', false)], commands: [], sniffRules: false, archiveRules: false, pageScripts: [] } }))).toBeUndefined()
   })
 })

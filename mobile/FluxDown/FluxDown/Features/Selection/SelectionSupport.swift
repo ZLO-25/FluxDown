@@ -103,9 +103,34 @@ final class SelectionResolver {
         }
     }
 
-    /// 取消：任务保持暂停。
+    /// 取消：BT 删除任务连同文件（`cancelDeletesTask`，同 GPUI；引擎随之撤回待选请求，Sheet 随请求消失关闭）；
+    /// 其它选择答复 `.cancelled`，任务保持暂停。
     func cancel(_ request: SelectionRequest, onSuccess: @escaping SelectionClose) {
-        resolve(request, .cancelled, successToast: L("mobileSelectionCancelled"), userInitiated: true, onSuccess: onSuccess)
+        guard request.kind.cancelDeletesTask else {
+            resolve(request, .cancelled, successToast: L("mobileSelectionCancelled"), userInitiated: true, onSuccess: onSuccess)
+            return
+        }
+        let toasts = container.toasts
+        if blockedByReadOnly() { return }
+        let id = request.requestId
+        guard inFlight.insert(id).inserted else { return }
+        ours.insert(id) // 请求消失（被撤回）的事件可能先于本任务恢复到达，不提示「已在别处处理」
+        let session = container.session
+        Task {
+            defer { inFlight.remove(id) }
+            do throws(HostError) {
+                try await session.delete(request.taskId, deleteFiles: true)
+                FluxHaptic.success.play()
+                toasts.show(text: L("mobileTaskFileDeleted"), tone: .success, systemImage: "checkmark.circle")
+                onSuccess()
+            } catch {
+                ours.remove(id)
+                if !Self.isStale(error), container.store.state.selections.contains(where: { $0.requestId == id }) {
+                    FluxHaptic.error.play()
+                    toasts.show(text: ErrorText.describe(error), tone: .error)
+                }
+            }
+        }
     }
 
     /// 倒计时到期：按默认项答复。
@@ -117,11 +142,14 @@ final class SelectionResolver {
 // MARK: - 共用 UI
 
 /// 倒计时基准：首次出现时固定 `total`，环按 deadline 重算（重建视图不会重置）。
+/// `enabled == false`：请求无截止（用户关闭了自动选择默认项），不显示倒计时、不自动答复。
 struct SelectionTiming {
     let deadline: Date
     let total: TimeInterval
+    let enabled: Bool
 
     init(_ request: SelectionRequest) {
+        enabled = request.hasDeadline
         deadline = Date(timeIntervalSince1970: TimeInterval(request.deadlineUnixMs) / 1000)
         total = max(deadline.timeIntervalSinceNow, 1)
     }
@@ -159,22 +187,24 @@ struct SelectionBar<Primary: View>: ToolbarContent {
 
     var body: some ToolbarContent {
         ToolbarItem(placement: .bottomBar) {
-            HStack(spacing: 8) {
-                CountdownRing(
-                    deadline: timing.deadline,
-                    total: timing.total,
-                    label: { L("selectionAutoDefaultIn", ["seconds": $0]) },
-                    onExpire: onExpire
-                )
-                TimelineView(.periodic(from: .now, by: 1)) { context in
-                    let seconds = max(0, Int(timing.deadline.timeIntervalSince(context.date).rounded(.up)))
-                    Text(L("selectionAutoDefaultIn", ["seconds": seconds]))
-                        .font(.footnote)
-                        .monospacedDigit()
-                        .lineLimit(2)
-                        .foregroundStyle(seconds <= 5 ? Color.fdStatusWarningText : Color.secondary)
+            if timing.enabled {
+                HStack(spacing: 8) {
+                    CountdownRing(
+                        deadline: timing.deadline,
+                        total: timing.total,
+                        label: { L("selectionAutoDefaultIn", ["seconds": $0]) },
+                        onExpire: onExpire
+                    )
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        let seconds = max(0, Int(timing.deadline.timeIntervalSince(context.date).rounded(.up)))
+                        Text(L("selectionAutoDefaultIn", ["seconds": seconds]))
+                            .font(.footnote)
+                            .monospacedDigit()
+                            .lineLimit(2)
+                            .foregroundStyle(seconds <= 5 ? Color.fdStatusWarningText : Color.secondary)
+                    }
+                    .accessibilityHidden(true)
                 }
-                .accessibilityHidden(true)
             }
         }
         ToolbarSpacer(.flexible, placement: .bottomBar)

@@ -10,11 +10,12 @@ import { Button } from "@/ui/components/Button";
 import { EmptyState } from "@/ui/components/EmptyState";
 import { Icon } from "@/ui/components/Icon";
 import { IconButton } from "@/ui/components/IconButton";
-import { TextInput } from "@/ui/components/TextInput";
 import { showToast } from "@/ui/components/Toast";
+import { QuickDownload } from "./QuickDownload";
 import { formatBytes, formatSpeed, progressPercent } from "@/ui/format";
 import { useT } from "@/ui/i18n";
 import "./features.css";
+import { isCompletedFileMissing } from "./task-state";
 
 /** popup ↔ background 的任务对象（与 background/tasks.ts 一致）。 */
 interface TaskBrief {
@@ -26,6 +27,7 @@ interface TaskBrief {
   speed: number;
   errorMessage?: string;
   createdAt: string;
+  fileMissing?: boolean;
 }
 
 interface NmhTasksResponse {
@@ -71,8 +73,6 @@ export function TaskList(props: Props): JSX.Element {
   const t = useT();
   const [state, setState] = useState<NmhTasksResponse | null>(null);
   const [starting, setStarting] = useState(false);
-  const [quickUrl, setQuickUrl] = useState("");
-  const [quickBusy, setQuickBusy] = useState(false);
   const inFlight = useRef(false);
   const startTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
@@ -137,47 +137,9 @@ export function TaskList(props: Props): JSX.Element {
     startTimer.current = setTimeout(() => setStarting(false), 8000);
   };
 
-  const submitQuick = async () => {
-    const url = quickUrl.trim();
-    if (!url) return;
-    try {
-      new URL(url);
-    } catch {
-      showToast(t("popup.quickDownload.invalidUrl"), "error");
-      return;
-    }
-    setQuickBusy(true);
-    try {
-      const res = await sendAction<"downloadUrls">({ action: "downloadUrls", urls: [url] });
-      if (res?.success) {
-        showToast(t("popup.quickDownload.sent"), "success");
-        setQuickUrl("");
-        void poll();
-      } else {
-        showToast(res?.message || t("popup.quickDownload.failed"), "error");
-      }
-    } catch {
-      showToast(t("popup.quickDownload.failed"), "error");
-    } finally {
-      setQuickBusy(false);
-    }
-  };
-
   if (!state) return <div class="fd-empty">{t("header.checking")}</div>;
 
-  const quick = props.quickDownload && state.connected ? (
-    <div class="fd-quick">
-      <TextInput
-        value={quickUrl}
-        placeholder={t("popup.quickDownload.placeholder")}
-        onInput={setQuickUrl}
-        onCommit={() => void submitQuick()}
-      />
-      <Button size="sm" variant="primary" disabled={quickBusy} onClick={() => void submitQuick()}>
-        {t("popup.quickDownload.button")}
-      </Button>
-    </div>
-  ) : null;
+  const quick = props.quickDownload && state.connected ? <QuickDownload onSent={() => void poll()} /> : null;
 
   if (!state.connected) {
     return (
@@ -248,25 +210,29 @@ export function TaskList(props: Props): JSX.Element {
       {completed.length > 0 ? (
         <section class="fd-group">
           <h4 class="fd-group-title">{t("popup.tasks.completed")}</h4>
-          {completed.map((task) => (
-            <div class="fd-task" key={task.taskId}>
-              <Icon name="checkCircle" size={18} class="fd-ok" />
-              <div class="fd-task-main">
-                <div class="fd-row-title" title={task.fileName}>
-                  {task.fileName}
+          {completed.map((task) => {
+            const missing = isCompletedFileMissing(task);
+            return (
+              <div class="fd-task" key={task.taskId}>
+                <Icon name={missing ? "alert" : "checkCircle"} size={18} class={missing ? "" : "fd-ok"} />
+                <div class="fd-task-main">
+                  <div class="fd-row-title" title={task.fileName}>
+                    {task.fileName}
+                  </div>
+                  <div class="fd-task-meta">
+                    <span>{formatBytes(task.totalBytes > 0 ? task.totalBytes : task.downloadedBytes)}</span>
+                  </div>
+                  {missing ? <div class="fd-task-error">{t("popup.task.fileMissing")}</div> : null}
                 </div>
-                <div class="fd-task-meta">
-                  <span>{formatBytes(task.totalBytes > 0 ? task.totalBytes : task.downloadedBytes)}</span>
-                </div>
+                <Button size="sm" variant="ghost" disabled={missing} onClick={() => void fileOp("open", task.taskId)}>
+                  {t("popup.task.open")}
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => void fileOp("reveal", task.taskId)}>
+                  {t("popup.task.reveal")}
+                </Button>
               </div>
-              <Button size="sm" variant="ghost" onClick={() => void fileOp("open", task.taskId)}>
-                {t("popup.task.open")}
-              </Button>
-              <Button size="sm" variant="ghost" onClick={() => void fileOp("reveal", task.taskId)}>
-                {t("popup.task.reveal")}
-              </Button>
-            </div>
-          ))}
+            );
+          })}
         </section>
       ) : null}
     </div>

@@ -2,7 +2,7 @@
   "identity": "fluxdown@feature-demo",
   "name": "功能演示 Feature Demo",
   "version": "1.0.0",
-  "description": "覆盖插件平台全部能力的演示插件：可移植视图、桌面脚本、命令、任务右键、详情 tab、设置视图、事件、定时器、任务 API、嗅探规则、resolver 与 hook。",
+  "description": "覆盖插件平台能力的演示插件：可移植视图、桌面脚本、命令、事件、任务 API、嗅探与分类规则、resolver 与 hook。",
   "homepage": "https://fluxdown.com/docs/plugins/sdk",
   "resolvers": [
     {
@@ -43,6 +43,7 @@
       { "id": "inspect", "title": "查看任务信息", "taskMenu": true }
     ],
     "sniffRules": "rules.json",
+    "archiveRules": { "entry": "archive-rules.json", "publicKey": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8" },
     "pageScripts": [
       {
         "id": "page-hello",
@@ -55,7 +56,7 @@
     ]
   },
   "settings": [
-    { "key": "greeting", "title": "问候语", "type": "string", "default": "你好" },
+    { "key": "greeting", "title": "问候语", "type": "string", "default": "你好", "localizations": { "zh": { "title": "问候语" }, "en": { "title": "Greeting" } } },
     {
       "key": "mode",
       "title": "模式",
@@ -65,10 +66,11 @@
         { "value": "calm", "label": "安静" },
         { "value": "loud", "label": "热闹" }
       ],
-      "default": "calm"
+      "default": "calm",
+      "localizations": { "zh": { "title": "模式", "options": { "calm": "安静", "loud": "热闹" } }, "en": { "title": "Mode", "options": { "calm": "Calm", "loud": "Loud" } } }
     },
-    { "key": "toastOnDone", "title": "任务完成时弹通知", "type": "boolean", "default": "true" },
-    { "key": "tickSeconds", "title": "面板计时间隔（秒）", "type": "number", "min": 1, "max": 60, "default": "2" }
+    { "key": "toastOnDone", "title": "任务完成时弹通知", "type": "boolean", "default": "true", "localizations": { "zh": { "title": "任务完成时弹通知" }, "en": { "title": "Notify when a task completes" } } },
+    { "key": "tickSeconds", "title": "面板计时间隔（秒）", "type": "number", "min": 1, "max": 60, "default": "2", "localizations": { "zh": { "title": "面板计时间隔（秒）" }, "en": { "title": "Panel timer interval (seconds)" } } }
   ],
-  "permissions": ["tasks", "browserRules", "desktop", "background", "pageScripts"]
+  "permissions": ["tasks", "browserRules", "desktop", "background", "pageScripts", "archive"]
 }

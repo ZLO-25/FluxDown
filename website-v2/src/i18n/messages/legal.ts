@@ -9,6 +9,9 @@ import { defineMessages } from "../define";
 const GH = "https://github.com/zerx-lab/FluxDown";
 const ext = (url: string, label: string) =>
   `<a href="${url}" rel="noopener noreferrer" target="_blank">${label}</a>`;
+/** 账单 / 退款联系邮箱:服务条款「退款」与「联系我们」两处共用。 */
+const BILLING_EMAIL = "1603852@qq.com";
+const BILLING_MAIL = `<a href="mailto:${BILLING_EMAIL}">${BILLING_EMAIL}</a>`;
 
 export const legal = defineMessages({
   en: {
@@ -22,7 +25,7 @@ export const legal = defineMessages({
       },
       eyebrow: "Legal · Privacy",
       title: "Privacy <em>Policy</em>",
-      updated: "October 2026",
+      updated: "November 2026",
       intro:
         'FluxDown ("we", "our", or "the software") is committed to protecting your privacy. This Privacy Policy explains what information we collect, what we do not collect, and how your data is handled when you use the FluxDown desktop application, the FluxDown mobile apps for iOS and Android, the browser extension, the optional FluxDown account, and this website.',
       sections: [
@@ -31,7 +34,7 @@ export const legal = defineMessages({
           title: "Information We Collect",
           body: "We collect minimal information necessary to provide and improve our services:",
           items: [
-            "<strong>Website analytics:</strong> We use Vercel Web Analytics, a privacy-friendly analytics service that collects anonymous, aggregated page view data. No cookies are used, no personal data is collected, and no individual users are tracked.",
+            "<strong>Website analytics:</strong> This website uses Cloudflare Web Analytics (cookieless, aggregated page views) and Google Analytics 4 (page views, referrers and on-page interactions, using first-party cookies). Details are in Website Analytics below.",
             "<strong>Feedback submissions:</strong> When you voluntarily submit feedback through our website, we collect the feedback type, title, description, and optionally your contact information. This data is stored as GitHub Issues in our repository.",
             "<strong>Email subscriptions:</strong> If you subscribe to platform availability notifications, we store your email address in a GitHub Issue. This is used solely to notify you when the requested platform becomes available.",
             "<strong>Anonymous usage counters (desktop and server):</strong> The desktop application and the headless server send two anonymous events: <code>app_installed</code> once and <code>app_active</code> at most once a day. They contain a random installation ID, the operating system, CPU architecture and app version — never URLs, file names or account data. You can turn them off with the Anonymous Usage Statistics switch in settings. The mobile apps do not send these events.",
@@ -49,6 +52,21 @@ export const legal = defineMessages({
             "<strong>Cloud notifications (opt-in, desktop and server):</strong> if you enable them, task events (file name, size, status, error and queue name) are sent so we can deliver email or Telegram notifications. Download URLs and save folders are only included if you turn on those options separately. Events are kept for 7 days.",
             "<strong>Download route quality:</strong> while signed in, the app reports connection measurements for download servers (server host name, IP address, connection time, throughput and success) so FluxDown can choose faster routes. These measurements never include URL paths, query strings, file names or tokens.",
             "<strong>Plans:</strong> if you buy an optional plan on the desktop app or the website, we keep the order record (plan, amount and status) with your account. The mobile apps do not offer purchases.",
+            "<strong>Private extension grants and download records:</strong> if an administrator enables a private extension (an extension built for specific customers) for your account, we store the grant (the extension, its validity period and whether it was revoked) and a record of each download of that private extension's package (your account, the extension and version, and the time). Download records are deleted automatically after 365 days, and they do not include your IP address or device information. This data is used only to check that you are entitled to the extension, to safely withdraw a version that turns out to be malicious (the app receives the withdrawal list for extensions you were granted, including after a grant is revoked), and for access auditing. It does not involve your own downloads or download history.",
+          ],
+        },
+        {
+          id: "bt-guard",
+          title: "BT Leech Protection Evidence Reports",
+          body: 'The BT leech protection feature can optionally report evidence about abusive BitTorrent peers to FluxDown so that a shared, signed block list can be built. <strong>It is off by default, and nothing is reported unless you are signed in and have explicitly turned on the evidence reporting switch.</strong> Detection itself runs only on your device. If you turn reporting on, we process:',
+          items: [
+            "<strong>What is reported:</strong> for each peer that matched a detection rule: the peer's IP address group (a single IPv4 address, or an IPv6 /64 network), the rule that matched, metering figures (bytes delivered to it, redundant bytes, the delivered-to-torrent-size ratio, re-request and rewind counters), the time range it was observed in, and the peer's client fingerprint (the peer ID prefix and client name it announced).",
+            "<strong>Torrent identifier:</strong> the torrent's infohash is turned into a one-way keyed hash (HMAC) with a secret key on our server as soon as it arrives. The original infohash is never stored, so the hash cannot be traced back to a torrent.",
+            "<strong>What is never reported:</strong> file names, paths and torrent names are not included. Private torrents are never reported. Peers on local, loopback and link-local networks are never reported.",
+            "<strong>Purpose:</strong> reports from many signed-in users are compared; only when several independent users report the same address group for several different torrents is it added to a public, signed block list that the apps can download. A single report never lists anyone.",
+            "<strong>Retention:</strong> evidence is deleted after a 14-day window. A list entry is taken down automatically 14 days after the last new evidence for it.",
+            "<strong>Third-party data:</strong> the block list also contains community data from BTN-Collected-Rules by PBH-BTN, licensed under CC BY 4.0 (" + ext("https://github.com/PBH-BTN/BTN-Collected-Rules", "source") + ").",
+            "<strong>If you were listed:</strong> list entries are shown by IP address group only, never with personal data. You can check whether your current IP address is listed, see the reason and the expiry time, and file an appeal on the <a href=\"/bt-guard\">BT leech protection self-check page</a>. Approved appeals are removed and allow-listed.",
           ],
         },
         {
@@ -86,7 +104,7 @@ export const legal = defineMessages({
         {
           id: "analytics",
           title: "Website Analytics",
-          body: "This website uses Vercel Web Analytics, which is a privacy-focused analytics service. It does not use cookies, does not collect personal information, does not track individual users across sessions, and is compliant with GDPR, CCPA, and other privacy regulations without requiring a cookie consent banner.",
+          body: `This website uses two analytics services to understand how visitors find and use it. ${ext("https://www.cloudflare.com/web-analytics/", "Cloudflare Web Analytics")} counts aggregated page views without cookies. ${ext("https://policies.google.com/privacy", "Google Analytics 4")} records page views, referrers, approximate location, device and browser type, and on-page interactions such as scrolls and outbound clicks; it sets first-party cookies (<code>_ga</code>, <code>_ga_*</code>) to distinguish visits. Google Analytics 4 does not log or store full IP addresses. Analytics runs only on this website — never in the FluxDown apps or the browser extension — and never sees what you download. You can block it with any content blocker or the ${ext("https://tools.google.com/dlpage/gaoptout", "Google Analytics opt-out add-on")}.`,
           items: [],
         },
         {
@@ -102,7 +120,7 @@ export const legal = defineMessages({
           items: [
             "Sign out at any time, or remove individual devices from your account, in the app's account settings.",
             "Turn settings sync, cloud notifications and the anonymous usage counters on or off in settings.",
-            'Delete your FluxDown account at any time in the app: Settings → Account → Delete Account (confirmed with your password or an email code). This permanently removes your account, signed-in devices, synced settings, sent links and notification settings. Order records are kept only where we are legally required to. Files you downloaded stay on your device. If you cannot access the app, contact us through the <a href="{feedback}">Feedback page</a> from your account email.',
+            'Delete your FluxDown account at any time in the app: Settings → Account → Delete Account (confirmed with your password or an email code). This permanently removes your account, signed-in devices, synced settings, sent links, notification settings and private extension grants, and deletes your private extension download records. Administrators\' operation logs of granting and revoking access are kept for security auditing but are no longer linked to your account. Order records are kept only where we are legally required to. Files you downloaded stay on your device. If you cannot access the app, contact us through the <a href="{feedback}">Feedback page</a> from your account email.',
           ],
         },
         {
@@ -138,13 +156,13 @@ export const legal = defineMessages({
       meta: {
         title: "Terms of Service - FluxDown",
         description:
-          "FluxDown terms of service: license, acceptable use, warranties and liability for the FluxDown desktop app, browser extension and website.",
+          "FluxDown terms of service: license, acceptable use, paid cloud plans, pricing, refunds, warranties and liability for the FluxDown apps, browser extension, FluxCloud and website.",
       },
       eyebrow: "Legal · Terms",
       title: "Terms of <em>Service</em>",
-      updated: "February 2026",
+      updated: "November 2026",
       intro:
-        'Please read these Terms of Service ("Terms") carefully before using FluxDown software, browser extension, and website (collectively, the "Service"). By using the Service, you agree to be bound by these Terms.',
+        'Please read these Terms of Service ("Terms") carefully before using FluxDown software, browser extension, FluxCloud cloud services, and website (collectively, the "Service"). By using the Service, you agree to be bound by these Terms.',
       sections: [
         {
           id: "acceptance",
@@ -204,15 +222,45 @@ export const legal = defineMessages({
           items: [],
         },
         {
+          id: "plans",
+          title: "Paid Plans, Pricing & Billing",
+          body: 'The FluxDown apps, browser extension and every local download feature are free. Only FluxCloud cloud services are sold, in the two forms below. Current plans, prices and term lengths are listed on the <a href="{pricing}">Pricing page</a>; the amount shown at checkout before you pay is the final amount charged.',
+          items: [
+            "<strong>Permanent plans (one-time purchase).</strong> Paid once, in a single payment. There is no recurring fee, no billing period and nothing to renew; the plan's entitlements stay on your account for as long as the FluxCloud service operates.",
+            "<strong>Membership cards (fixed term).</strong> Paid once per term; each card's term length in days is shown on the Pricing page. Cards are renewed manually: they never auto-renew and are never charged automatically. Renewing the same card extends it from its current end date. When a card expires you automatically return to your permanent plan's entitlements, or to the free plan if you have none.",
+            "<strong>No automatic charges.</strong> We do not sell subscriptions and have no auto-renewal. You are only ever charged for a purchase you start yourself.",
+            "<strong>Payment methods and currency.</strong> WeChat Pay is settled in CNY. International cards, Apple Pay and Google Pay are processed by our payment provider Waffo and charged in USD. USDT is paid on the networks listed at checkout. Card details are handled by the payment provider and are never stored by FluxDown.",
+            "<strong>Upgrades and promotions.</strong> When upgrading, the amount already paid for your current plan may be credited, as shown at checkout. Promotional prices and referral discounts apply only where checkout shows them.",
+            "<strong>Price changes.</strong> We may change prices for future purchases. Completed orders are never repriced or charged again.",
+            "For plans marked as entitlement-locked, published entitlements can only be increased, never reduced; the plan page states whether a plan is locked.",
+            "Plans are for your own use. Reselling, sharing accounts or abuse (including bulk automated downloading) may result in restricted or revoked entitlements.",
+          ],
+        },
+        {
+          id: "refunds",
+          title: "Refunds & Cancellation",
+          body: "Plans and cards are digital services activated as soon as payment is confirmed. The following rules apply equally to permanent plans and membership cards (including renewals):",
+          items: [
+            "<strong>7-day refund.</strong> You may request a full refund of any order within 7 days of payment, for any reason. The refund is the amount actually paid for that order, and the plan or card granted by that order is revoked once the refund is issued.",
+            "<strong>After 7 days.</strong> Orders are non-refundable after 7 days from payment, including membership card time that has not been used yet.",
+            "<strong>Always refunded.</strong> Duplicate charges, and payments whose plan we cannot activate, are refunded in full at any time.",
+            "<strong>Statutory rights.</strong> Nothing in these Terms limits any refund or withdrawal right you have under applicable law.",
+            "<strong>Not eligible.</strong> Orders on accounts restricted for violating these Terms are not eligible for the 7-day refund.",
+            "<strong>Cancellation.</strong> Nothing renews automatically, so there is no subscription to cancel: a membership card simply ends on its expiry date, and you are never charged again unless you buy again. To cancel an order within 7 days, request a refund as described below.",
+            `<strong>How to request.</strong> Email ${BILLING_MAIL} from your account email with your order number and the reason. We usually reply within 3 business days. Approved refunds go back to the original payment method (for USDT, to an address on the same network that you provide) and typically arrive within 5–10 business days, depending on the payment channel.`,
+            "<strong>Billing disputes.</strong> If you think a charge is wrong, please contact us before disputing it with your bank or card issuer. A refunded or charged-back order has its plan revoked.",
+          ],
+        },
+        {
           id: "changes",
           title: "Changes to These Terms",
-          body: "We reserve the right to modify these Terms at any time. Updated Terms will be posted on this page with a revised date. Your continued use of the Service after any changes indicates your acceptance of the new Terms.",
+          body: "We reserve the right to modify these Terms at any time. Updated Terms will be posted on this page with a revised date. Your continued use of the Service after any changes indicates your acceptance of the new Terms. Changes never apply retroactively to orders already completed.",
           items: [],
         },
         {
           id: "contact",
           title: "Contact Us",
-          body: 'If you have any questions about these Terms of Service, please reach out to us through the <a href="{feedback}">Feedback page</a> on our website.',
+          body: `For billing and refunds, email ${BILLING_MAIL}. For any other questions about these Terms of Service, reach out to us through the <a href="{feedback}">Feedback page</a> on our website.`,
           items: [],
         },
       ],
@@ -295,7 +343,7 @@ export const legal = defineMessages({
       },
       eyebrow: "法律 · 隐私",
       title: "隐私<em>政策</em>",
-      updated: "2026 年 10 月",
+      updated: "2026 年 11 月",
       intro:
         "FluxDown（以下简称「我们」或「本软件」）致力于保护您的隐私。本隐私政策说明了当您使用 FluxDown 桌面应用、iOS 与 Android 移动应用、浏览器扩展、可选的 FluxDown 账户和本网站时，我们收集哪些信息、不收集哪些信息以及如何处理您的数据。",
       sections: [
@@ -304,7 +352,7 @@ export const legal = defineMessages({
           title: "我们收集的信息",
           body: "我们仅收集提供和改进服务所必需的最少信息：",
           items: [
-            "<strong>网站分析：</strong>我们使用 Vercel Web Analytics，这是一项注重隐私的分析服务，仅收集匿名的、聚合的页面浏览数据。不使用 Cookie，不收集个人数据，不追踪个人用户。",
+            "<strong>网站分析：</strong>本网站使用 Cloudflare Web Analytics（不使用 Cookie，仅聚合页面浏览量）与 Google Analytics 4（页面浏览、来源与页内互动，使用第一方 Cookie），详见下文「网站分析」。",
             "<strong>反馈提交：</strong>当您通过网站自愿提交反馈时，我们收集反馈类型、标题、描述以及可选的联系方式。这些数据以 GitHub Issue 的形式存储在我们的代码仓库中。",
             "<strong>邮件订阅：</strong>如果您订阅了平台可用性通知，我们会将您的邮箱地址存储在 GitHub Issue 中，仅用于在所请求的平台可用时通知您。",
             "<strong>匿名使用计数（桌面端与服务器端）：</strong>桌面应用与无界面服务器会发送两个匿名事件：安装时一次 <code>app_installed</code>，每天至多一次 <code>app_active</code>。其中只包含随机安装 ID、操作系统、CPU 架构和应用版本，绝不包含链接、文件名或账户信息，可在设置中通过「匿名使用统计」开关关闭。移动应用不发送这些事件。",
@@ -322,6 +370,21 @@ export const legal = defineMessages({
             "<strong>云端推送（需主动开启，桌面端与服务器端）：</strong>开启后会发送任务事件（文件名、大小、状态、错误与队列名），用于投递邮件或 Telegram 通知。下载地址与保存目录只有在您分别开启对应选项时才会包含。事件保留 7 天。",
             "<strong>下载线路质量：</strong>登录期间，应用会上报下载服务器的连接测量数据（服务器主机名、IP 地址、连接耗时、吞吐量与是否成功），用于为 FluxDown 选择更快的线路。其中绝不包含链接路径、查询参数、文件名或令牌。",
             "<strong>套餐：</strong>如果您在桌面应用或网站上购买可选套餐，我们会在账户中保存订单记录（套餐、金额与状态）。移动应用不提供任何购买。",
+            "<strong>私有扩展授权与下载记录：</strong>如果管理员为您的账户开通了某个私有扩展（面向特定客户定制的扩展），我们会保存授权记录（扩展、有效期、是否已撤销），以及每次下载该私有扩展安装包的记录（您的账户、扩展与版本、下载时间）。下载记录保留 365 天后自动删除；这些记录不包含您的 IP 地址或设备信息。这些数据只用于三件事：校验您是否有权获取该扩展；在某个版本被判定为恶意时安全撤回（应用会收到您曾获授权的扩展的撤回清单，授权被撤销后同样如此）；以及访问审计。该功能不涉及您自己的下载内容或下载历史。",
+          ],
+        },
+        {
+          id: "bt-guard",
+          title: "BT 防吸血证据上报",
+          body: 'BT 防吸血功能可以选择性地把恶意 BitTorrent 对端的证据上报给 FluxDown，用于生成共享的签名黑名单。<strong>该功能默认关闭；只有您已登录并明确开启「证据上报」开关后才会上报任何内容。</strong>检测本身只在您的设备上运行。开启上报后，我们会处理：',
+          items: [
+            "<strong>上报内容：</strong>对每个命中检测规则的对端：其 IP 地址组（单个 IPv4 地址，或 IPv6 /64 网络）、命中的规则、计量数据（向其送达的字节数、重复字节数、送达量与种子体积之比、重复请求与回退计数）、观察到的时间段，以及对端的客户端特征（其声明的 peer ID 前缀与客户端名称）。",
+            "<strong>种子标识：</strong>种子的 infohash 在到达我们服务器时立即用服务端密钥做单向散列（HMAC），不保存原值，散列值无法反推出具体种子。",
+            "<strong>绝不上报的内容：</strong>不包含文件名、路径与种子名；私有种子永不上报；局域网、回环与链路本地地址的对端永不上报。",
+            "<strong>用途：</strong>我们对多位已登录用户的上报做交叉比对；只有多个独立用户针对多个不同种子上报同一地址组时，才会把它加入应用可下载的公开签名名单。单次上报不会使任何人被列入。",
+            "<strong>保存期限：</strong>证据在 14 天窗口后删除；名单条目在最近一次新证据后 14 天无新证据即自动下架。",
+            "<strong>第三方数据：</strong>名单还包含来自 PBH-BTN 的 BTN-Collected-Rules 的社区数据，采用 CC BY 4.0 许可（" + ext("https://github.com/PBH-BTN/BTN-Collected-Rules", "来源") + "）。",
+            "<strong>如果您被列入名单：</strong>名单条目只以 IP 地址组展示，不含任何个人信息。您可以在 <a href=\"/zh/bt-guard\">BT 防吸血自查页</a> 查询当前 IP 地址是否在名单中、查看原因与到期时间并提出申诉；申诉通过后条目会被移除并加入白名单。",
           ],
         },
         {
@@ -359,7 +422,7 @@ export const legal = defineMessages({
         {
           id: "analytics",
           title: "网站分析",
-          body: "本网站使用 Vercel Web Analytics，这是一项注重隐私的分析服务。它不使用 Cookie、不收集个人信息、不跨会话追踪用户，符合 GDPR、CCPA 等隐私法规，无需显示 Cookie 同意横幅。",
+          body: `本网站使用两项分析服务来了解访客如何找到并使用本站。${ext("https://www.cloudflare.com/web-analytics/", "Cloudflare Web Analytics")} 不使用 Cookie，只统计聚合的页面浏览量。${ext("https://policies.google.com/privacy", "Google Analytics 4")} 记录页面浏览、来源、大致地区、设备与浏览器类型以及滚动、外链点击等页内互动，并设置第一方 Cookie（<code>_ga</code>、<code>_ga_*</code>）以区分访问；Google Analytics 4 不记录也不存储完整 IP 地址。分析只在本网站运行，FluxDown 应用与浏览器扩展中都没有，也绝不会知道您下载了什么。您可以用任意内容拦截器或 ${ext("https://tools.google.com/dlpage/gaoptout", "Google Analytics 停用插件")}阻止它。`,
           items: [],
         },
         {
@@ -375,7 +438,7 @@ export const legal = defineMessages({
           items: [
             "随时在应用的账户设置中退出登录，或从账户中移除单台设备。",
             "在设置中开启或关闭设置同步、云端推送与匿名使用计数。",
-            '您可以随时在应用中删除 FluxDown 账户：设置 → 账户 → 删除账户（需验证密码或邮箱验证码）。删除后，账户、已登录设备、同步的设置、发送的链接与推送设置将被永久移除；仅在法律要求时保留订单记录。已下载的文件仍保留在您的设备上。如果无法使用应用，请用账户邮箱通过<a href="{feedback}">反馈页面</a>联系我们。',
+            '您可以随时在应用中删除 FluxDown 账户：设置 → 账户 → 删除账户（需验证密码或邮箱验证码）。删除后，账户、已登录设备、同步的设置、发送的链接、推送设置与私有扩展授权将被永久移除，您的私有扩展下载记录也会一并删除；管理员对授权与撤销的操作日志会保留用于安全审计，但不再与您的账户关联；仅在法律要求时保留订单记录。已下载的文件仍保留在您的设备上。如果无法使用应用，请用账户邮箱通过<a href="{feedback}">反馈页面</a>联系我们。',
           ],
         },
         {
@@ -410,13 +473,14 @@ export const legal = defineMessages({
     terms: {
       meta: {
         title: "服务条款 - FluxDown",
-        description: "FluxDown 服务条款：FluxDown 桌面应用、浏览器扩展与网站的许可、合理使用、担保与责任限制。",
+        description:
+          "FluxDown 服务条款：FluxDown 应用、浏览器扩展、FluxCloud 与网站的许可、合理使用、付费套餐、收费方式、退款、担保与责任限制。",
       },
       eyebrow: "法律 · 条款",
       title: "服务<em>条款</em>",
-      updated: "2026 年 2 月",
+      updated: "2026 年 11 月",
       intro:
-        "请在使用 FluxDown 软件、浏览器扩展和网站（统称「服务」）前仔细阅读本服务条款（以下简称「条款」）。使用本服务即表示您同意受本条款约束。",
+        "请在使用 FluxDown 软件、浏览器扩展、FluxCloud 云端服务和网站（统称「服务」）前仔细阅读本服务条款（以下简称「条款」）。使用本服务即表示您同意受本条款约束。",
       sections: [
         {
           id: "acceptance",
@@ -476,15 +540,45 @@ export const legal = defineMessages({
           items: [],
         },
         {
+          id: "plans",
+          title: "付费套餐、价格与计费",
+          body: 'FluxDown 应用、浏览器扩展及全部本地下载功能免费。收费的只有 FluxCloud 云端服务，分为以下两种形式。当前在售套餐、价格与期限见<a href="{pricing}">定价页</a>；以付款前结账页显示的金额为最终扣款金额。',
+          items: [
+            "<strong>永久套餐（一次性买断）。</strong>一次付清，单笔扣款。无周期费用、无计费周期、无需续费；在 FluxCloud 服务运营期间，套餐权益持续保留在您的账户上。",
+            "<strong>会员卡（期限卡）。</strong>按期一次性购买，每张卡的期限天数在定价页标注。会员卡手动续费，不会自动续费或自动扣款；续费同一张卡时从当前到期时间顺延。到期后自动回到永久套餐的权益；没有永久套餐则回到免费版。",
+            "<strong>无自动扣费。</strong>我们不提供订阅制，也没有自动续费；只有您自己发起的购买才会扣款。",
+            "<strong>支付方式与币种。</strong>微信支付以人民币结算；国际银行卡、Apple Pay、Google Pay 由支付服务商 Waffo 处理，以美元扣款；USDT 按结账页列出的网络支付。银行卡信息由支付服务商处理，FluxDown 不存储。",
+            "<strong>升级与优惠。</strong>升级时，当前套餐已付金额可按结账页所示抵扣。活动价与推荐码优惠仅在结账页显示时适用。",
+            "<strong>价格调整。</strong>我们可能调整今后购买的价格；已完成的订单不会被重新定价或再次扣款。",
+            "开启「权益锁定」的套餐，已公示权益只增不减；是否锁定以套餐页标注为准。",
+            "套餐限本人使用，转售、共享账号或滥用（含批量自动化下载）可限制或回收权益。",
+          ],
+        },
+        {
+          id: "refunds",
+          title: "退款与取消",
+          body: "套餐与会员卡属于付款确认后即时开通的数字服务。以下规则同样适用于永久套餐与会员卡（含续费订单）：",
+          items: [
+            "<strong>7 天退款。</strong>任一订单在付款后 7 天内，可无理由申请全额退款。退款金额为该订单实际支付金额；退款完成后，撤销该订单开通的套餐或会员卡。",
+            "<strong>超过 7 天。</strong>付款满 7 天后订单不予退款，包括会员卡尚未使用的时长。",
+            "<strong>始终全额退款。</strong>重复扣款，以及付款后我们无法为您开通套餐的订单，任何时候都全额退款。",
+            "<strong>法定权利。</strong>本条款不限制您依适用法律享有的任何退款或撤销权利。",
+            "<strong>不适用情形。</strong>因违反本条款被限制的账户，其订单不适用 7 天退款。",
+            "<strong>取消。</strong>没有任何自动续费，因此无需取消订阅：会员卡到期即自然结束，除非您再次购买，否则不会再扣款。如需在 7 天内取消订单，请按下文申请退款。",
+            `<strong>申请方式。</strong>请使用账户邮箱发送邮件至 ${BILLING_MAIL}，注明订单号与退款原因。我们通常在 3 个工作日内回复。退款原路退回（USDT 订单退回您提供的同网络地址），视支付渠道一般 5–10 个工作日到账。`,
+            "<strong>账单争议。</strong>如认为扣款有误，请先联系我们，再向银行或发卡机构提出争议。已退款或被拒付的订单将撤销对应套餐。",
+          ],
+        },
+        {
           id: "changes",
           title: "条款变更",
-          body: "我们保留随时修改本条款的权利。更新后的条款将发布在本页面，并注明修订日期。在任何更改之后继续使用本服务即表示您接受新条款。",
+          body: "我们保留随时修改本条款的权利。更新后的条款将发布在本页面，并注明修订日期。在任何更改之后继续使用本服务即表示您接受新条款。条款变更不追溯适用于已完成的订单。",
           items: [],
         },
         {
           id: "contact",
           title: "联系我们",
-          body: '如果您对本服务条款有任何疑问，请通过我们网站的<a href="{feedback}">反馈页面</a>与我们联系。',
+          body: `账单与退款请发送邮件至 ${BILLING_MAIL}。对本服务条款的其他疑问，请通过我们网站的<a href="{feedback}">反馈页面</a>与我们联系。`,
           items: [],
         },
       ],

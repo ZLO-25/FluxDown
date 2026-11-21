@@ -23,11 +23,54 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::actor::{ActorCallError, ActorError, ActorOperation, ActorResult, DaemonActorHandle};
+use crate::actor::{
+    ActorCallError, ActorError, ActorOperation, ActorResult, DaemonActorHandle, SeedLocalOptions,
+};
 use crate::blob_store::{BlobKind, BlobStore};
 use crate::config::demo_allows;
 use crate::event_hub::DaemonEventHub;
 use crate::selection::DaemonSelection;
+
+/// `daemon.task.seedLocal` 读取现成 `.torrent` 的大小上限。
+#[cfg(feature = "bt")]
+const SEED_LOCAL_TORRENT_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// `daemon.task.seedLocal` 的生成种子参数 → 引擎选项；不合法的字段在哈希之前就报出来。
+#[cfg(feature = "bt")]
+fn seed_local_build_options(
+    params: &fluxdown_protocol::DaemonSeedLocalParams,
+) -> Result<fluxdown_engine::bt_local_seed::TorrentBuildOptions, RpcErrorObject> {
+    use fluxdown_engine::bt_local_seed::{InvalidBuildOption, TorrentBuildOptions, TorrentFormat};
+    let version = match params.version.trim().to_ascii_lowercase().as_str() {
+        "" | "v1" => TorrentFormat::V1,
+        "v2" => TorrentFormat::V2,
+        "hybrid" => TorrentFormat::Hybrid,
+        _ => {
+            return Err(invalid_argument(
+                "version",
+                "version must be v1, v2 or hybrid",
+            ));
+        }
+    };
+    let options = TorrentBuildOptions {
+        trackers: params.trackers.clone(),
+        version,
+        private: params.private,
+        piece_length: (params.piece_length != 0).then_some(params.piece_length),
+        web_seeds: params.web_seeds.clone(),
+        comment: params.comment.clone(),
+        source: params.source.clone(),
+        created_by: format!("FluxDown {}", fluxdown_protocol::APP_VERSION),
+    };
+    options.validate().map_err(|error| {
+        let field = match error {
+            InvalidBuildOption::PieceLength(_) => "pieceLength",
+            InvalidBuildOption::WebSeed(_) | InvalidBuildOption::TooManyWebSeeds => "webSeeds",
+        };
+        invalid_argument(field, &error.to_string())
+    })?;
+    Ok(options)
+}
 
 /// daemon 运行时共享服务。
 pub struct DaemonService {
@@ -48,6 +91,9 @@ pub struct DaemonService {
     ytdlp_installing: AtomicBool,
     actor: DaemonActorHandle,
     demo_url: Option<String>,
+    /// BT 防吸血宿主（`daemon.bt.guard.*`）；未接线时这些方法答 `unavailable`。
+    #[cfg(feature = "bt")]
+    bt_guard: Option<Arc<fluxdown_engine::bt_guard::BtGuardHost>>,
 }
 
 impl DaemonService {
@@ -90,6 +136,8 @@ impl DaemonService {
             ytdlp_installing: AtomicBool::new(false),
             actor,
             demo_url: None,
+            #[cfg(feature = "bt")]
+            bt_guard: None,
         }
     }
 
@@ -97,6 +145,14 @@ impl DaemonService {
     #[must_use]
     pub fn with_demo_url(mut self, demo_url: Option<String>) -> Self {
         self.demo_url = demo_url;
+        self
+    }
+
+    /// 接入 BT 防吸血宿主（`daemon.bt.guard.*` 的数据面）。
+    #[cfg(feature = "bt")]
+    #[must_use]
+    pub fn with_bt_guard(mut self, bt_guard: Arc<fluxdown_engine::bt_guard::BtGuardHost>) -> Self {
+        self.bt_guard = Some(bt_guard);
         self
     }
 
@@ -137,6 +193,20 @@ impl DaemonService {
     pub fn task(&self, task_id: &str) -> Option<fluxdown_protocol::TaskDto> {
         self.events
             .inspect(|snapshot| snapshot.task(task_id).cloned())
+    }
+
+    /// Read a plugin PNG resource scoped to a live view session.
+    #[must_use]
+    pub fn plugin_image(&self, session: &str, id: &str) -> Option<Arc<[u8]>> {
+        #[cfg(feature = "plugins")]
+        {
+            self.plugin_manager.as_ref()?.view_image(session, id)
+        }
+        #[cfg(not(feature = "plugins"))]
+        {
+            let _ = (session, id);
+            None
+        }
     }
 
     /// 分发 hello 后的连接级 RPC 调用。
@@ -238,6 +308,124 @@ impl DaemonService {
                 }))
             }
             method::DAEMON_TASK_CREATE => self.create_task(params).await,
+            method::DAEMON_TASK_SEED_LOCAL => self.seed_local(params).await,
+            method::DAEMON_TASK_BT_STATUS => {
+                let params = parse_params::<fluxdown_protocol::DaemonBtStatusParams>(params)?;
+                match self
+                    .actor
+                    .execute(ActorOperation::BtStatus {
+                        task_id: params.task_id,
+                    })
+                    .await
+                {
+                    Ok(ActorResult::BtStatus(status)) => to_value(*status),
+                    Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
+                    Err(error) => Err(actor_error(error)),
+                }
+            }
+            method::DAEMON_BT_PORT_STATUS => {
+                match self.actor.execute(ActorOperation::BtPortStatus).await {
+                    Ok(ActorResult::BtPortStatus(status)) => to_value(*status),
+                    Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
+                    Err(error) => Err(actor_error(error)),
+                }
+            }
+            method::DAEMON_TASK_REANNOUNCE => {
+                let params = parse_params::<fluxdown_protocol::DaemonBtStatusParams>(params)?;
+                self.execute_unit(ActorOperation::ReannounceTask {
+                    task_id: params.task_id,
+                })
+                .await
+            }
+            method::DAEMON_TASK_BT_FILES => {
+                let params = parse_params::<fluxdown_protocol::DaemonBtStatusParams>(params)?;
+                match self
+                    .actor
+                    .execute(ActorOperation::BtTaskFiles {
+                        task_id: params.task_id,
+                    })
+                    .await
+                {
+                    Ok(ActorResult::BtFiles(files)) => to_value(*files),
+                    Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
+                    Err(error) => Err(actor_error(error)),
+                }
+            }
+            method::DAEMON_TASK_SET_FILE_PRIORITIES => {
+                let params =
+                    parse_params::<fluxdown_protocol::SetTaskFilePrioritiesParams>(params)?;
+                self.execute_unit(ActorOperation::SetTaskFilePriorities {
+                    task_id: params.task_id,
+                    priorities: params
+                        .priorities
+                        .into_iter()
+                        .map(|entry| (entry.index, entry.priority))
+                        .collect(),
+                })
+                .await
+            }
+            method::DAEMON_TASK_RENAME_BT_FILE => {
+                let params = parse_params::<fluxdown_protocol::RenameBtFileParams>(params)?;
+                if params.path.trim().is_empty() {
+                    return Err(invalid_argument("path", "the new path must not be empty"));
+                }
+                self.execute_unit(ActorOperation::RenameBtFile {
+                    task_id: params.task_id,
+                    index: params.index,
+                    path: params.path,
+                })
+                .await
+            }
+            method::DAEMON_TASK_RECHECK => {
+                let params = parse_params::<fluxdown_protocol::DaemonBtStatusParams>(params)?;
+                self.execute_unit(ActorOperation::RecheckTask {
+                    task_id: params.task_id,
+                })
+                .await
+            }
+            method::DAEMON_TASK_MOVE_STORAGE => {
+                let params = parse_params::<fluxdown_protocol::MoveTaskStorageParams>(params)?;
+                if params.save_dir.trim().is_empty() {
+                    return Err(invalid_argument(
+                        "saveDir",
+                        "the destination folder must not be empty",
+                    ));
+                }
+                self.execute_unit(ActorOperation::MoveTaskStorage {
+                    task_id: params.task_id,
+                    save_dir: params.save_dir,
+                })
+                .await
+            }
+            method::DAEMON_TASK_ED2K_STATUS => {
+                let params = parse_params::<fluxdown_protocol::DaemonEd2kStatusParams>(params)?;
+                match self
+                    .actor
+                    .execute(ActorOperation::Ed2kStatus {
+                        task_id: params.task_id,
+                    })
+                    .await
+                {
+                    Ok(ActorResult::Ed2kStatus(status)) => to_value(*status),
+                    Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
+                    Err(error) => Err(actor_error(error)),
+                }
+            }
+            method::DAEMON_TASK_TORRENT_SHARE => {
+                let params = parse_params::<fluxdown_protocol::DaemonTorrentShareParams>(params)?;
+                match self
+                    .actor
+                    .execute(ActorOperation::TorrentShare {
+                        task_id: params.task_id,
+                        include_torrent: params.include_torrent,
+                    })
+                    .await
+                {
+                    Ok(ActorResult::TorrentShare(share)) => to_value(*share),
+                    Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
+                    Err(error) => Err(actor_error(error)),
+                }
+            }
             method::DAEMON_TASK_CREATE_MANY => self.create_tasks(params).await,
             method::DAEMON_TASK_PAUSE => {
                 let params = parse_params::<IdParams>(params)?;
@@ -283,6 +471,31 @@ impl DaemonService {
                 })
                 .await
             }
+            method::DAEMON_TASK_SET_PROXY => {
+                let params = parse_params::<fluxdown_protocol::SetTaskProxyParams>(params)?;
+                self.execute_unit(ActorOperation::SetTaskProxy {
+                    task_id: params.task_id,
+                    proxy_url: params.proxy_url,
+                })
+                .await
+            }
+            method::DAEMON_TASK_EDIT_INFO => {
+                let params = parse_params::<IdParams>(params)?;
+                let snapshot = fluxdown_engine::task_edit::snapshot(&self.db, &params.id)
+                    .await
+                    .map_err(internal_error)?;
+                serde_json::to_value(fluxdown_engine_protocol::task_edit_snapshot_to_dto(
+                    snapshot,
+                ))
+                .map_err(|error| internal_error(format!("{error:#}")))
+            }
+            method::DAEMON_TASK_EDIT => {
+                let params = parse_params::<fluxdown_protocol::EditTaskParams>(params)?;
+                self.execute_unit(ActorOperation::EditTask(Box::new(
+                    fluxdown_engine_protocol::task_edit_to_engine(params),
+                )))
+                .await
+            }
             method::DAEMON_TASK_DELETE => {
                 let params = parse_params::<DeleteParams>(params)?;
                 self.execute_unit(ActorOperation::DeleteTask {
@@ -306,6 +519,40 @@ impl DaemonService {
                 })
                 .await
             }
+            method::DAEMON_TASK_SET_PIECE_PICKING => {
+                let params = parse_params::<fluxdown_protocol::SetTaskPiecePickingParams>(params)?;
+                self.execute_unit(ActorOperation::SetTaskPiecePicking {
+                    task_id: params.task_id,
+                    sequential: params.sequential,
+                    first_last_pieces_first: params.first_last_pieces_first,
+                })
+                .await
+            }
+            method::DAEMON_TASK_SET_BT_LIMITS => {
+                let params = parse_params::<fluxdown_protocol::SetTaskBtLimitsParams>(params)?;
+                for (field, value) in [
+                    ("downloadLimitBps", params.download_limit_bps),
+                    ("uploadLimitBps", params.upload_limit_bps),
+                ] {
+                    if value.is_some_and(|bps| bps < 0) {
+                        return Err(invalid_argument(field, "speed limits must not be negative"));
+                    }
+                }
+                self.execute_unit(ActorOperation::SetTaskBtLimits {
+                    task_id: params.task_id,
+                    download_limit_bps: params.download_limit_bps,
+                    upload_limit_bps: params.upload_limit_bps,
+                })
+                .await
+            }
+            method::DAEMON_TASK_SET_SUPER_SEEDING => {
+                let params = parse_params::<fluxdown_protocol::SetTaskSuperSeedingParams>(params)?;
+                self.execute_unit(ActorOperation::SetTaskSuperSeeding {
+                    task_id: params.task_id,
+                    enabled: params.enabled,
+                })
+                .await
+            }
             method::DAEMON_TASK_VERIFY => {
                 let params = parse_params::<IdParams>(params)?;
                 match self
@@ -314,6 +561,28 @@ impl DaemonService {
                     .await
                 {
                     Ok(ActorResult::TaskVerify(result)) => to_value(result),
+                    Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
+                    Err(error) => Err(actor_error(error)),
+                }
+            }
+            method::DAEMON_TASK_HASH => {
+                let params = parse_params::<fluxdown_protocol::DaemonTaskHashParams>(params)?;
+                let algorithm = fluxdown_engine::file_hash::HashAlgorithm::parse(&params.algorithm)
+                    .ok_or_else(|| {
+                        invalid_argument(
+                            "algorithm",
+                            &format!("unsupported hash algorithm: {}", params.algorithm),
+                        )
+                    })?;
+                match self
+                    .actor
+                    .execute(ActorOperation::HashTask {
+                        task_id: params.task_id,
+                        algorithm,
+                    })
+                    .await
+                {
+                    Ok(ActorResult::TaskHash(result)) => to_value(result),
                     Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
                     Err(error) => Err(actor_error(error)),
                 }
@@ -432,11 +701,15 @@ impl DaemonService {
                                 name: outcome.name,
                                 source_url,
                                 error: outcome.error,
+                                plugin_id: outcome.plugin_id,
                                 items: outcome
                                     .items
                                     .into_iter()
                                     .map(manifest_item_to_preview_dto)
                                     .collect(),
+                                archive_metadata: outcome
+                                    .archive_metadata
+                                    .map(fluxdown_engine_protocol::archive_metadata_to_dto),
                             })
                         }
                         Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
@@ -483,6 +756,42 @@ impl DaemonService {
             method::DAEMON_CONFIG_GET => {
                 to_value(self.events.inspect(|snapshot| snapshot.config.clone()))
             }
+            method::DAEMON_CONFIG_ARIA2_OPTIONS => {
+                use fluxdown_protocol::aria2_options::{
+                    Aria2OptionsRequest, Aria2OptionsResponse, export, parse,
+                };
+                let request = parse_params::<Aria2OptionsRequest>(params)?;
+                let snapshot = self.events.inspect(|snapshot| snapshot.config.clone());
+                let parsed = match request.text.as_deref() {
+                    Some(text) => parse(text),
+                    None => export(&snapshot.values).and_then(|text| parse(&text)),
+                };
+                let preview = parsed.and_then(|values| {
+                    // The eventual write repeats domain validation and checks the revision.
+                    crate::config::validate_config_patch(&values)
+                        .map_err(|error| error.to_string())?;
+                    let mut effective = snapshot.values.clone();
+                    effective.extend(values.clone());
+                    export(&effective).map(|text| (text, values))
+                });
+                let (text, values, error) = match preview {
+                    Ok((text, values)) => (text, values, None),
+                    Err(error) => (
+                        request.text.unwrap_or_default(),
+                        Default::default(),
+                        Some(error),
+                    ),
+                };
+                let defaults = export(&Default::default())
+                    .map_err(|error| internal_error(error.to_string()))?;
+                to_value(Aria2OptionsResponse {
+                    text,
+                    defaults,
+                    values,
+                    revision: snapshot.revision,
+                    error,
+                })
+            }
             method::DAEMON_CONFIG_PATCH => {
                 let patch = parse_params::<DaemonConfigPatch>(params)?;
                 let values = crate::config::validate_config_patch(&patch.values)
@@ -519,6 +828,39 @@ impl DaemonService {
                     Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
                     Err(error) => Err(actor_error(error)),
                 }
+            }
+            method::DAEMON_CONFIG_PROXY_ROUTE => {
+                let params = parse_params::<fluxdown_protocol::ProxyRouteRequest>(params)?;
+                let mut map = self
+                    .db
+                    .get_all_config()
+                    .await
+                    .map_err(|error| internal_error(format!("{error:#}")))?;
+                if let Some(rules) = params.rules {
+                    map.insert(
+                        fluxdown_engine::proxy_rules::PROXY_RULES_KEY.to_owned(),
+                        rules,
+                    );
+                }
+                let url = params.url;
+                let response = tokio::task::spawn_blocking(move || {
+                    let raw = map
+                        .get(fluxdown_engine::proxy_rules::PROXY_RULES_KEY)
+                        .map(String::as_str)
+                        .unwrap_or_default();
+                    let issues = fluxdown_engine::proxy_rules::validate(raw);
+                    let url = url.trim();
+                    let explanation = (!url.is_empty()).then(|| {
+                        fluxdown_engine::proxy_rules::explain(
+                            &fluxdown_engine::proxy_config::ProxyConfig::from_config_map(&map),
+                            url,
+                        )
+                    });
+                    fluxdown_engine_protocol::proxy_route_to_dto(issues, explanation)
+                })
+                .await
+                .map_err(|error| internal_error(format!("{error:#}")))?;
+                to_value(response)
             }
             method::DAEMON_CONFIG_CONN_POLICY => {
                 let raw = self
@@ -870,7 +1212,6 @@ impl DaemonService {
                     .set_enabled(&params.identity, params.enabled)
                     .await
                     .map_err(|error| invalid_argument("identity", &error.to_string()))?;
-                self.publish_plugins().await?;
                 Ok(json!({ "ok": true }))
             }
             #[cfg(feature = "plugins")]
@@ -885,7 +1226,6 @@ impl DaemonService {
                         }
                         other => invalid_argument("identity", &other.to_string()),
                     })?;
-                self.publish_plugins().await?;
                 Ok(json!({ "ok": true }))
             }
             #[cfg(feature = "plugins")]
@@ -961,7 +1301,6 @@ impl DaemonService {
                         }
                         other => invalid_argument("entries", &other.to_string()),
                     })?;
-                self.publish_plugins().await?;
                 Ok(json!({ "ok": true }))
             }
             #[cfg(feature = "plugins")]
@@ -982,7 +1321,6 @@ impl DaemonService {
                     .await
                     .map_err(|error| internal_error(format!("{error:#}")))?;
                 let missing_components = self.plugin_missing_components(&identity).await;
-                self.publish_plugins().await?;
                 to_value(fluxdown_protocol::InstalledPlugin {
                     identity,
                     missing_components,
@@ -997,7 +1335,6 @@ impl DaemonService {
                     .await
                     .map_err(|error| plugin_package_error("dirPath", &error))?;
                 let missing_components = self.plugin_missing_components(&identity).await;
-                self.publish_plugins().await?;
                 to_value(fluxdown_protocol::InstalledPlugin {
                     identity,
                     missing_components,
@@ -1007,9 +1344,6 @@ impl DaemonService {
             method::DAEMON_PLUGIN_RELOAD_DEV => {
                 let params = parse_params::<PluginIdentityParams>(params)?;
                 let result = self.plugin_manager()?.reload_dev(&params.identity).await;
-                // 失败也要广播：load_all 已刷新快照（加载失败原因 / 新 manifest），
-                // 列表必须与引擎一致。
-                self.publish_plugins().await?;
                 result.map_err(|error| plugin_package_error("identity", &error))?;
                 let missing_components = self.plugin_missing_components(&params.identity).await;
                 to_value(fluxdown_protocol::InstalledPlugin {
@@ -1024,7 +1358,6 @@ impl DaemonService {
                     .uninstall(&params.identity)
                     .await
                     .map_err(|error| invalid_argument("identity", &error.to_string()))?;
-                self.publish_plugins().await?;
                 Ok(json!({ "ok": true }))
             }
             #[cfg(feature = "plugins")]
@@ -1042,14 +1375,11 @@ impl DaemonService {
                     .filter(|entry| matches!(entry.yanked.as_str(), "vulnerable" | "malicious"))
                     .map(|entry| (entry.plugin_id.clone(), entry.version.clone()))
                     .collect();
-                let changed = self
-                    .plugin_manager()?
+                // 撤回结果由引擎经 `PluginsChanged` 广播，这里无需再发。
+                self.plugin_manager()?
                     .apply_market_revocations(&revoked)
                     .await
                     .map_err(|error| internal_error(format!("{error:#}")))?;
-                if changed {
-                    self.publish_plugins().await?;
-                }
                 to_value(
                     index
                         .entries
@@ -1068,11 +1398,59 @@ impl DaemonService {
                     .await
                     .map_err(|error| market_error(&error))?;
                 let missing_components = self.plugin_missing_components(&identity).await;
-                self.publish_plugins().await?;
                 to_value(fluxdown_protocol::InstalledPlugin {
                     identity,
                     missing_components,
                 })
+            }
+            #[cfg(feature = "plugins")]
+            method::DAEMON_PLUGIN_INSTALL_PRIVATE => {
+                let params = parse_params::<fluxdown_protocol::PluginInstallPrivateParams>(params)?;
+                if params.entry.channel.as_deref() != Some("private") {
+                    return Err(invalid_argument(
+                        "entry",
+                        "private plugin entry must declare channel \"private\"",
+                    ));
+                }
+                let bytes = self
+                    .blobs
+                    .read(&params.blob_id, BlobKind::Plugin)
+                    .await
+                    .map_err(|error| invalid_argument("blobId", &error.to_string()))?;
+                let entry = fluxdown_engine_protocol::market_entry_from_dto(params.entry);
+                let identity = fluxdown_engine::plugin::install_private_package(
+                    self.plugin_manager()?,
+                    bytes,
+                    &entry,
+                )
+                .await
+                .map_err(|error| market_error(&error))?;
+                self.blobs
+                    .consume(&params.blob_id, BlobKind::Plugin)
+                    .await
+                    .map_err(|error| internal_error(format!("{error:#}")))?;
+                let missing_components = self.plugin_missing_components(&identity).await;
+                to_value(fluxdown_protocol::InstalledPlugin {
+                    identity,
+                    missing_components,
+                })
+            }
+            #[cfg(feature = "plugins")]
+            method::DAEMON_PLUGIN_REVOKE_PRIVATE => {
+                let params = parse_params::<fluxdown_protocol::PluginRevokePrivateParams>(params)?;
+                let revoked: std::collections::HashSet<(String, String)> = params
+                    .revoked
+                    .into_iter()
+                    .map(|item| (item.plugin_id, item.version))
+                    .collect();
+                // 撤回结果由引擎经 `PluginsChanged` / `PluginAutoDisabled` 广播，这里无需再发。
+                let scope: Option<std::collections::HashSet<String>> =
+                    params.scope.map(|scope| scope.into_iter().collect());
+                self.plugin_manager()?
+                    .apply_private_revocations(&revoked, scope.as_ref())
+                    .await
+                    .map_err(|error| internal_error(format!("{error:#}")))?;
+                Ok(json!({ "ok": true }))
             }
             #[cfg(feature = "plugins")]
             method::DAEMON_PLUGIN_IGNORE_RETRY => {
@@ -1083,7 +1461,12 @@ impl DaemonService {
                 self.plugin_manager()?
                     .clear_task_resolver(&params.task_id)
                     .await
-                    .map_err(|error| internal_error(format!("{error:#}")))?;
+                    .map_err(|error| match error {
+                        fluxdown_engine::plugin::PluginError::InvalidSetting { key, message } => {
+                            invalid_argument(&key, &message)
+                        }
+                        other => internal_error(format!("{other:#}")),
+                    })?;
                 self.execute_unit(ActorOperation::ResumeTask {
                     task_id: params.task_id,
                 })
@@ -1123,10 +1506,13 @@ impl DaemonService {
                 Ok(json!({ "ok": true }))
             }
             #[cfg(feature = "plugins")]
+            method::DAEMON_PLUGIN_ARCHIVE_RULES => self.plugin_host_call(method_name, params).await,
+            #[cfg(feature = "plugins")]
             method::DAEMON_PLUGIN_VIEW_OPEN
             | method::DAEMON_PLUGIN_VIEW_EVENT
             | method::DAEMON_PLUGIN_VIEW_CLOSE
             | method::DAEMON_PLUGIN_VIEW_SNAPSHOT
+            | method::DAEMON_PLUGIN_VIEW_SET_LOCALE
             | method::DAEMON_PLUGIN_VIEW_KEEPALIVE
             | method::DAEMON_PLUGIN_COMMAND
             | method::DAEMON_PLUGIN_INVOKE
@@ -1136,6 +1522,7 @@ impl DaemonService {
             | method::DAEMON_PLUGIN_VIEW_EVENT
             | method::DAEMON_PLUGIN_VIEW_CLOSE
             | method::DAEMON_PLUGIN_VIEW_SNAPSHOT
+            | method::DAEMON_PLUGIN_VIEW_SET_LOCALE
             | method::DAEMON_PLUGIN_VIEW_KEEPALIVE
             | method::DAEMON_PLUGIN_COMMAND
             | method::DAEMON_PLUGIN_INVOKE
@@ -1156,6 +1543,7 @@ impl DaemonService {
             | method::DAEMON_PLUGIN_MARKET_LIST
             | method::DAEMON_PLUGIN_MARKET_INSTALL
             | method::DAEMON_PLUGIN_IGNORE_RETRY
+            | method::DAEMON_PLUGIN_ARCHIVE_RULES
             | method::DAEMON_PLUGIN_SITE_DEFAULTS
             | method::DAEMON_PLUGIN_SET_SITE_DEFAULT
             | method::DAEMON_PLUGIN_CONSENT
@@ -1293,6 +1681,33 @@ impl DaemonService {
                     .map_err(|error| internal_error(format!("{error:#}")))?;
                 to_value(fluxdown_engine_protocol::egress_plan_to_dto(plan))
             }
+            #[cfg(feature = "bt")]
+            method::DAEMON_BT_GUARD_STATE
+            | method::DAEMON_BT_GUARD_ENTRIES_LIST
+            | method::DAEMON_BT_GUARD_ENTRIES_ADD
+            | method::DAEMON_BT_GUARD_ENTRIES_REMOVE
+            | method::DAEMON_BT_GUARD_EVENTS_LIST
+            | method::DAEMON_BT_GUARD_EXPORT
+            | method::DAEMON_BT_GUARD_FILTER_SOURCES_REFRESH
+            | method::DAEMON_BT_GUARD_CLOUD_REFRESH
+            | method::DAEMON_BT_GUARD_CLOUD_APPLY
+            | method::DAEMON_BT_GUARD_EVIDENCE_DRAIN => {
+                self.bt_guard_call(is_local_agent, method_name, params)
+                    .await
+            }
+            #[cfg(not(feature = "bt"))]
+            method::DAEMON_BT_GUARD_STATE
+            | method::DAEMON_BT_GUARD_ENTRIES_LIST
+            | method::DAEMON_BT_GUARD_ENTRIES_ADD
+            | method::DAEMON_BT_GUARD_ENTRIES_REMOVE
+            | method::DAEMON_BT_GUARD_EVENTS_LIST
+            | method::DAEMON_BT_GUARD_EXPORT
+            | method::DAEMON_BT_GUARD_FILTER_SOURCES_REFRESH
+            | method::DAEMON_BT_GUARD_CLOUD_REFRESH
+            | method::DAEMON_BT_GUARD_CLOUD_APPLY
+            | method::DAEMON_BT_GUARD_EVIDENCE_DRAIN => Err(unsupported_error(
+                "daemon was built without BitTorrent support",
+            )),
             method::DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH => {
                 match self
                     .actor
@@ -1311,6 +1726,41 @@ impl DaemonService {
                     .await
                 {
                     Ok(ActorResult::Ed2kRefresh(response)) => to_value(response),
+                    Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
+                    Err(error) => Err(actor_error(error)),
+                }
+            }
+            method::DAEMON_ED2K_NODES_SUBSCRIPTION_REFRESH => {
+                match self.actor.execute(ActorOperation::RefreshEd2kNodes).await {
+                    Ok(ActorResult::Ed2kNodesRefresh(response)) => to_value(response),
+                    Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
+                    Err(error) => Err(actor_error(error)),
+                }
+            }
+            method::DAEMON_ED2K_ID_CHECK => {
+                // 参数整体可省略（旧调用方 / 详情页）：等同 `auto`。
+                let params = match params {
+                    Some(Value::Null) | None => fluxdown_protocol::Ed2kIdCheckParams::default(),
+                    params => parse_params::<fluxdown_protocol::Ed2kIdCheckParams>(params)?,
+                };
+                match self
+                    .actor
+                    .execute(ActorOperation::Ed2kIdCheck { params })
+                    .await
+                {
+                    Ok(ActorResult::Ed2kNetwork(network)) => to_value(*network),
+                    Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
+                    Err(error) => Err(actor_error(error)),
+                }
+            }
+            method::DAEMON_ED2K_KAD_BOOTSTRAP => {
+                let params = parse_params::<fluxdown_protocol::Ed2kKadBootstrapParams>(params)?;
+                match self
+                    .actor
+                    .execute(ActorOperation::Ed2kKadBootstrap { params })
+                    .await
+                {
+                    Ok(ActorResult::Ed2kKadBootstrap(result)) => to_value(*result),
                     Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
                     Err(error) => Err(actor_error(error)),
                 }
@@ -1501,6 +1951,133 @@ impl DaemonService {
         }
     }
 
+    /// `daemon.task.seedLocal`：现成 `.torrent`（有大小上限）从 daemon 主机读取，否则在 actor 之外
+    /// 为内容路径生成种子（哈希耗时与数据量成正比，故走慢方法通道），按需写出 `.torrent`，
+    /// 再交 actor 登记并开始做种（`createOnly` 时只生成、不建任务）。
+    #[cfg(feature = "bt")]
+    async fn seed_local(&self, params: Option<Value>) -> Result<Value, RpcErrorObject> {
+        let params = parse_params::<fluxdown_protocol::DaemonSeedLocalParams>(params)?;
+        if params.path.trim().is_empty() {
+            return Err(invalid_argument("path", "path is required"));
+        }
+        let torrent_path = params
+            .torrent_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty());
+        let torrent_output = params.torrent_output.trim();
+        if params.create_only {
+            if torrent_output.is_empty() {
+                return Err(invalid_argument(
+                    "torrentOutput",
+                    "torrentOutput is required with createOnly",
+                ));
+            }
+            if torrent_path.is_some() {
+                return Err(invalid_argument(
+                    "createOnly",
+                    "createOnly generates a torrent; it cannot be combined with torrentPath",
+                ));
+            }
+        }
+        if !torrent_output.is_empty() && !std::path::Path::new(torrent_output).is_absolute() {
+            return Err(invalid_argument(
+                "torrentOutput",
+                "torrentOutput must be an absolute path",
+            ));
+        }
+        let (torrent_bytes, generated) = match torrent_path {
+            Some(torrent_path) => {
+                let metadata = tokio::fs::metadata(torrent_path)
+                    .await
+                    .map_err(|error| invalid_argument("torrentPath", &error.to_string()))?;
+                if !metadata.is_file() || metadata.len() > SEED_LOCAL_TORRENT_MAX_BYTES {
+                    return Err(invalid_argument(
+                        "torrentPath",
+                        "torrentPath must be a .torrent file no larger than 32 MiB",
+                    ));
+                }
+                let bytes = tokio::fs::read(torrent_path)
+                    .await
+                    .map_err(|error| invalid_argument("torrentPath", &error.to_string()))?;
+                (bytes, false)
+            }
+            None => {
+                let options = seed_local_build_options(&params)?;
+                let bytes = fluxdown_engine::bt_local_seed::build_torrent(
+                    std::path::Path::new(&params.path),
+                    &options,
+                )
+                .await
+                .map_err(|error| match error {
+                    fluxdown_engine::bt_local_seed::LocalSeedError::InvalidArgument(message) => {
+                        invalid_argument("path", &message)
+                    }
+                    fluxdown_engine::bt_local_seed::LocalSeedError::Operation(message) => {
+                        internal_error(message)
+                    }
+                    error @ fluxdown_engine::bt_local_seed::LocalSeedError::Duplicate { .. } => {
+                        internal_error(error.to_string())
+                    }
+                })?;
+                (bytes, true)
+            }
+        };
+        if !torrent_output.is_empty() {
+            tokio::fs::write(torrent_output, &torrent_bytes)
+                .await
+                .map_err(|error| invalid_argument("torrentOutput", &error.to_string()))?;
+        }
+        if params.create_only {
+            return to_value(fluxdown_protocol::SeedLocalResultDto {
+                torrent_path: torrent_output.to_owned(),
+                ..Default::default()
+            });
+        }
+        let torrent_output = torrent_output.to_owned();
+        match self
+            .actor
+            .execute(ActorOperation::SeedLocal {
+                path: params.path,
+                torrent_bytes,
+                options: SeedLocalOptions {
+                    unlimited: params.unlimited,
+                    super_seeding: params.super_seeding,
+                    // 刚为这份数据生成的种子不必再算一遍（qBittorrent「制作 Torrent 后开始做种」同样
+                    // 跳过校验）；现成种子只在用户声明数据可信时跳过。
+                    skip_check: generated || params.skip_check,
+                },
+            })
+            .await
+        {
+            Ok(ActorResult::SeedLocal(mut result)) => {
+                result.torrent_path = torrent_output;
+                to_value(result)
+            }
+            Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
+            Err(error) => Err(actor_error(error)),
+        }
+    }
+
+    /// 不带 BT 的构建：`daemon.task.seedLocal` 由 actor 统一回「不支持的协议」。
+    #[cfg(not(feature = "bt"))]
+    async fn seed_local(&self, params: Option<Value>) -> Result<Value, RpcErrorObject> {
+        let params = parse_params::<fluxdown_protocol::DaemonSeedLocalParams>(params)?;
+        match self
+            .actor
+            .execute(ActorOperation::SeedLocal {
+                path: params.path,
+                torrent_bytes: Vec::new(),
+                options: SeedLocalOptions::default(),
+            })
+            .await
+        {
+            Ok(ActorResult::SeedLocal(result)) => to_value(result),
+            Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
+            Err(error) => Err(actor_error(error)),
+        }
+    }
+
     /// `daemon.task.createMany`：校验整块参数（任何一项违规都是整体 `InvalidArgument`），
     /// 逐条过演示模式守卫，然后交给 actor 在一个事务内落库。逐项拒绝（thunder 解码失败、
     /// BT 被禁用、checksum 畸形…）以 `results[i].error` 返回，不影响同块其它项。
@@ -1671,6 +2248,13 @@ impl DaemonService {
                     size: item.size,
                 })
                 .collect(),
+            resolver_plugin_id: request.resolver_plugin_id,
+            archive_metadata: request
+                .archive_metadata
+                .map(fluxdown_engine_protocol::archive_metadata_to_engine),
+            category_route: request
+                .category_route
+                .map(fluxdown_engine_protocol::category_route_to_engine),
         }
     }
 }
@@ -1923,13 +2507,13 @@ fn component_name(component: fluxdown_protocol::ComponentKind) -> &'static str {
 impl DaemonService {
     async fn runtime_stats(&self) -> fluxdown_protocol::DaemonRuntimeStatsDto {
         let (save_dir, active_tasks, pending_tasks, stats) = self.events.inspect(|snapshot| {
-            let save_dir = snapshot
-                .config
-                .values
-                .get("default_save_dir")
-                .cloned()
-                .filter(|path| !path.trim().is_empty())
-                .unwrap_or_else(fluxdown_engine::user_dirs::download_dir_or_cwd);
+            let save_dir = crate::disk_free::stats_save_dir(
+                snapshot
+                    .config
+                    .values
+                    .get("default_save_dir")
+                    .map(String::as_str),
+            );
             let active = snapshot
                 .tasks
                 .iter()
@@ -1947,6 +2531,7 @@ impl DaemonService {
             pending_tasks: u32::try_from(pending_tasks).unwrap_or(u32::MAX),
             total_download_bps: stats.total_download_bps,
             retry_pending_tasks: stats.retry_pending_tasks,
+            local_work_count: stats.local_work_count,
             total_upload_bps: stats.total_upload_bps,
             disk_free_bytes: fluxdown_engine::disk_space::available_space_checked(
                 std::path::PathBuf::from(&save_dir),
@@ -2347,6 +2932,17 @@ fn actor_error(error: ActorCallError) -> RpcErrorObject {
                     .with_reason(fluxdown_protocol::ErrorReason::TaskStateConflict),
             )
         }
+        ActorCallError::Operation(ActorError::TaskFilesKept { in_use, message }) => {
+            let reason = if in_use {
+                fluxdown_protocol::ErrorReason::TaskFilesInUse
+            } else {
+                fluxdown_protocol::ErrorReason::TaskFilesNotDeleted
+            };
+            RpcErrorObject::application(
+                message,
+                RpcErrorData::new(ApplicationErrorCode::Internal, false).with_reason(reason),
+            )
+        }
     }
 }
 
@@ -2355,7 +2951,7 @@ fn require_local_agent(is_local_agent: bool) -> Result<(), RpcErrorObject> {
         Ok(())
     } else {
         Err(RpcErrorObject::application(
-            "migration methods are restricted to the local agent",
+            "this method is restricted to the local agent",
             RpcErrorData::new(ApplicationErrorCode::Unauthorized, false),
         ))
     }
@@ -2460,6 +3056,15 @@ fn market_error(error: &fluxdown_engine::plugin::MarketError) -> RpcErrorObject 
             false,
             ErrorReason::PluginPackageInvalid,
         ),
+        // 无细分原因：UI 正常路径不会走到（私有来源的插件不显示公开更新），退回「冲突」通用文案。
+        MarketError::PrivateSource(_) => {
+            let message = error.to_string();
+            fluxdown_engine::log_warn!("[plugin-market] {message}");
+            return RpcErrorObject::application(
+                message,
+                RpcErrorData::new(ApplicationErrorCode::Conflict, false),
+            );
+        }
     };
     let message = error.to_string();
     fluxdown_engine::log_warn!("[plugin-market] {message}");
@@ -2503,6 +3108,11 @@ fn unsupported_error(message: &str) -> RpcErrorObject {
 #[cfg(feature = "plugins")]
 #[path = "plugin_host_rpc.rs"]
 mod plugin_host_rpc;
+
+/// BT 防吸血 RPC（`daemon.bt.guard.*`）。同样作为子模块编译。
+#[cfg(feature = "bt")]
+#[path = "bt_guard_rpc.rs"]
+mod bt_guard_rpc;
 
 #[cfg(test)]
 mod tests {
@@ -2553,6 +3163,31 @@ mod tests {
         assert!(validate_queue_schedule(&schedule("main", false, "", "")).is_ok());
         assert!(validate_queue_stop("later").is_ok());
         assert!(validate_queue_schedule(&schedule("later", true, "08:00", "23:00")).is_ok());
+    }
+
+    /// 删除被拒（任务已保留）：按是否被占用给出不同 reason，message 保留系统原因。
+    #[test]
+    fn kept_task_deletion_maps_to_file_reasons() {
+        let reason = |in_use: bool| {
+            let error = super::actor_error(super::ActorCallError::Operation(
+                super::ActorError::TaskFilesKept {
+                    in_use,
+                    message: "task kept: os error 32".to_owned(),
+                },
+            ));
+            assert_eq!(error.message, "task kept: os error 32");
+            let data = error.data.expect("application error data");
+            assert!(!data.retryable);
+            data.reason
+        };
+        assert_eq!(
+            reason(true),
+            Some(fluxdown_protocol::ErrorReason::TaskFilesInUse)
+        );
+        assert_eq!(
+            reason(false),
+            Some(fluxdown_protocol::ErrorReason::TaskFilesNotDeleted)
+        );
     }
 
     fn create_many(edit: impl FnOnce(&mut Value)) -> DaemonCreateTasksParams {
@@ -2662,6 +3297,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aria2_options_preview_is_read_only_and_preserves_omitted_settings() {
+        use fluxdown_protocol::{DaemonConfigSnapshot, DaemonSnapshot, method};
+
+        let dir = std::env::temp_dir().join(format!("fluxdown_aria2_{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create directory");
+        let db = fluxdown_engine::db::Db::open(&dir)
+            .await
+            .expect("open database");
+        db.init_default_config("/tmp").await.expect("seed config");
+        let config = DaemonConfigSnapshot {
+            revision: 7,
+            values: std::collections::BTreeMap::from([
+                ("default_segments".into(), "12".into()),
+                ("global_user_agent".into(), "custom-agent".into()),
+            ]),
+        };
+        let events = crate::event_hub::DaemonEventHub::new(
+            DaemonSnapshot {
+                config: config.clone(),
+                ..Default::default()
+            },
+            32,
+        );
+        let selections = crate::selection::DaemonSelection::new(events.clone());
+        let blobs = std::sync::Arc::new(
+            crate::blob_store::BlobStore::open(dir.join("blobs"))
+                .await
+                .expect("open blobs"),
+        );
+        let service = DaemonService::new(
+            crate::service_hello("aria2-test", Vec::new()),
+            events.clone(),
+            selections,
+            blobs,
+            crate::actor::DaemonActorHandle::disconnected(),
+            db,
+            dir.clone(),
+            #[cfg(feature = "plugins")]
+            None,
+        );
+        let exported = service
+            .call_inner(
+                "aria2-test",
+                true,
+                method::DAEMON_CONFIG_ARIA2_OPTIONS,
+                Some(json!({})),
+            )
+            .await
+            .expect("export");
+        assert!(exported["text"].as_str().unwrap().contains("split=12"));
+        assert_eq!(exported["revision"], 7);
+        let preview = service
+            .call_inner(
+                "aria2-test",
+                true,
+                method::DAEMON_CONFIG_ARIA2_OPTIONS,
+                Some(json!({"text": "max-overall-download-limit=2M"})),
+            )
+            .await
+            .expect("preview");
+        assert_eq!(preview["values"], json!({"speed_limit_bytes": "2097152"}));
+        assert!(
+            preview["text"]
+                .as_str()
+                .unwrap()
+                .contains("user-agent=custom-agent")
+        );
+        assert_eq!(events.inspect(|snapshot| snapshot.config.clone()), config);
+        let error = service
+            .call_inner(
+                "aria2-test",
+                true,
+                method::DAEMON_CONFIG_ARIA2_OPTIONS,
+                Some(json!({"text": "split=8\nrpc-secret=secret"})),
+            )
+            .await
+            .expect("validation diagnostics cross the gateway as result data");
+        assert!(
+            error["error"].as_str().unwrap().contains("line 2:"),
+            "{error}"
+        );
+        assert_eq!(
+            error["values"],
+            json!({}),
+            "invalid draft must not yield a partial patch"
+        );
+        assert_eq!(events.inspect(|snapshot| snapshot.config.clone()), config);
+        drop(service);
+        tokio::fs::remove_dir_all(dir)
+            .await
+            .expect("remove directory");
+    }
+
+    #[tokio::test]
+    async fn proxy_route_explains_draft_rules() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_daemon_proxy_route_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create proxy route dir");
+        let db = fluxdown_engine::db::Db::open(&dir)
+            .await
+            .expect("open proxy route db");
+        db.init_default_config("/tmp")
+            .await
+            .expect("seed proxy route config");
+        let events =
+            crate::event_hub::DaemonEventHub::new(fluxdown_protocol::DaemonSnapshot::default(), 32);
+        let selections = crate::selection::DaemonSelection::new(events.clone());
+        let blobs = std::sync::Arc::new(
+            crate::blob_store::BlobStore::open(dir.join("blobs"))
+                .await
+                .expect("open proxy route blobs"),
+        );
+        let service = DaemonService::new(
+            crate::service_hello("proxy-route-test", Vec::new()),
+            events,
+            selections,
+            blobs,
+            crate::actor::DaemonActorHandle::disconnected(),
+            db,
+            dir.clone(),
+            #[cfg(feature = "plugins")]
+            None,
+        );
+        let call = |params: Value| {
+            let service = &service;
+            async move {
+                service
+                    .call_inner(
+                        "proxy-route-test",
+                        true,
+                        fluxdown_protocol::method::DAEMON_CONFIG_PROXY_ROUTE,
+                        Some(params),
+                    )
+                    .await
+                    .expect("proxyRoute call")
+            }
+        };
+
+        let hit = call(json!({
+            "url": "https://x.github.com/a",
+            "rules": r#"[{"id":"a","match":"domain","pattern":"github.com","action":"direct"}]"#,
+        }))
+        .await;
+        assert_eq!(hit["matched"]["index"], json!(0), "{hit}");
+        assert_eq!(hit["reason"], json!("direct"), "{hit}");
+        assert_eq!(hit["issues"], json!([]), "{hit}");
+
+        let miss = call(json!({"url": "https://other.test", "rules": "[]"})).await;
+        assert!(miss["matched"].is_null(), "{miss}");
+        assert_eq!(miss["reason"], json!("modeNone"), "{miss}");
+
+        let bad = call(json!({
+            "rules": r#"[{"id":"a","match":"regex","pattern":"(","action":"direct"}]"#,
+        }))
+        .await;
+        assert_eq!(bad["issues"][0]["field"], json!("pattern"), "{bad}");
+        assert_eq!(bad["issues"][0]["code"], json!("invalidRegex"), "{bad}");
+        assert_eq!(bad["reason"], json!(""), "{bad}");
+
+        drop(service);
+        tokio::fs::remove_dir_all(&dir)
+            .await
+            .expect("remove proxy route dir");
+    }
+
+    #[tokio::test]
     async fn every_canonical_daemon_method_reaches_a_real_dispatch_branch() {
         let dir = std::env::temp_dir().join(format!(
             "fluxdown_daemon_dispatch_{}_{}",
@@ -2757,6 +3565,7 @@ mod tests {
         method_name == fluxdown_protocol::method::DAEMON_GROUP_RESOLVE_PREVIEW
             || method_name.starts_with("daemon.plugin.")
             || method_name.starts_with("daemon.component.")
+            || (cfg!(not(feature = "bt")) && method_name.starts_with("daemon.bt.guard."))
     }
 }
 

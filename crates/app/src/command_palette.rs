@@ -172,6 +172,12 @@ fn commands(labels: &Labels, cx: &App) -> Vec<PaletteItem> {
             FluxIcon::Magnet,
             |_, cx| run_in_downloads(cx, PageCommand::OpenTorrentFile),
         ),
+        labels.command(
+            "cmd.seed_local",
+            "seedLocalTitle",
+            FluxIcon::HardDrive,
+            |_, cx| run_in_downloads(cx, PageCommand::SeedLocal),
+        ),
         labels
             .command("cmd.pause_all", "pauseAll", FluxIcon::Pause, |_, cx| {
                 run_in_downloads(cx, PageCommand::PauseAll);
@@ -414,7 +420,7 @@ fn navigate(cx: &mut App, route: RouteId) {
     cx.defer(move |cx| navigate_now(cx, route));
 }
 
-fn navigate_now(cx: &mut App, route: RouteId) {
+pub(crate) fn navigate_now(cx: &mut App, route: RouteId) {
     crate::windows::main::reveal(cx);
     if let Some(shell) = Desktop::global(cx)
         .main_shell

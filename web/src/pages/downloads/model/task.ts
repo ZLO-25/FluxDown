@@ -36,7 +36,7 @@ export const remoteKey = (taskId: string): RowKey => `r:${taskId}`
 export const isLocalKey = (key: RowKey): boolean => key.startsWith('l:')
 export const taskIdOfKey = (key: RowKey): string => key.slice(2)
 
-/** 引擎/daemon 插件系统失败任务的错误消息前缀。 */
+/** 可「忽略插件重试」的插件失败错误消息前缀（二段解析任务失败用 `[解析插件]`，不匹配本前缀）。 */
 export const PLUGIN_ERROR_PREFIX = '[插件]'
 
 export interface DownloadTaskView {
@@ -72,6 +72,14 @@ export interface DownloadTaskView {
   groupId: string
   errorMessage: string
   fileMissing: boolean
+  /** BT 按顺序下载；远程 / 非 BT 为 false。 */
+  btSequential: boolean
+  /** BT 先下载首尾分块；远程 / 非 BT 为 false。 */
+  btFirstLastPiecesFirst: boolean
+  /** BT 超级做种；远程 / 非 BT 为 false。 */
+  btSuperSeeding: boolean
+  /** 落盘文件哈希 `algo=hex`；空 = 尚未计算。远程任务恒空。 */
+  fileHash: string
   seedingStatus: number
   uploadedBytes: number
   boosted: boolean
@@ -242,6 +250,10 @@ export function buildLocalView(
     groupId: task.groupId,
     errorMessage: task.errorMessage,
     fileMissing: task.fileMissing,
+    btSequential: task.btSequential,
+    btFirstLastPiecesFirst: task.btFirstLastPiecesFirst,
+    btSuperSeeding: task.btSuperSeeding,
+    fileHash: task.fileHash,
     seedingStatus: task.seedingStatus,
     uploadedBytes: task.uploadedBytes,
     boosted,
@@ -287,6 +299,10 @@ export function buildRemoteView(task: RemoteTaskDto): DownloadTaskView {
     groupId: '',
     errorMessage: task.error ?? '',
     fileMissing: false,
+    btSequential: false,
+    btFirstLastPiecesFirst: false,
+    btSuperSeeding: false,
+    fileHash: '',
     seedingStatus: 0,
     uploadedBytes: 0,
     boosted: false,
@@ -306,10 +322,30 @@ export function shareUrl(view: DownloadTaskView): string {
   return view.originUrl === '' ? view.url : view.originUrl
 }
 
+/**
+ * 「复制下载地址」能给出的真实链接：本地导入的 `.torrent` 无来源时只有 `torrent-file://` 哨兵，
+ * 返回空串（与 GPUI `copyable_share_url` 一致）。
+ */
+export function copyableShareUrl(view: DownloadTaskView): string {
+  const url = shareUrl(view)
+  return url.startsWith('torrent-file://') ? '' : url
+}
+
 /** 来源站点：referrer host 为主，空则 url host。 */
 export function sourceSite(view: DownloadTaskView): string {
   const host = urlHost(view.referrer)
   return host === '' ? view.site : host
+}
+
+/**
+ * 可在浏览器打开的来源页：仅 `http(s)://` 且有 host 的 referrer（与 GPUI `source_page_url` 一致）。
+ * referrer 来自浏览器捕获 / API，不可信；其他协议（`javascript:`、`file:` …）只显示与复制。
+ */
+export function sourcePageUrl(view: Pick<DownloadTaskView, 'referrer'>): string | null {
+  const split = view.referrer.indexOf('://')
+  if (split < 0) return null
+  const scheme = view.referrer.slice(0, split).toLowerCase()
+  return (scheme === 'http' || scheme === 'https') && urlHost(view.referrer) !== '' ? view.referrer : null
 }
 
 /** 本地任务实时并发连接数（远程 / 未连接为 null）。 */

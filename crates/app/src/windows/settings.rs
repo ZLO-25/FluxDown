@@ -64,15 +64,17 @@ pub fn open(cx: &mut App) {
         attach(&session, &extensions, cx);
         extensions.update(cx, |extensions, cx| {
             extensions
-                .set_plugin_view_factory(crate::plugin_contributions::settings_view_factory(), cx);
+                .set_plugin_view_factory(crate::plugin_contributions::dialog_view_factory(), cx);
         });
         cx.subscribe(&extensions, |_, event, cx| match event {
             ExtensionsEvent::OpenPluginView { plugin, view } => {
-                let plugin = plugin.clone();
+                let plugin = (**plugin).clone();
                 let view = view.clone();
                 // 事件在设置窗口的 update 栈内分发；开新窗口延后到栈外。
                 cx.defer(move |cx| crate::windows::plugin::open(cx, &plugin, &view));
             }
+            // 与活动栏账户按钮同一入口：聚焦设置窗口并定位到账户页（内部自行 defer）。
+            ExtensionsEvent::OpenAccount => crate::activity::open_account(cx),
         })
         .detach();
         let window_view =

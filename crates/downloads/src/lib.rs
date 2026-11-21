@@ -8,6 +8,7 @@ mod batch;
 mod components;
 mod controller;
 mod deletion;
+mod flags;
 mod model;
 mod pages;
 mod strings;
@@ -18,9 +19,13 @@ pub use components::title_bar::{
     DownloadPageWidget, DownloadSearchBox, DownloadTitleBar, DownloadViewMenu,
 };
 pub use controller::{
-    DownloadsCommand, DownloadsController, DownloadsPort, DownloadsResult,
+    BtGuardEvidence, DownloadsCommand, DownloadsController, DownloadsPort, DownloadsResult,
     LAST_DOWNLOAD_TARGET_PREF, LAST_SAVE_DIR_PREF, PortFuture, QueueFields,
-    REMEMBER_LAST_SAVE_DIR_PREF, SeedLimits,
+    REMEMBER_LAST_SAVE_DIR_PREF, REMEMBER_LAST_TARGET_PREF, SeedLimits, TorrentShare,
+};
+pub use flags::{FlagAssets, flag_asset_path, flag_codes};
+pub use model::bt_guard::{
+    BAN_CLIENT_MINUTES, BanClientEdit, CLIENT_RULES_KEY, append_ban_client_rule,
 };
 pub use model::devices::{DeviceEntry, DeviceKind, DispatchTarget};
 pub use model::progress_window::{

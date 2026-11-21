@@ -8,7 +8,7 @@ import { useT } from '../../../../i18n'
 import { cn } from '../../../../lib/cn'
 import { copyText } from '../../../../lib/copy'
 import { RpcError, rpc } from '../../../../lib/rpc'
-import type { AgentSessionDto, CloudOrder, CloudPlan } from '../../../../lib/rpc'
+import type { AgentSessionDto, CloudOrder, CloudPlan, CloudSubscription } from '../../../../lib/rpc'
 import { Badge, Button, ConfirmFooter, Dialog, DialogFooter, Icon, Input, ProgressBar, Spinner } from '../../../../ui'
 import {
   localDate,
@@ -18,6 +18,10 @@ import {
   normalizeReferralCode,
   ownedPriceMinor,
   payableMinor,
+  baseSortOf,
+  cardPlans,
+  isSubscriptionPlan,
+  lifetimePlans,
   planCardState,
   planIconName,
   priceDisplay,
@@ -38,7 +42,7 @@ const FALLBACK_COLOR = 'var(--fx-colors-accent-foreground, currentColor)'
 type Load =
   | { status: 'loading' }
   | { status: 'error' }
-  | { status: 'ready'; catalog: CloudPlan[]; credit: number; currentCode: string | null }
+  | { status: 'ready'; catalog: CloudPlan[]; credit: number; currentCode: string | null; subscription: CloudSubscription | null }
 
 type Step = { kind: 'select' } | { kind: 'paying'; order: CloudOrder; plan: CloudPlan } | { kind: 'success'; planName: string }
 
@@ -75,13 +79,13 @@ function Banner({ tone, children }: { tone: 'danger' | 'info'; children: string 
   )
 }
 
-function PlanCard({ plan, state, credit, selected, onSelect, ordinal }: { plan: CloudPlan; state: PlanCardState; credit: number; selected: boolean; onSelect: () => void; ordinal: number | null }) {
+function PlanCard({ plan, state, credit, selected, onSelect, ordinal, conflict }: { plan: CloudPlan; state: PlanCardState; credit: number; selected: boolean; onSelect: () => void; ordinal: number | null; conflict: boolean }) {
   const t = useT()
   const color = planColor(plan)
   const price = priceDisplay(plan, state, credit)
   const progress = campaignProgress(plan)
   const endDate = localDate(plan.campaign?.endAt)
-  const available = state === 'available'
+  const available = state === 'available' || state === 'renewable'
   const Glyph = ICONS[planIconName(plan.icon)]
   return (
     <button
@@ -95,6 +99,7 @@ function PlanCard({ plan, state, credit, selected, onSelect, ordinal }: { plan: 
         selected ? 'border-accent-text bg-accent-text/8' : 'border-hairline bg-surface hover:bg-nav-hover',
         !available && 'cursor-not-allowed opacity-60 hover:bg-surface',
       )}
+      title={conflict ? t('errReasonSubscriptionConflict') : undefined}
     >
       <span className="flex size-10 shrink-0 items-center justify-center rounded-lg" style={{ background: `color-mix(in srgb, ${color} 14%, transparent)`, color }}>
         <Glyph className="size-5" strokeWidth={1.75} />
@@ -103,9 +108,10 @@ function PlanCard({ plan, state, credit, selected, onSelect, ordinal }: { plan: 
         <span className="flex flex-wrap items-center gap-2">
           <span className="text-sm font-semibold text-foreground">{plan.name}</span>
           <PlanBadge plan={plan} ordinal={ordinal} />
-          {state === 'current' ? <Badge tone="accent">{t('accountPlanCurrent')}</Badge> : null}
+          {state === 'current' || state === 'renewable' ? <Badge tone="accent">{t('accountPlanCurrent')}</Badge> : null}
           {state === 'tierBlocked' || state === 'creditBlocked' ? <Badge>{t('accountPlanLowerTier')}</Badge> : null}
         </span>
+        {isSubscriptionPlan(plan) ? <span className="text-xs text-muted-foreground tabular">{t('accountPeriodDays', { days: plan.billingPeriodDays ?? 0 })}</span> : null}
         {plan.description ? <span className="text-xs text-muted-foreground">{plan.description}</span> : null}
         {plan.highlights.length > 0 ? (
           <ul className="mt-0.5 flex flex-col gap-0.5">
@@ -288,7 +294,7 @@ export function PlanDialog({ session, onClose }: { session: AgentSessionDto; onC
       if (profile.status === 'rejected') console.warn('[plan] refreshProfile failed; credit treated as 0', profile.reason)
       const credit = profile.status === 'fulfilled' ? Math.max(0, profile.value.purchaseCreditMinor) : 0
       const currentCode = profile.status === 'fulfilled' ? profile.value.plan || null : sessionPlanCode.current
-      setLoad({ status: 'ready', catalog: catalog.value, credit, currentCode })
+      setLoad({ status: 'ready', catalog: catalog.value, credit, currentCode, subscription: profile.status === 'fulfilled' ? (profile.value.activeSubscription ?? null) : null })
     })()
     return () => {
       alive = false
@@ -331,13 +337,19 @@ export function PlanDialog({ session, onClose }: { session: AgentSessionDto; onC
     [reload, t],
   )
 
-  const onPaid = useCallback((order: CloudOrder) => setStep({ kind: 'success', planName: order.planName }), [])
+  const onPaid = useCallback(
+    (order: CloudOrder) => setStep({ kind: 'success', planName: order.planName }),
+    [],
+  )
 
   const ready = load.status === 'ready' ? load : null
   const plans = ready ? purchasablePlans(ready.catalog) : []
   const owned = ready ? ownedPriceMinor(ready.catalog, ready.currentCode) : 0
+  const baseSort = ready ? baseSortOf(ready.catalog, ready.currentCode) : null
+  const stateOf = (plan: CloudPlan, r: NonNullable<typeof ready>): PlanCardState => planCardState(plan, r.currentCode, owned, r.credit, r.subscription, baseSort)
   const chosen = ready && selected ? plans.find((plan) => plan.code === selected) : undefined
-  const chosenAvailable = chosen !== undefined && ready !== null && planCardState(chosen, ready.currentCode, owned, ready.credit) === 'available'
+  const chosenState = chosen && ready ? stateOf(chosen, ready) : null
+  const chosenAvailable = chosenState === 'available' || chosenState === 'renewable'
 
   let title = t('accountPlanDialogTitle')
   let footer = null
@@ -373,7 +385,7 @@ export function PlanDialog({ session, onClose }: { session: AgentSessionDto; onC
     footer = (
       <ConfirmFooter
         cancelLabel={t('cancel')}
-        okLabel={chosen && chosenAvailable && ready ? `${t('accountPlanBuy')} ${formatMinor(payableMinor(chosen, ready.credit), chosen.currency)}` : t('accountPlanBuy')}
+        okLabel={chosen && chosenAvailable && ready ? `${t(chosenState === 'renewable' ? 'accountRenew' : 'accountPlanBuy')} ${formatMinor(payableMinor(chosen, isSubscriptionPlan(chosen) ? 0 : ready.credit), chosen.currency)}` : t('accountPlanBuy')}
         onCancel={onClose}
         onOk={() => chosen && void buy(chosen)}
         okDisabled={!chosenAvailable}
@@ -393,23 +405,34 @@ export function PlanDialog({ session, onClose }: { session: AgentSessionDto; onC
         {ready && plans.length === 0 ? <div className="py-8 text-center text-sm text-muted-foreground">{t('accountPlanEmpty')}</div> : null}
         {ready && plans.length > 0 ? (
           <div role="radiogroup" className="flex flex-col gap-2">
-            {plans.map((plan) => {
-              const state = planCardState(plan, ready.currentCode, owned, ready.credit)
-              return (
-                <PlanCard
-                  key={plan.code}
-                  plan={plan}
-                  state={state}
-                  credit={ready.credit}
-                  selected={selected === plan.code}
-                  ordinal={state === 'current' ? session.user.membershipOrdinal : null}
-                  onSelect={() => {
-                    setSelected(plan.code)
-                    setNotice(null)
-                  }}
-                />
-              )
-            })}
+            {[
+              { key: 'lifetime', title: t('accountPurchaseGroupLifetime'), items: lifetimePlans(plans) },
+              { key: 'cards', title: t('accountPurchaseGroupCards'), items: cardPlans(plans) },
+            ].map((group) =>
+              group.items.length === 0 ? null : (
+                <div key={group.key} className="flex flex-col gap-2">
+                  {cardPlans(plans).length > 0 ? <div className="text-xs font-medium text-muted-foreground">{group.title}</div> : null}
+                  {group.items.map((plan) => {
+                    const state = stateOf(plan, ready)
+                    return (
+                      <PlanCard
+                        key={plan.code}
+                        plan={plan}
+                        state={state}
+                        credit={ready.credit}
+                        selected={selected === plan.code}
+                        ordinal={state === 'current' ? session.user.membershipOrdinal : null}
+                        conflict={state === 'tierBlocked' && isSubscriptionPlan(plan) && ready.subscription !== null}
+                        onSelect={() => {
+                          setSelected(plan.code)
+                          setNotice(null)
+                        }}
+                      />
+                    )
+                  })}
+                </div>
+              ),
+            )}
           </div>
         ) : null}
         {ready && plans.length > 0 ? (

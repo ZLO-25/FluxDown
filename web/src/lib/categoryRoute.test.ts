@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { CustomCategoryDto } from './rpc'
-import { autoFollowDir, matchedCategory, modeDir, pickableCategories, routeBaseDir, routeFollows, routeFromCategories, routeFromPreference, routeSaveDir, wildcardMatches } from './categoryRoute'
+import { autoFollowDir, categoryModeFromPreference, categoryModePreference, dirUntouched, eligibleRoute, matchedCategory, modeDir, pickableCategories, routeBaseDir, routeFollows, routeFromCategories, routeFromPreference, routeSaveDir, wildcardMatches } from './categoryRoute'
 import type { CategoryRouteDto } from './rpc'
 
 declare const Bun: { file(path: URL): { json(): Promise<unknown> } }
@@ -29,8 +29,8 @@ const cat = (id: string, patch: Partial<CustomCategoryDto> = {}): CustomCategory
 })
 
 describe('routeFromCategories', () => {
-  test('没有任何目录 → null', () => {
-    expect(routeFromCategories([cat('all', { builtinType: 'all' }), cat('v', { extensions: ['mp4'] })])).toBeNull()
+  test('没有分类目录时仍返回授权的空规则路由', () => {
+    expect(routeFromCategories([cat('all', { builtinType: 'all' }), cat('v', { extensions: ['mp4'] })])).toEqual({ rules: [] })
   })
 
   test('other 无目录：无目录的普通分类省略，有目录的保留', () => {
@@ -49,7 +49,7 @@ describe('routeFromCategories', () => {
       cat('hidden', { saveDir: '/h', visible: false }),
       cat('other', { builtinType: 'other', saveDir: '/o' }),
     ])
-    expect(route).toEqual({ rules: [{ matchMode: 'regex', regexPattern: '^x' }], otherDir: '/o' })
+    expect(route).toEqual({ rules: [{ matchMode: 'regex', regexPattern: '^x' }], otherDir: '/o', archiveCategories: { other: '/o' } })
   })
 
   test('偏好值解析（数组 / JSON 字符串）', () => {
@@ -57,6 +57,16 @@ describe('routeFromCategories', () => {
     const expected = { rules: [{ matchMode: 'extension', extensions: ['mp4'], saveDir: '/v' }] }
     expect(routeFromPreference(list)).toEqual(expected)
     expect(routeFromPreference(JSON.stringify(list))).toEqual(expected)
+  })
+  test('归档按稳定内置类型跟随改名和目录变化，不猜自定义分类', () => {
+    const image = cat('builtin_image', { builtinType: 'image', name: '摄影收藏', saveDir: ' /photos ' })
+    const first = routeFromCategories([image, cat('custom', { name: '音频', saveDir: '/custom' })])
+    expect(first.archiveCategories).toEqual({ image: '/photos' })
+    image.saveDir = '/new-photos'
+    expect(routeFromCategories([image]).archiveCategories).toEqual({ image: '/new-photos' })
+    expect(first.archiveCategories).toEqual({ image: '/photos' })
+    expect(routeFromCategories([{ ...image, visible: false }]).archiveCategories).toBeUndefined()
+    expect(routeFromCategories([{ ...image, saveDir: '' }]).archiveCategories).toBeUndefined()
   })
 })
 
@@ -107,11 +117,39 @@ describe('wildcardMatches / url 规则', () => {
 })
 
 describe('auto follow / mode', () => {
-  test('空、等于 offered、等于上次自动写入才跟随', () => {
+  test('空、等于程序最近写入值才跟随；从未写入时等于 offered', () => {
     expect(autoFollowDir('', '/d', null, '/v')).toBe('/v')
     expect(autoFollowDir(' /d ', '/d', null, '/v')).toBe('/v')
     expect(autoFollowDir('/v', '/d', '/v', null)).toBe('/d')
     expect(autoFollowDir('/custom', '/d', '/v', '/p')).toBeNull()
+  })
+
+  test('回归：自动命中分类目录后用户改回 offered，不被覆盖且提交不路由', () => {
+    // 自动写入 /v 后，用户手改回默认目录 /d：lastWritten=/v，不再视为未手改。
+    expect(dirUntouched('/d', '/d', '/v')).toBe(false)
+    expect(autoFollowDir('/d', '/d', '/v', '/p')).toBeNull()
+    // 用户改成另一个分类目录同理。
+    expect(dirUntouched('/p', '/d', '/v')).toBe(false)
+    // 未手改：等于 lastWritten 或为空。
+    expect(dirUntouched(' /v ', '/d', '/v')).toBe(true)
+    expect(dirUntouched('  ', '/d', '/v')).toBe(true)
+    expect(dirUntouched('/d', ' /d ', null)).toBe(true)
+  })
+
+  test('手选默认 / 分类目录后重命名保持目录且不路由；重新选 Auto 恢复跟随', () => {
+    const route: CategoryRouteDto = { rules: [{ matchMode: 'extension', extensions: ['zip'], saveDir: '/category' }] }
+    const options = [cat('zip', { extensions: ['zip'], saveDir: '/category' })]
+    for (const chosen of ['/default', '/category']) {
+      let manuallyChosen = true
+      let currentDir = chosen
+      expect(autoFollowDir(currentDir, '/default', chosen, '/renamed', manuallyChosen)).toBeNull()
+      expect(eligibleRoute(route, { kind: 'auto' }, manuallyChosen, currentDir, '/default')).toBeNull()
+
+      manuallyChosen = false // pickCategory({ kind: 'auto' }) clears manual intent
+      currentDir = modeDir({ kind: 'auto' }, options, '/default', '/category')
+      expect(autoFollowDir(currentDir, '/default', currentDir, '/renamed', manuallyChosen)).toBe('/renamed')
+      expect(eligibleRoute(route, { kind: 'auto' }, manuallyChosen, currentDir, '/default')).toBe(route)
+    }
   })
 
   test('可选分类过滤与命中', () => {
@@ -129,5 +167,34 @@ describe('auto follow / mode', () => {
     expect(modeDir({ kind: 'category', id: 'v' }, options, '/d', null)).toBe('/v')
     expect(modeDir({ kind: 'none' }, options, '/d', '/v')).toBe('/d')
     expect(modeDir({ kind: 'auto' }, options, '/d', null)).toBe('/d')
+  })
+})
+
+describe('remembered category mode', () => {
+  const categories = [
+    cat('visible', { saveDir: '/visible' }),
+    cat('hidden', { saveDir: '/hidden', visible: false }),
+    cat('empty', { saveDir: ' ' }),
+    cat('all', { saveDir: '/all', builtinType: 'all' }),
+  ]
+
+  test('restores only valid picker choices and falls back to Auto for malformed or stale values', () => {
+    expect(categoryModeFromPreference(undefined, categories)).toEqual({ kind: 'auto' })
+    expect(categoryModeFromPreference('garbage', categories)).toEqual({ kind: 'auto' })
+    expect(categoryModeFromPreference('category:', categories)).toEqual({ kind: 'auto' })
+    for (const id of ['hidden', 'empty', 'all', 'removed']) {
+      expect(categoryModeFromPreference(`category:${id}`, categories)).toEqual({ kind: 'auto' })
+    }
+    expect(categoryModeFromPreference('none', categories)).toEqual({ kind: 'none' })
+    expect(categoryModeFromPreference('category:visible', categories)).toEqual({ kind: 'category', id: 'visible' })
+  })
+
+  test('serializes modes and explicit category directory does not route', () => {
+    const mode = { kind: 'category' as const, id: 'visible' }
+    expect(categoryModePreference({ kind: 'auto' })).toBe('auto')
+    expect(categoryModePreference({ kind: 'none' })).toBe('none')
+    expect(categoryModePreference(mode)).toBe('category:visible')
+    expect(modeDir(mode, categories, '/default', '/predicted')).toBe('/visible')
+    expect(eligibleRoute({ rules: [] }, mode, false, '/visible', '/default')).toBeNull()
   })
 })

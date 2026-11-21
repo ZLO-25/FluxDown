@@ -1,0 +1,400 @@
+import { GUARD_COLUMNS_MIN_WIDTH, peerGuardView } from '../../../lib/btGuard'
+import type { PeerGuardView } from '../../../lib/btGuard'
+import { normalizeCountry } from '../../../lib/flags/flags'
+import type { BtPeerDto, BtPeerTransport, BtStatusDto, BtTrackerDto, BtTrackerStatus } from '../../../lib/rpc'
+import type { TaskState } from '../model/task'
+import type { Translate } from '../table/text'
+
+/** 轮询间隔（与「速度」标签一致）。 */
+export const BT_STATUS_POLL_MS = 2000
+
+/** 连接列表渲染上限（服务端已按活跃度排序，超出部分是最不活跃的）。 */
+export const MAX_PEER_ROWS = 200
+
+// ── 相对时间 ──
+
+export type RelativeUnit = 's' | 'm' | 'h' | 'd'
+
+/** 秒数 → 最大整单位（<60s 秒，<60m 分，<24h 时，其余天）；负值按 0。 */
+export function relativeSpan(secs: number): { unit: RelativeUnit; n: number } {
+  const s = Math.max(0, Math.floor(Number.isFinite(secs) ? secs : 0))
+  if (s < 60) return { unit: 's', n: s }
+  if (s < 3600) return { unit: 'm', n: Math.floor(s / 60) }
+  if (s < 86_400) return { unit: 'h', n: Math.floor(s / 3600) }
+  return { unit: 'd', n: Math.floor(s / 86_400) }
+}
+
+function spanText(t: Translate, secs: number): string {
+  const { unit, n } = relativeSpan(secs)
+  switch (unit) {
+    case 's':
+      return t('etaSeconds', { n })
+    case 'm':
+      return t('etaMinutes', { n })
+    case 'h':
+      return t('etaHours', { n })
+    case 'd':
+      return `${n} ${t('timeUnitDays')}`
+  }
+}
+
+/** 下次 announce：未知（0 / 缺省）→ null；已过期（<=0）显示「in 0s」。 */
+export function nextAnnounceText(t: Translate, at: number | undefined, nowSecs: number): string | null {
+  if (!at || at <= 0) return null
+  return t('btTrackerIn', { time: spanText(t, at - nowSecs) })
+}
+
+/** 最近成功：从未（0 / 缺省）→ 「Never」。时钟略有偏差时按 0 秒前。 */
+export function lastOkText(t: Translate, at: number | undefined, nowSecs: number): string {
+  if (!at || at <= 0) return t('btTrackerNever')
+  return t('btTrackerAgo', { time: spanText(t, nowSecs - at) })
+}
+
+// ── Tracker ──
+
+const STATUS_KEY: Record<BtTrackerStatus, string> = {
+  working: 'btTrackerStatusWorking',
+  updating: 'btTrackerStatusUpdating',
+  notWorking: 'btTrackerStatusNotWorking',
+  notContacted: 'btTrackerStatusNotContacted',
+  unknown: 'btTrackerStatusUnknown',
+}
+
+export const trackerStatusKey = (status: BtTrackerStatus): string => STATUS_KEY[status]
+
+/** 状态点底色 / 文字色（均为主题令牌）。 */
+export const TRACKER_DOT: Record<BtTrackerStatus, string> = {
+  working: 'bg-success',
+  updating: 'bg-muted-foreground animate-pulse',
+  notWorking: 'bg-destructive',
+  notContacted: 'bg-text-tertiary',
+  unknown: 'bg-text-tertiary',
+}
+
+export const TRACKER_TEXT: Record<BtTrackerStatus, string> = {
+  working: 'text-success',
+  updating: 'text-muted-foreground',
+  notWorking: 'text-destructive',
+  notContacted: 'text-text-tertiary',
+  unknown: 'text-text-tertiary',
+}
+
+/**
+ * 「没有任何 tracker 工作」提示（GPUI `none_working` 同条件）：至少一个 tracker 失败（`notWorking`），
+ * 没有 `working`，也没有 `unknown`（引擎未上报）。全部 `updating` / `notContacted` 不提示，避免首次
+ * announce 期间误报。
+ */
+export function showNoneWorking(trackers: readonly Pick<BtTrackerDto, 'status'>[]): boolean {
+  const any = (status: BtTrackerStatus) => trackers.some((tr) => tr.status === status)
+  return trackers.length > 0 && !any('unknown') && !any('working') && any('notWorking')
+}
+
+// ── DHT 伪行 ──
+// 与 crates/downloads/src/model/bt_trackers.rs::{dht_row, dht_nodes_text} 对齐，共用夹具 crates/downloads/tests/fixtures/bt_dht_row_cases.json。
+
+/** DHT 伪行的展示意图：文案键 + 沿用 tracker 状态配色的语气；`nodes` = [IPv4, IPv6] 路由表节点数（只在运行且已有节点时）。 */
+export interface DhtRowView {
+  label: string
+  tone: BtTrackerStatus
+  hint: string | null
+  nodes: readonly [number, number] | null
+}
+
+const dhtView = (label: string, tone: BtTrackerStatus, hint: string | null = null): DhtRowView => ({ label, tone, hint, nodes: null })
+
+/** 旧 daemon（无 `dht`）或未知状态退回只看设置开关。 */
+export function dhtRow(status: Pick<BtStatusDto, 'dhtEnabled' | 'dht'>): DhtRowView {
+  const bySetting = () => (status.dhtEnabled ? dhtView('btTrackerDhtOn', 'working') : dhtView('btTrackerDhtOff', 'notContacted'))
+  const dht = status.dht
+  if (dht === undefined) return bySetting()
+  switch (dht.state) {
+    case 'disabled':
+      return dhtView('btTrackerDhtOff', 'notContacted')
+    case 'private':
+      return dhtView('btTrackerDhtPrivate', 'notContacted', 'btTrackerDhtPrivateHint')
+    case 'idle':
+      return dhtView('btTrackerDhtOn', 'working')
+    case 'unavailable':
+      return dhtView('btTrackerDhtUnavailable', 'notWorking', 'btTrackerDhtUnavailableHint')
+    case 'running':
+      // 路由表空：刚启动正在引导，长时间如此通常是 UDP 被拦截。
+      if (dht.nodesV4 === 0 && dht.nodesV6 === 0) return dhtView('btTrackerDhtConnecting', 'updating', 'btTrackerDhtConnectingHint')
+      return { ...dhtView('btTrackerDhtOn', 'working', 'btTrackerDhtNodesHint'), nodes: [dht.nodesV4, dht.nodesV6] }
+    default:
+      return bySetting()
+  }
+}
+
+/** 节点数文案键与参数（`{n}` 总数、`{v4}` / `{v6}` 分项）：没有 IPv6 节点时只报总数。 */
+export function dhtNodesText([v4, v6]: readonly [number, number]): { key: string; args: { n: string; v4: string; v6: string } } {
+  return {
+    key: v6 === 0 ? 'btTrackerDhtNodes' : 'btTrackerDhtNodesSplit',
+    args: { n: String(v4 + v6), v4: String(v4), v6: String(v6) },
+  }
+}
+
+/** 渲染行：保持服务端顺序，仅归一化可选字段。 */
+export interface TrackerRow {
+  key: string
+  url: string
+  source: BtTrackerDto['source']
+  status: BtTrackerStatus
+  peers: number | null
+  message: string
+  /** 原始错误文本；服务端未给时回退到 message。 */
+  detail: string
+  lastOkAt: number
+  nextAnnounceAt: number
+  /** 层级的显示值（BEP 12 层级从 0 起，界面从 1 起；GPUI `tier + 1`）。 */
+  tier: number
+  /** tracker 报告的做种 / 下载中 / 完成次数；未知（旧 daemon 或 tracker 未回）为 null。 */
+  seeders: number | null
+  leechers: number | null
+  downloaded: number | null
+}
+
+const countOrNull = (value: number | undefined): number | null => (typeof value === 'number' && Number.isFinite(value) ? value : null)
+
+/** tracker 统计数的显示：未知为 `—`（GPUI `count_text`）。 */
+export function countText(value: number | null): string {
+  return value === null ? '—' : String(value)
+}
+
+/** 窄版式的统计行（层级 / 做种 / 下载中 / 完成），`labels` 按同序传入（GPUI `tracker_stats_items`）。 */
+export function trackerStatsItems(labels: readonly [string, string, string, string], row: Pick<TrackerRow, 'tier' | 'seeders' | 'leechers' | 'downloaded'>): string[] {
+  return [
+    `${labels[0]}: ${row.tier}`,
+    `${labels[1]}: ${countText(row.seeders)}`,
+    `${labels[2]}: ${countText(row.leechers)}`,
+    `${labels[3]}: ${countText(row.downloaded)}`,
+  ]
+}
+
+/** HTTP 源状态 -> i18n 键；未知取值（新 daemon 扩展）返回 null，界面原样显示。 */
+export function webSeedStateKey(state: string): string | null {
+  switch (state) {
+    case 'idle':
+      return 'btWebSeedStateIdle'
+    case 'downloading':
+      return 'btWebSeedStateDownloading'
+    case 'backingOff':
+      return 'btWebSeedStateBackingOff'
+    case 'disabled':
+      return 'btWebSeedStateDisabled'
+    default:
+      return null
+  }
+}
+
+/** 常规页 v2 info hash：非空才显示（v1 种子 / 旧 daemon / 未取得元数据为 null）。 */
+export function infoHashV2(status: Pick<BtStatusDto, 'infoHashV2'> | null | undefined): string | null {
+  const hash = (status?.infoHashV2 ?? '').trim()
+  return hash === '' ? null : hash
+}
+
+export function mapTrackerRows(trackers: readonly BtTrackerDto[]): TrackerRow[] {
+  const seen = new Map<string, number>()
+  return trackers.map((tr) => {
+    const nth = seen.get(tr.url) ?? 0
+    seen.set(tr.url, nth + 1)
+    return {
+      key: nth === 0 ? tr.url : `${tr.url}#${nth}`,
+      url: tr.url,
+      source: tr.source,
+      status: tr.status,
+      peers: typeof tr.peers === 'number' ? tr.peers : null,
+      message: (tr.message ?? '').trim(),
+      detail: (tr.detail ?? tr.message ?? '').trim(),
+      lastOkAt: tr.lastOkAt ?? 0,
+      nextAnnounceAt: tr.nextAnnounceAt ?? 0,
+      tier: (typeof tr.tier === 'number' && Number.isFinite(tr.tier) ? tr.tier : 0) + 1,
+      seeders: countOrNull(tr.seeders),
+      leechers: countOrNull(tr.leechers),
+      downloaded: countOrNull(tr.downloaded),
+    }
+  })
+}
+
+// ── Tracker 筛选 / 排序 ──
+// 与 crates/downloads/src/model/bt_trackers.rs 对齐，共用夹具 crates/downloads/tests/fixtures/bt_tracker_view_cases.json。
+
+export type TrackerFilter = 'all' | 'working' | 'updating' | 'notWorking' | 'notContacted'
+
+export const TRACKER_FILTERS: readonly TrackerFilter[] = ['all', 'working', 'updating', 'notWorking', 'notContacted']
+
+export type TrackerSortKey = 'url' | 'status' | 'peers' | 'nextAnnounce' | 'lastOk'
+
+/** `null` = 服务端顺序。 */
+export type TrackerSort = { key: TrackerSortKey; desc: boolean } | null
+
+export type TrackerCounts = Record<TrackerFilter, number>
+
+export function trackerCounts(rows: readonly Pick<TrackerRow, 'status'>[]): TrackerCounts {
+  const counts: TrackerCounts = { all: rows.length, working: 0, updating: 0, notWorking: 0, notContacted: 0 }
+  for (const row of rows) {
+    if (row.status === 'working' || row.status === 'updating' || row.status === 'notWorking' || row.status === 'notContacted') counts[row.status] += 1
+  }
+  return counts
+}
+
+/** 升序：先看失败。 */
+const STATUS_RANK: Record<BtTrackerStatus, number> = { notWorking: 0, updating: 1, working: 2, notContacted: 3, unknown: 4 }
+
+/** 排序值；`null` = 缺省（无论升降序都排最后）。lastOk 取负使「最近」在升序最前。 */
+function sortValue(row: TrackerRow, key: TrackerSortKey): number | string | null {
+  switch (key) {
+    case 'url':
+      return row.url.toLowerCase()
+    case 'status':
+      return STATUS_RANK[row.status] ?? STATUS_RANK.unknown
+    case 'peers':
+      return row.peers
+    case 'nextAnnounce':
+      return row.nextAnnounceAt === 0 ? null : row.nextAnnounceAt
+    case 'lastOk':
+      return row.lastOkAt === 0 ? null : -row.lastOkAt
+  }
+}
+
+/** 过滤 + 稳定排序，返回 `rows` 下标。 */
+export function trackerView(rows: readonly TrackerRow[], filter: TrackerFilter, sort: TrackerSort): number[] {
+  const indices: number[] = []
+  rows.forEach((row, index) => {
+    if (filter === 'all' || row.status === filter) indices.push(index)
+  })
+  if (sort === null) return indices
+  const { key, desc } = sort
+  const values = rows.map((row) => sortValue(row, key))
+  return indices.sort((a, b) => {
+    const va = values[a] ?? null
+    const vb = values[b] ?? null
+    if (va === null || vb === null) return va === vb ? a - b : va === null ? 1 : -1
+    const cmp = va < vb ? -1 : va > vb ? 1 : 0
+    return cmp === 0 ? a - b : desc ? -cmp : cmp
+  })
+}
+
+/** 表头点击三态：未排序 → 升序 → 降序 → 未排序；换列从升序开始。 */
+export function nextTrackerSort(current: TrackerSort, key: TrackerSortKey): TrackerSort {
+  if (current === null || current.key !== key) return { key, desc: false }
+  return current.desc ? null : { key, desc: true }
+}
+
+/** 中间省略：头部由 CSS 截断，尾部固定显示（保留域名后的路径末段 / 端口）。 */
+export function splitMiddle(url: string, tailLen = 18): { head: string; tail: string } {
+  if (url.length <= tailLen * 2) return { head: url, tail: '' }
+  return { head: url.slice(0, url.length - tailLen), tail: url.slice(url.length - tailLen) }
+}
+
+export type TrackerLayout = 'card' | 'table' | 'wide' | 'wideStats'
+
+/** 层级 / 做种 / 下载 / 完成四列并排所需的最小宽度（GPUI `TRACKER_STATS_MIN_WIDTH`）。 */
+export const TRACKER_STATS_MIN_WIDTH = 1100
+
+/**
+ * 容器宽度 → Tracker 版式：<560 卡片式；<900 表格（消息与统计在 URL 下方）；<1100 宽版（消息独立成列，
+ * 统计仍在 URL 下方）；其余统计也各占一列。
+ */
+export function trackerLayout(width: number): TrackerLayout {
+  if (width < 560) return 'card'
+  if (width < 900) return 'table'
+  if (width < TRACKER_STATS_MIN_WIDTH) return 'wide'
+  return 'wideStats'
+}
+
+/** 消息是否独立成列（两种宽版）。 */
+export const trackerMessageColumn = (layout: TrackerLayout): boolean => layout === 'wide' || layout === 'wideStats'
+
+/**
+ * 任务是否在运行（下载中，或已完成且正在做种 `seedingStatus === 1`），决定「强制汇报」是否可用。
+ * 镜像 GPUI `bt_task_running`：排队等做种名额（`8`）不算运行，daemon 会回 `taskStateConflict`。
+ */
+export function btTaskRunning(view: { state: TaskState; seedingStatus: number }): boolean {
+  return view.state === 'downloading' || (view.state === 'completed' && view.seedingStatus === 1)
+}
+
+/** BT 元数据是否已到手：名称非空且总大小已知（磁力带 `dn=` 时名称先于元数据出现，只看名称不够）。 */
+export function btMetadataReady(view: { metadataPending: boolean; sizeBytes: number }): boolean {
+  return !view.metadataPending && view.sizeBytes > 0
+}
+
+// ── Peers ──
+
+export type PeerColumn = 'addr' | 'client' | 'transport' | 'downloaded' | 'uploaded' | 'downBps' | 'upBps' | 'groupDelivered' | 'suspicion' | 'action'
+
+export type PeerLayout = 'card' | 'compact' | 'full'
+
+/**
+ * 容器宽度 → 连接版式：<480 卡片；<780 紧凑（隐藏客户端 / 上传量）；其余全列。
+ * 带防吸血列（IP 组送达 / 嫌疑 / 处置，最小宽度合计见 `GUARD_COLUMNS_MIN_WIDTH`）时全列版式要求更宽，否则退回紧凑。
+ */
+export function peerLayout(width: number, guard = false): PeerLayout {
+  if (width < 480) return 'card'
+  if (width < (guard ? GUARD_COLUMNS_MIN_WIDTH : 780)) return 'compact'
+  return 'full'
+}
+
+/** `guard` = 防吸血数据可用（任一 peer 带 IP 组）：追加 IP 组送达量 / 嫌疑 / 处置列。 */
+export function peerColumns(layout: PeerLayout, guard = false): PeerColumn[] {
+  switch (layout) {
+    case 'card':
+      return ['addr', 'transport', 'downBps', 'upBps']
+    case 'compact':
+      return guard ? ['addr', 'transport', 'downloaded', 'downBps', 'upBps', 'action'] : ['addr', 'transport', 'downloaded', 'downBps', 'upBps']
+    case 'full':
+      return guard
+        ? ['addr', 'client', 'transport', 'downloaded', 'uploaded', 'downBps', 'upBps', 'groupDelivered', 'suspicion', 'action']
+        : ['addr', 'client', 'transport', 'downloaded', 'uploaded', 'downBps', 'upBps']
+  }
+}
+
+const TRANSPORT_LABEL: Record<BtPeerTransport, string> = { tcp: 'TCP', utp: 'uTP', socks: 'SOCKS', http: 'HTTP', i2p: 'I2P' }
+
+export const transportLabel = (transport: BtPeerTransport): string => TRANSPORT_LABEL[transport] ?? String(transport).toUpperCase()
+
+export interface PeerRow {
+  key: string
+  addr: string
+  client: string
+  /** 大写国家码；未知 = `''`。 */
+  country: string
+  transport: BtPeerTransport
+  downloaded: number
+  uploaded: number
+  downBps: number
+  upBps: number
+  /** 防吸血字段（旧 daemon / 未启用时为无嫌疑、放行）。 */
+  guard: PeerGuardView
+}
+
+/** 是否有 peer 带防吸血 IP 组（决定是否显示防吸血列）。 */
+export function hasGuardData(rows: readonly Pick<PeerRow, 'guard'>[]): boolean {
+  return rows.some((row) => row.guard.ipGroup !== '')
+}
+
+/** 取前 `MAX_PEER_ROWS` 条（服务端顺序）；`key` = 地址，重复地址追加序号保证唯一。 */
+export function mapPeerRows(peers: readonly BtPeerDto[]): { rows: PeerRow[]; total: number } {
+  const seen = new Map<string, number>()
+  const rows = peers.slice(0, MAX_PEER_ROWS).map((p) => {
+    const nth = seen.get(p.addr) ?? 0
+    seen.set(p.addr, nth + 1)
+    return {
+      key: nth === 0 ? p.addr : `${p.addr}#${nth}`,
+      addr: p.addr,
+      client: (p.client ?? '').trim(),
+      country: normalizeCountry(p.country),
+      transport: p.transport,
+      downloaded: p.downloaded,
+      uploaded: p.uploaded,
+      downBps: p.downBps,
+      upBps: p.upBps,
+      guard: peerGuardView(p),
+    }
+  })
+  return { rows, total: peers.length }
+}
+
+/** 空态：运行中（下载 / 做种）= `btPeersEmpty`，否则 `btPeersIdleHint`。 */
+export function peersEmptyKey(state: TaskState, seeding: boolean): 'btPeersEmpty' | 'btPeersIdleHint' {
+  return state === 'downloading' || seeding ? 'btPeersEmpty' : 'btPeersIdleHint'
+}

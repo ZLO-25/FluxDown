@@ -2,7 +2,7 @@
 //!
 //! 不依赖 GPUI 状态，只做金额格式化、价格 / 状态判定、倒计时、邀请码校验与映射表。
 
-use fluxdown_protocol::{CloudPlan, ErrorReason};
+use fluxdown_protocol::{CloudPlan, CloudSubscription, ErrorReason};
 use fluxdown_ui_components::FluxIcon;
 
 /// 每个账号最多可创建的推荐码数量。
@@ -29,7 +29,7 @@ pub(crate) fn effective_price(plan: &CloudPlan) -> i64 {
         .map_or(plan.price_minor, |campaign| campaign.effective_price_minor)
 }
 
-/// 可购买列表：`purchasable && code != "free" && 生效价 > 0`，按 `sort` 升序稳定排序。
+/// 可购买会员列表：`purchasable && code != "free" && 生效价 > 0`，按 `sort` 升序稳定排序。
 pub(crate) fn purchasable_plans(catalog: &[CloudPlan]) -> Vec<&CloudPlan> {
     let mut plans: Vec<&CloudPlan> = catalog
         .iter()
@@ -50,6 +50,20 @@ pub(crate) fn owned_price(catalog: &[CloudPlan], current_code: Option<&str>) -> 
     }
 }
 
+/// 已持有永久套餐的 `sort`：目录里找不到（含未登录）→ `None`（不据此拦截会员卡）。
+pub(crate) fn owned_sort(catalog: &[CloudPlan], current_code: Option<&str>) -> Option<i64> {
+    let code = current_code?;
+    catalog
+        .iter()
+        .find(|plan| plan.code == code)
+        .map(|plan| plan.sort)
+}
+
+/// 周期会员卡（`billingPeriodDays` 非空的会员套餐）。
+pub(crate) fn is_subscription_plan(plan: &CloudPlan) -> bool {
+    plan.billing_period_days.is_some()
+}
+
 /// 套餐卡片状态；只有 [`CardState::Available`] 可选。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CardState {
@@ -59,23 +73,35 @@ pub(crate) enum CardState {
     TierBlocked,
     /// 已付抵扣额不低于该套餐生效价。
     CreditBlocked,
+    /// 当前生效的会员卡（同卡续费）。
+    Renewable,
     Available,
 }
 
 impl CardState {
     pub(crate) fn selectable(self) -> bool {
-        self == Self::Available
+        matches!(self, Self::Available | Self::Renewable)
     }
 }
 
 /// 状态优先级：Current > TierBlocked > CreditBlocked > Available。
+/// 周期会员卡不抵扣：同卡 → Renewable；有其他生效卡 → TierBlocked；`sort` 不高于永久套餐 → TierBlocked；否则 Available。
 pub(crate) fn card_state(
     plan: &CloudPlan,
     current_code: Option<&str>,
     owned: i64,
     credit: i64,
+    active_subscription: Option<&CloudSubscription>,
+    base_sort: Option<i64>,
 ) -> CardState {
-    if current_code == Some(plan.code.as_str()) {
+    if is_subscription_plan(plan) {
+        match active_subscription {
+            Some(sub) if sub.plan_code == plan.code => CardState::Renewable,
+            Some(_) => CardState::TierBlocked,
+            None if base_sort.is_some_and(|sort| plan.sort <= sort) => CardState::TierBlocked,
+            None => CardState::Available,
+        }
+    } else if current_code == Some(plan.code.as_str()) {
         CardState::Current
     } else if owned > 0 && plan.price_minor <= owned {
         CardState::TierBlocked
@@ -108,7 +134,11 @@ pub(crate) struct PriceDisplay {
 /// 抵扣额只作用于可购买（[`CardState::Available`]）的卡片：当前 / 不可选套餐不是升级目标，
 /// 用已付金额去减它们的价格会把「已付」误显示成「已抵扣」。
 pub(crate) fn price_display(plan: &CloudPlan, state: CardState, credit: i64) -> PriceDisplay {
-    let credit = if state.selectable() { credit } else { 0 };
+    let credit = if state == CardState::Available {
+        credit
+    } else {
+        0
+    };
     let currency = plan.currency.as_str();
     let main = format_minor(payable(plan, credit), currency);
     if credit > 0 {
@@ -233,6 +263,7 @@ pub(crate) fn billing_reason_key(reason: ErrorReason) -> Option<&'static str> {
         ErrorReason::PlanAlreadyOwned => "accountPlanErrorAlreadyOwned",
         ErrorReason::PlanNotUpgrade => "accountPlanErrorNotUpgrade",
         ErrorReason::PlanTierNotHigher => "accountPlanErrorTierNotHigher",
+        ErrorReason::SubscriptionConflict => "errReasonSubscriptionConflict",
         ErrorReason::ReferralCodeInvalid => "accountPlanErrorReferralInvalid",
         ErrorReason::ReferralSelfUse => "accountPlanErrorReferralSelfUse",
         ErrorReason::ReferralAlreadyUsed => "accountPlanErrorReferralAlreadyUsed",
@@ -353,6 +384,54 @@ mod tests {
         assert!(purchasable_plans(&[with_campaign(plan("x", 100, 0), 0)]).is_empty());
     }
 
+    fn card(code: &str, price: i64, sort: i64) -> CloudPlan {
+        let mut p = plan(code, price, sort);
+        p.billing_period_days = Some(30);
+        p
+    }
+
+    fn sub(code: &str) -> CloudSubscription {
+        CloudSubscription {
+            plan_code: code.to_owned(),
+            ..CloudSubscription::default()
+        }
+    }
+
+    #[test]
+    fn subscription_card_states() {
+        let c = card("m1", 1000, 5);
+        let other = card("m2", 2000, 6);
+        // 同卡 → Renewable；其他卡在有生效卡时 → TierBlocked。
+        assert_eq!(
+            card_state(&c, Some("pro"), 3000, 9999, Some(&sub("m1")), Some(1)),
+            CardState::Renewable
+        );
+        assert_eq!(
+            card_state(&other, Some("pro"), 3000, 9999, Some(&sub("m1")), Some(1)),
+            CardState::TierBlocked
+        );
+        // 无生效卡：sort ≤ 永久套餐 → TierBlocked；更高 → Available（价格低于永久套餐也不拦、不抵扣）。
+        assert_eq!(
+            card_state(&c, Some("pro"), 3000, 9999, None, Some(5)),
+            CardState::TierBlocked
+        );
+        assert_eq!(
+            card_state(&c, Some("pro"), 3000, 9999, None, Some(4)),
+            CardState::Available
+        );
+        assert_eq!(
+            card_state(&c, None, 0, 9999, None, None),
+            CardState::Available
+        );
+        assert!(CardState::Renewable.selectable());
+        assert!(is_subscription_plan(&c));
+        assert!(!is_subscription_plan(&plan("pro", 3000, 1)));
+        assert_eq!(
+            billing_reason_key(ErrorReason::SubscriptionConflict),
+            Some("errReasonSubscriptionConflict")
+        );
+    }
+
     #[test]
     fn owned_price_uses_full_catalog() {
         let catalog = vec![
@@ -368,6 +447,9 @@ mod tests {
 
     #[test]
     fn card_state_priority() {
+        let card_state = |plan: &CloudPlan, cur: Option<&str>, owned: i64, credit: i64| {
+            super::card_state(plan, cur, owned, credit, None, None)
+        };
         let pro = plan("pro", 3000, 1);
         // Current 优先于一切（即便同时满足 TierBlocked / CreditBlocked）。
         assert_eq!(

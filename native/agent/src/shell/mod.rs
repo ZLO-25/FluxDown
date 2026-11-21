@@ -83,7 +83,35 @@ pub struct TrayModel {
     pub restart: String,
     pub quit: String,
     pub tooltip: String,
+    /// 托盘图标（跟随应用图标设置；macOS 恒为 [`TrayIconSource::Default`] 单色模板图）。
+    pub icon: TrayIconSource,
 }
+
+/// 托盘图标来源：默认由宿主按平台 / 明暗选内置图；其余是已缩放好的 PNG。
+///
+/// 相等性只看 `key`（`bolt` / `custom:<revision>`）：同一个 key 对应同一张图，宿主据此判定是否要
+/// 重新 `set_icon`，不比较 PNG 字节。
+#[derive(Clone, Debug, Default)]
+pub enum TrayIconSource {
+    #[default]
+    Default,
+    Image {
+        key: String,
+        png: Arc<[u8]>,
+    },
+}
+
+impl PartialEq for TrayIconSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Default, Self::Default) => true,
+            (Self::Image { key: left, .. }, Self::Image { key: right, .. }) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for TrayIconSource {}
 
 /// runtime → 托盘宿主线程的推送端口。
 pub trait TrayPort: Send + Sync {
@@ -179,6 +207,9 @@ pub struct ShellState {
     daemon: Arc<DaemonClient>,
     events: AgentEventHub,
     changed: Arc<Notify>,
+    /// 「最后一个官方 UI 已断开」的代数，每次断开 +1；应用图标服务记录待办时的代数，等更大的代数再重试
+    /// （不用 `Notify`：它会在无人等待时存下许可，让之后才出现的待办立刻误重试）。
+    ui_left: tokio::sync::watch::Sender<u64>,
 }
 
 impl ShellState {
@@ -201,6 +232,7 @@ impl ShellState {
             daemon,
             events,
             changed: Arc::new(Notify::new()),
+            ui_left: tokio::sync::watch::channel(0).0,
         })
     }
 
@@ -212,6 +244,26 @@ impl ShellState {
     #[must_use]
     pub fn ui_clients(&self) -> usize {
         self.ui_clients.load(Ordering::Acquire)
+    }
+
+    /// 当前「最后一个官方 UI 已断开」的代数。
+    #[must_use]
+    pub fn ui_left_generation(&self) -> u64 {
+        *self.ui_left.borrow()
+    }
+
+    /// 等待代数严格大于 `seen`，返回新的代数。
+    pub async fn wait_ui_left_after(&self, seen: u64) -> u64 {
+        let mut receiver = self.ui_left.subscribe();
+        let newer = receiver
+            .wait_for(|generation| *generation > seen)
+            .await
+            .map(|generation| *generation);
+        match newer {
+            Ok(generation) => generation,
+            // 发送端属于 `self`，不会先于它关闭；万一如此，等于永远没有新的断开。
+            Err(_) => std::future::pending().await,
+        }
     }
 
     /// 官方 UI（声明 `client.selections`）完成握手。
@@ -255,6 +307,7 @@ impl ShellState {
                 .unwrap_or_else(|_| panic!("UI client decrement always supplies an updated count"));
             if previous <= 1 {
                 launches.ui_left(Instant::now());
+                self.ui_left.send_modify(|generation| *generation += 1);
             }
         }
         self.reconcile_selection(false).await;
@@ -390,36 +443,6 @@ impl ShellState {
         }
     }
 
-    /// 新版本提醒：托盘驻留且没有 UI 连接时拉起界面（`--capture` 只开提醒窗口，不开主窗口），
-    /// 界面在运行时由它自己按同一判定开窗。非驻留时没有 UI 就没有后台，不拉起。
-    fn reconcile_update_prompt(&self, now: Instant) {
-        let due_version = self.events.inspect(|snapshot| {
-            fluxdown_protocol::update_prompt::is_due(
-                &snapshot.update,
-                &snapshot.preferences.values,
-                unix_ms(),
-            )
-            .then(|| snapshot.update.latest_version.clone())
-        });
-        {
-            let mut launches = self.launches();
-            let Some(version) = due_version else {
-                launches.update_settled();
-                return;
-            };
-            if self.ui_clients() > 0
-                || !self.tray_visible.load(Ordering::Acquire)
-                || !launches.update_due(now, &version)
-            {
-                return;
-            }
-            launches.begin_update(now, &version);
-        }
-        if let Err(error) = self.launch_tracked(&["--capture"]) {
-            tracing::warn!(error = %error, "could not launch desktop for update prompt");
-        }
-    }
-
     /// 拉起已在 [`UiLaunches`] 登记的桌面进程；进程退出（或没能启动）时释放登记并唤醒控制循环
     /// 重新判定。
     fn launch_tracked(&self, args: &[&str]) -> Result<(), crate::platform::PlatformError> {
@@ -492,6 +515,8 @@ pub struct ShellServices {
     pub daemon: Arc<DaemonClient>,
     pub events: AgentEventHub,
     pub gateway: Arc<crate::gateway::GatewayService>,
+    /// agent 数据目录（`icons/` 下的应用图标文件）。
+    pub agent_data_dir: std::path::PathBuf,
 }
 
 /// 外壳控制循环：偏好 → 驻留 / 托盘展示；托盘动作；待确认交互拉起界面；非驻留闲置退出。
@@ -507,11 +532,12 @@ pub async fn run_controller(
         daemon,
         events,
         gateway,
+        agent_data_dir,
     } = services;
     #[cfg(feature = "desktop")]
-    let mut tray = tray_model::TrayPresenter::new(host.port.take());
+    let mut tray = tray_model::TrayPresenter::new(host.port.take(), agent_data_dir);
     #[cfg(not(feature = "desktop"))]
-    let _ = host.port.take();
+    let _ = (host.port.take(), agent_data_dir);
     let mut actions = host.actions.take();
     #[cfg(feature = "desktop")]
     let mut hotkeys = crate::hotkey::HotkeyController::start(
@@ -572,7 +598,6 @@ pub async fn run_controller(
         if !lifecycle.quit_requested() {
             state.reconcile_prompt(Instant::now());
             state.reconcile_task_windows(Instant::now());
-            state.reconcile_update_prompt(Instant::now());
         }
         #[cfg(feature = "desktop")]
         {
@@ -775,14 +800,6 @@ fn snapshot_is_idle(snapshot: &AgentSnapshot) -> bool {
         && snapshot.power.armed_delay_secs.is_none()
 }
 
-fn unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-        })
-}
-
 /// 是否有必须由界面承载的待确认交互：外部捕获恒需要；引擎选择只在托盘驻留、由 agent 代为订阅
 /// 时才需要拉起界面（非驻留且无 UI 时 agent 不订阅，daemon 直接走默认值）。
 fn needs_prompt_ui(snapshot: &AgentSnapshot, tray_visible: bool) -> bool {
@@ -872,8 +889,8 @@ mod tests {
             let frame = receiver.try_recv().expect("replayed task intent");
             assert_eq!(frame.sequence, baseline.sequence + offset as u64 + 1);
             assert!(matches!(
-                frame.event,
-                ServiceEvent::Agent(AgentEvent::CaptureTasksStarted(ids)) if ids == [task_id]
+                &frame.event,
+                ServiceEvent::Agent(AgentEvent::CaptureTasksStarted(ids)) if *ids == [task_id]
             ));
         }
         state.launch_for_task_windows("already-ready");
@@ -884,8 +901,8 @@ mod tests {
         state.ui_snapshot_ready();
         let frame = receiver.try_recv().expect("new reconnect intent");
         assert!(matches!(
-            frame.event,
-            ServiceEvent::Agent(AgentEvent::CaptureTasksStarted(ids)) if ids == ["during-reconnect"]
+            &frame.event,
+            ServiceEvent::Agent(AgentEvent::CaptureTasksStarted(ids)) if *ids == ["during-reconnect"]
         ));
         assert!(matches!(
             receiver.try_recv(),

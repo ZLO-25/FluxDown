@@ -17,6 +17,7 @@ pub(crate) enum GroupCountTone {
 
 #[derive(Clone)]
 pub(crate) struct DownloadStrings {
+    pub(crate) task_edit_title: SharedString,
     pub(crate) category_archive: SharedString,
     pub(crate) category_audio: SharedString,
     pub(crate) category_document: SharedString,
@@ -73,7 +74,12 @@ pub(crate) struct DownloadStrings {
     pub(crate) main_queue: SharedString,
     pub(crate) open_file: SharedString,
     pub(crate) open_folder: SharedString,
+    /// 右键「复制文件」：把产物以文件写入系统剪贴板。
+    pub(crate) copy_file: SharedString,
     pub(crate) remote_tasks: SharedString,
+    pub(crate) directory_default: SharedString,
+    pub(crate) directory_external: SharedString,
+    pub(crate) directory_unknown: SharedString,
     pub(crate) sidebar_queues: SharedString,
     pub(crate) status_all: SharedString,
     pub(crate) status_completed: SharedString,
@@ -110,17 +116,49 @@ pub(crate) struct DownloadStrings {
     pub(crate) change_url_label: SharedString,
     pub(crate) change_url_placeholder: SharedString,
     /// 右键「修改线程数」及其对话框（含「已下进度保留」说明与成功提示）。
-    pub(crate) edit_threads: SharedString,
     pub(crate) edit_threads_title: SharedString,
     pub(crate) edit_threads_hint: SharedString,
     pub(crate) edit_threads_label: SharedString,
     pub(crate) edit_threads_zero_hint: SharedString,
     pub(crate) edit_threads_invalid: SharedString,
     pub(crate) threads_changed: SharedString,
+    /// 「本机做种」对话框与入口。
+    pub(crate) seed_local_title: SharedString,
+    pub(crate) seed_local_desc: SharedString,
+    pub(crate) seed_local_path: SharedString,
+    pub(crate) seed_local_path_placeholder: SharedString,
+    pub(crate) seed_local_pick_file: SharedString,
+    pub(crate) seed_local_pick_folder: SharedString,
+    pub(crate) seed_local_torrent: SharedString,
+    pub(crate) seed_local_torrent_hint: SharedString,
+    pub(crate) seed_local_pick_torrent: SharedString,
+    pub(crate) seed_local_trackers: SharedString,
+    pub(crate) seed_local_trackers_hint: SharedString,
+    pub(crate) seed_local_unlimited: SharedString,
+    pub(crate) seed_local_unlimited_desc: SharedString,
+    pub(crate) seed_local_submit: SharedString,
+    pub(crate) seed_local_working: SharedString,
+    pub(crate) seed_local_started: SharedString,
+    pub(crate) seed_local_err_path_required: SharedString,
     /// 右键「完整性校验」（已完成 BT 任务）。
     pub(crate) verify_integrity: SharedString,
+    /// 右键「选片方式」分组标题（不可点击；其下为顺序单选 + 首尾勾选）。
+    pub(crate) bt_piece_picking: SharedString,
+    /// 右键「最稀有优先」（未完成 BT 任务；与「按顺序下载」互斥，缺省选中）。
+    pub(crate) bt_rarest_first: SharedString,
+    /// 右键「按顺序下载」（未完成 BT 任务；与「最稀有优先」互斥）。
+    pub(crate) bt_sequential: SharedString,
+    /// 右键「先下载首尾文件块」（未完成 BT 任务，可与任一顺序组合）。
+    pub(crate) bt_first_last_pieces: SharedString,
+    /// 右键 BT 运维项：强制重新校验 / 移动到… / 任务限速… / 超级做种。
+    pub(crate) bt_force_recheck: SharedString,
+    pub(crate) bt_move_storage: SharedString,
+    pub(crate) bt_task_limits: SharedString,
+    pub(crate) bt_super_seeding: SharedString,
     pub(crate) redownload_task: SharedString,
     pub(crate) copy_url: SharedString,
+    pub(crate) copy_magnet: SharedString,
+    pub(crate) export_torrent: SharedString,
     /// 复制下载地址后的成功提示。
     pub(crate) url_copied: SharedString,
     pub(crate) move_to_queue: SharedString,
@@ -252,7 +290,11 @@ impl DownloadStrings {
             resume_all_queue_stopped: shared(translator.text("resumeAllQueueStopped")),
             open_file: shared(translator.text("openFile")),
             open_folder: shared(translator.text("openFolder")),
+            copy_file: shared(translator.text("copyFileAction")),
             remote_tasks: shared(translator.text("remoteTasksGroup")),
+            directory_default: shared(translator.text("viewDirectoryDefault")),
+            directory_external: shared(translator.text("viewDirectoryExternal")),
+            directory_unknown: shared(translator.text("viewDirectoryUnknown")),
             sidebar_queues: shared(translator.text(keys::SIDEBAR_QUEUES)),
             status_all: shared(translator.text(keys::TAB_ALL)),
             status_completed: shared(translator.text(keys::STATUS_COMPLETED)),
@@ -285,16 +327,43 @@ impl DownloadStrings {
             change_url_title: shared(translator.text("webChangeUrlTitle")),
             change_url_label: shared(translator.text("webChangeUrlLabel")),
             change_url_placeholder: shared(translator.text("webChangeUrlPlaceholder")),
-            edit_threads: shared(translator.text("editThreads")),
             edit_threads_title: shared(translator.text("editThreadsTitle")),
             edit_threads_hint: shared(translator.text("editThreadsResetHint")),
             edit_threads_label: shared(translator.text("configuredThreads")),
             edit_threads_zero_hint: shared(translator.text("queueDefaultSegmentsHint")),
             edit_threads_invalid: shared(translator.text("editThreadsInvalid")),
             threads_changed: shared(translator.text("threadsChanged")),
+            task_edit_title: shared(translator.text("taskEditTitle")),
+            seed_local_title: shared(translator.text("seedLocalTitle")),
+            seed_local_desc: shared(translator.text("seedLocalDesc")),
+            seed_local_path: shared(translator.text("seedLocalPath")),
+            seed_local_path_placeholder: shared(translator.text("seedLocalPathPlaceholder")),
+            seed_local_pick_file: shared(translator.text("seedLocalPickFile")),
+            seed_local_pick_folder: shared(translator.text("seedLocalPickFolder")),
+            seed_local_torrent: shared(translator.text("seedLocalTorrent")),
+            seed_local_torrent_hint: shared(translator.text("seedLocalTorrentHint")),
+            seed_local_pick_torrent: shared(translator.text("seedLocalPickTorrent")),
+            seed_local_trackers: shared(translator.text("seedLocalTrackers")),
+            seed_local_trackers_hint: shared(translator.text("seedLocalTrackersHint")),
+            seed_local_unlimited: shared(translator.text("seedLocalUnlimited")),
+            seed_local_unlimited_desc: shared(translator.text("seedLocalUnlimitedDesc")),
+            seed_local_submit: shared(translator.text("seedLocalSubmit")),
+            seed_local_working: shared(translator.text("seedLocalWorking")),
+            seed_local_started: shared(translator.text("seedLocalStarted")),
+            seed_local_err_path_required: shared(translator.text("seedLocalErrPathRequired")),
             verify_integrity: shared(translator.text("verifyTaskIntegrity")),
+            bt_piece_picking: shared(translator.text("btPiecePicking")),
+            bt_rarest_first: shared(translator.text("btRarestFirst")),
+            bt_sequential: shared(translator.text("btSequentialDownload")),
+            bt_first_last_pieces: shared(translator.text("btFirstLastPiecesFirst")),
+            bt_force_recheck: shared(translator.text("btForceRecheck")),
+            bt_move_storage: shared(translator.text("btMoveStorage")),
+            bt_task_limits: shared(translator.text("btTaskLimits")),
+            bt_super_seeding: shared(translator.text("btSuperSeeding")),
             redownload_task: shared(translator.text("redownloadTask")),
             copy_url: shared(translator.text("copyUrl")),
+            copy_magnet: shared(translator.text("btCopyMagnet")),
+            export_torrent: shared(translator.text("btExportTorrent")),
             url_copied: shared(translator.text("urlCopied")),
             move_to_queue: shared(translator.text("moveToQueueAction")),
             select_tasks: shared(translator.text("selectTasks")),
@@ -722,6 +791,9 @@ pub(crate) struct NewDownloadStrings {
     pub(crate) cookie: SharedString,
     pub(crate) cookie_desc: SharedString,
     pub(crate) cookie_placeholder: SharedString,
+    pub(crate) referrer: SharedString,
+    pub(crate) referrer_desc: SharedString,
+    pub(crate) referrer_placeholder: SharedString,
     pub(crate) checksum: SharedString,
     pub(crate) checksum_desc: SharedString,
     pub(crate) checksum_placeholder: SharedString,
@@ -840,6 +912,9 @@ impl NewDownloadStrings {
             cookie: shared(translator.text("taskCookie")),
             cookie_desc: shared(translator.text("taskCookieDesc")),
             cookie_placeholder: shared(translator.text("taskCookiePlaceholder")),
+            referrer: shared(translator.text("taskReferrer")),
+            referrer_desc: shared(translator.text("taskReferrerDesc")),
+            referrer_placeholder: shared(translator.text("taskReferrerPlaceholder")),
             checksum: shared(translator.text("taskChecksum")),
             checksum_desc: shared(translator.text("taskChecksumDesc")),
             checksum_placeholder: shared(translator.text("taskChecksumPlaceholder")),
@@ -1038,6 +1113,8 @@ pub(crate) fn error_text(
         ErrorReason::TaskStateConflict => Some("errReasonTaskStateConflict"),
         ErrorReason::TaskDeviceMismatch => Some("errReasonTaskDeviceMismatch"),
         ErrorReason::SaveDirUnavailable => Some("errReasonSaveDirUnavailable"),
+        ErrorReason::TaskFilesInUse => Some("errReasonTaskFilesInUse"),
+        ErrorReason::TaskFilesNotDeleted => Some("errReasonTaskFilesNotDeleted"),
         ErrorReason::CloudUnreachable => Some("accountErrorNetwork"),
         ErrorReason::SessionExpired => Some("errReasonSessionExpired"),
         ErrorReason::DeviceUntrusted => Some("accountSessionRevokedUntrusted"),
@@ -1171,7 +1248,7 @@ mod tests {
     #[test]
     fn post_only_errors_are_localized_and_others_pass_through()
     -> Result<(), fluxdown_ui_i18n::I18nError> {
-        let catalog = std::sync::Arc::new(fluxdown_ui_i18n::I18nCatalog::load_embedded()?);
+        let catalog = fluxdown_ui_i18n::I18nCatalog::load_embedded()?;
         let translator = catalog.translator("en");
         let strings = DownloadStrings::from_translator(&translator);
         assert_eq!(
@@ -1191,7 +1268,7 @@ mod tests {
     #[test]
     fn preparing_status_is_labelled_consistently_across_surfaces()
     -> Result<(), fluxdown_ui_i18n::I18nError> {
-        let catalog = std::sync::Arc::new(fluxdown_ui_i18n::I18nCatalog::load_embedded()?);
+        let catalog = fluxdown_ui_i18n::I18nCatalog::load_embedded()?;
         let translator = catalog.translator("en");
         let strings = DownloadStrings::from_translator(&translator);
         let task = |status: i32, queue_key: Option<i64>| {

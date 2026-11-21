@@ -1,16 +1,16 @@
-// 设置 · 扩展：插件 / 组件两个子页（对应 GPUI `crates/extensions`）。
+// 设置 · 扩展：插件 / 站点默认 / 组件三个子页（对应 GPUI `crates/extensions`）。
 // 子页首次访问才挂载（版本列表 / 市场懒加载），之后保持挂载以保留输入、进度与列表状态。
 
-import { useCallback, useState } from 'react'
+import { useState } from 'react'
 import { useT } from '../../../../i18n'
-import { rpcStore, useAgent, useConnection, useServiceEvents } from '../../../../lib/rpc'
-import type { EventFrame } from '../../../../lib/rpc'
-import { SegmentedTabs, toast } from '../../../../ui'
+import { useAgent, useConnection } from '../../../../lib/rpc'
+import { SegmentedTabs } from '../../../../ui'
 import { SettingsPage } from '../../kit/layout'
 import { ComponentsTab } from './ComponentsTab'
 import { PluginsTab } from './PluginsTab'
+import { SiteDefaultsTab } from './SiteDefaultsTab'
 
-type ExtensionsTab = 'plugins' | 'components'
+type ExtensionsTab = 'plugins' | 'siteDefaults' | 'components'
 
 const selectDaemonConnected = (snapshot: { daemonConnected: boolean }) => snapshot.daemonConnected
 
@@ -29,20 +29,6 @@ export function ExtensionsSettings() {
     setVisited((current) => (current.has(next) ? current : new Set(current).add(next)))
   }
 
-  // 熔断器自动禁用插件：提示（列表由快照事件同步）。
-  const onEvent = useCallback(
-    (frame: EventFrame) => {
-      const outer = frame.event
-      if (outer.service !== 'agent' || outer.event.type !== 'daemon' || outer.event.data.type !== 'engine') return
-      const message = outer.event.data.data
-      if (message.type !== 'pluginAutoDisabled') return
-      const plugin = rpcStore.peek().snapshot?.daemon.plugins.find((entry) => entry.identity === message.identity)
-      if (plugin) toast.warning(t(message.reason === 'Revoked' ? 'pluginRevokedToast' : 'pluginAutoDisabledToast', { name: plugin.name }))
-    },
-    [t],
-  )
-  useServiceEvents(onEvent)
-
   return (
     <SettingsPage title={t('settingsCatExtensions')} description={t('settingsCatExtensionsDesc')}>
       <SegmentedTabs
@@ -51,12 +37,18 @@ export function ExtensionsSettings() {
         onValueChange={show}
         items={[
           { value: 'plugins', label: t('settingsCatPlugins') },
+          { value: 'siteDefaults', label: t('pluginSiteDefaultsTab') },
           { value: 'components', label: t('settingsCatComponents') },
         ]}
       />
       <div hidden={tab !== 'plugins'}>
-        <PluginsTab stale={stale} onGoToComponents={() => show('components')} />
+        <PluginsTab stale={stale} active={tab === 'plugins'} onGoToComponents={() => show('components')} />
       </div>
+      {visited.has('siteDefaults') ? (
+        <div hidden={tab !== 'siteDefaults'}>
+          <SiteDefaultsTab stale={stale} active={tab === 'siteDefaults'} />
+        </div>
+      ) : null}
       {visited.has('components') ? (
         <div hidden={tab !== 'components'}>
           <ComponentsTab stale={stale} />

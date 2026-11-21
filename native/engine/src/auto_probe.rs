@@ -368,6 +368,7 @@ async fn adopt_alternate(
         // 多 CDN 钉定节点是直连 IP：起飞改走代理后不得再旁路代理。
         params.cdn.enabled = false;
     }
+    crate::intercept::sync_egress(params);
     params.auto_proxy = Some(Arc::new(AutoProxyCtx {
         host: ctx.host.clone(),
         user_agent: ctx.user_agent.clone(),
@@ -483,6 +484,8 @@ mod tests {
         host: &str,
         alternates: Vec<PathCandidate>,
     ) -> Result<DownloadParams, Box<dyn std::error::Error>> {
+        // 假代理与假源站都在环回上，须关闭引擎的环回直连才能走代理路径。
+        crate::proxy_config::disable_loopback_bypass_for_tests();
         let mut params =
             crate::downloader::test_support::params_with_interceptor(url, crate::intercept::noop())
                 .await?;
@@ -500,6 +503,10 @@ mod tests {
     /// 原始缺陷的端到端回归：直连被拒时不再等 3 轮退避重试（黑洞时约 63s）
     /// 后整任务失败，而是立即经系统代理拿到响应，并就地接管任务出口。
     #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows 的回环拒绝约 2 秒后才到，晚于错峰；错峰接管由 silent_direct_yields_to_proxy_after_stagger_and_stays_alternate 覆盖"
+    )]
     async fn refused_direct_is_taken_over_by_proxy_without_waiting() -> TestResult {
         let (proxy_port, proxy_hits) = fake_server(Some(OK_RESPONSE)).await?;
         let url = format!("http://127.0.0.1:{}/f.bin", closed_port()?);
@@ -507,7 +514,7 @@ mod tests {
         let mut params = race_params(&url, &host, vec![system_proxy_path(proxy_port)]).await?;
 
         let started = std::time::Instant::now();
-        let probed = race_probe(&mut params, ProbeKind::HeldGet).await?;
+        let probed = race_probe(&mut params, ProbeKind::Held).await?;
         let elapsed = started.elapsed();
 
         assert!(
@@ -546,7 +553,7 @@ mod tests {
         let mut params = race_params(&url, &host, vec![system_proxy_path(proxy_port)]).await?;
 
         let started = std::time::Instant::now();
-        race_probe(&mut params, ProbeKind::HeldGet).await?;
+        race_probe(&mut params, ProbeKind::Held).await?;
         let elapsed = started.elapsed();
 
         assert!(elapsed >= STAGGER_COLD, "错峰内不得抢跑备选: {elapsed:?}");
@@ -570,7 +577,7 @@ mod tests {
         let host = format!("race-404-{proxy_port}.test");
         let mut params = race_params(&url, &host, vec![system_proxy_path(proxy_port)]).await?;
 
-        let result = race_probe(&mut params, ProbeKind::HeldGet).await;
+        let result = race_probe(&mut params, ProbeKind::Held).await;
 
         assert!(result.is_err(), "404 是服务器结论，不是路径问题");
         assert_eq!(

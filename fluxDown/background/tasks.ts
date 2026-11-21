@@ -6,6 +6,7 @@ import { nmhListTasks, nmhOpenFile, nmhRevealFile } from "@/utils/native-messagi
 import type { TaskBrief } from "@/utils/native-messaging";
 import { loadSettings } from "@/utils/settings";
 import { logWarn } from "@/utils/error-log";
+import { peekAndroidPlatform } from "@/utils/platform";
 
 // ──────────────────────────────────────────────────────────────
 // 任务面板：完成通知轮询（chrome.alarms）
@@ -49,9 +50,9 @@ async function clearTaskPollAlarm(): Promise<void> {
   }
 }
 
-/** download/batchDownload 成功发送后调用：远程通道不参与本地完成通知。 */
+/** download/batchDownload 成功发送后调用：远程通道与 Android（Intent 投递，没有 NMH 任务列表）不参与本地完成通知。 */
 export function maybeArmTaskPollForChannel(channel?: "local" | "remote"): void {
-  if (channel === "remote") return;
+  if (channel === "remote" || peekAndroidPlatform() === true) return;
   ensureTaskPollAlarm().catch(() => {});
 }
 

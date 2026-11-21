@@ -27,6 +27,8 @@ const CAPTURE_OUTCOME_CAPACITY: usize = 1024;
 
 /// 「免打扰下载」：外部接管请求不弹确认，直接按默认设置建任务（设置页 `download.rs`）。
 pub(crate) const SILENT_DOWNLOAD_PREF: &str = "download.silent_download";
+/// 免打扰子开关：未显式指定目录的外部捕获按分类路由，缺省开启。设备本地偏好。
+pub(crate) const SILENT_AUTO_CATEGORY_PREF: &str = "download.silent_auto_category";
 /// 免打扰子开关：静默建的任务跳过 BT 文件 / HLS·DASH 画质 / 插件变体二次选择。设备本地偏好。
 pub(crate) const SILENT_SKIP_SELECTION_PREF: &str = "download.silent_skip_selection";
 /// 「跟随上次保存位置」与其记录（官方 UI 新建下载写入）。
@@ -54,8 +56,9 @@ impl CaptureOutcome {
 /// 捕获来源，决定是否需要用户确认。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureOrigin {
-    /// 本机用户显式交来的链接（系统打开链接、拖入）：直接建任务。
-    Direct,
+    /// 系统默认处理程序交来的链接（`magnet:` / `ed2k://` / 直链）：遵循「免打扰下载」偏好——
+    /// 开启时全选、不二次选择直接建任务；关闭时排入确认队列，由官方 UI 弹新建下载窗口。
+    SystemOpen,
     /// 浏览器扩展 / 用户脚本 / NMH 等外部接管：按「免打扰下载」偏好静默或确认。
     External,
     /// 需要用户过目的探测结果（剪贴板监听）：恒入确认队列。
@@ -76,6 +79,7 @@ pub struct TorrentCreateOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExternalPolicy {
     silent: bool,
+    auto_category: bool,
     skip_selection: bool,
     /// 「跟随上次保存位置」开启且有记录时的目录；捕获方未指定目录时使用。
     remembered_save_dir: Option<String>,
@@ -97,6 +101,10 @@ impl ExternalPolicy {
             .map(str::to_owned);
         Self {
             silent: flag(SILENT_DOWNLOAD_PREF),
+            auto_category: preferences
+                .get(SILENT_AUTO_CATEGORY_PREF)
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
             skip_selection: flag(SILENT_SKIP_SELECTION_PREF),
             remembered_save_dir,
         }
@@ -226,12 +234,12 @@ impl CaptureService {
             .collect()
     }
 
-    /// 按来源分流：`Direct` 与开启免打扰的 `External` 直接提交 daemon，其余排入确认队列（外壳
+    /// 按来源分流：开启免打扰的 `SystemOpen` / `External` 直接提交 daemon，其余排入确认队列（外壳
     /// 控制循环据快照在没有 UI 时拉起官方 UI）。批量请求（换行连接的多 URL）先拆成逐条请求。
     ///
-    /// 保存目录优先级：捕获方指定 > 分类目录 > （仅静默）跟随上次 > daemon 默认（原生移动端 `SilentCapture` 同序）。
-    /// 捕获方未指定目录时分类目录由 daemon 按初始名与下载完成时的最终文件名确定（[`CategoryPlan`]）；
-    /// 确认路径把按捕获名命中的分类目录写进待确认摘要，官方表单据此预填。
+    /// 保存目录优先级：捕获方指定 > （外部静默且自动分类开启）分类目录 > 跟随上次 > daemon 默认。
+    /// 自动分类关闭时不授权分类路由；开启时由 daemon 按初始名与最终文件名确定分类目录，
+    /// 上次目录仅用作未命中分类时的基准目录。确认路径仍按捕获名预填分类目录，不受子开关影响。
     pub async fn submit(
         &self,
         request: DownloadRequest,
@@ -251,9 +259,6 @@ impl CaptureService {
             .into_iter()
             .flat_map(split_batch)
             .collect::<Vec<_>>();
-        if origin == CaptureOrigin::Direct {
-            return self.create_all(requests, None, true, None).await;
-        }
         let (policy, route) = self.events.inspect(|snapshot| {
             let preferences = &snapshot.preferences.values;
             (
@@ -261,10 +266,21 @@ impl CaptureService {
                 crate::category_dir::category_route(preferences),
             )
         });
+        if requests.is_empty() {
+            return Ok(json!({ "taskIds": [] }));
+        }
+        if origin == CaptureOrigin::SystemOpen && policy.silent {
+            return self.create_all(requests, None, true, None).await;
+        }
         if origin == CaptureOrigin::External && policy.silent {
             let save_dir = policy.remembered_save_dir.as_deref();
             return self
-                .create_all(requests, save_dir, policy.skip_selection, route.as_ref())
+                .create_all(
+                    requests,
+                    save_dir,
+                    policy.skip_selection,
+                    route.as_ref().filter(|_| policy.auto_category),
+                )
                 .await;
         }
         self.enqueue(requests, route.as_ref()).await
@@ -417,7 +433,9 @@ impl CaptureService {
                 name: String::new(),
                 source_url: request.url,
                 error: String::new(),
+                plugin_id: String::new(),
                 items: Vec::new(),
+                archive_metadata: None,
             });
         }
         let source_url = request.url.clone();
@@ -459,11 +477,13 @@ impl CaptureService {
             let mut request = merge_group_request(transaction.request.clone(), request, &context)?;
             // 任务组落在默认目录：预填的是按捕获名（多为分享页地址）算出的分类目录，不代表组内
             // 文件；用户未改选目录时换回表单默认目录，组内文件也不再逐个按后缀分类。
+            request.category_route = None;
             if let Some(plan) = &transaction.category
                 && !offered.is_empty()
                 && plan.route.is_category_dir(request.save_dir.trim())
             {
                 request.save_dir = offered;
+                request.category_route = Some(plan.route.clone());
             }
             let claim = transaction
                 .group_creation
@@ -526,6 +546,7 @@ impl CaptureService {
         &self,
         transaction_id: &str,
         accepted: bool,
+        disable_category_route: bool,
         confirmed: Option<CreateTaskRequest>,
     ) -> Result<Value, CaptureError> {
         let CaptureTransaction {
@@ -554,7 +575,7 @@ impl CaptureService {
             Some(confirmed) => merge_confirmed_request(request, confirmed),
             None => captured_create_request(request),
         };
-        if let Some(plan) = category {
+        if !disable_category_route && let Some(plan) = category {
             let (offered, remembered) = self.events.inspect(|snapshot| {
                 let policy = ExternalPolicy::from_preferences(&snapshot.preferences.values);
                 (
@@ -709,12 +730,20 @@ fn captured_create_request(request: DownloadRequest) -> CaptureCreate {
     }
 }
 
+/// 表单来源页非空且与捕获的来源页（去首尾空白）不同 = 用户改过，捕获的 `Referer` 头须让位。
+fn referrer_edited(form: &str, captured: &str) -> bool {
+    let form = form.trim();
+    !form.is_empty() && form != captured.trim()
+}
+
 /// 官方 UI 表单结果合并进捕获原请求（规则见 `CaptureResolveParams::request`）。
 ///
 /// 表单看不到的请求上下文（method / body / 音频轨）与事务身份（url）恒取捕获值；
 /// 表单留空的字段回退捕获值；请求头以捕获为底、表单同名覆盖，表单填了 UA 时去掉
-/// 捕获的 `User-Agent` 头。表单的 HTTP 认证原样保留：引擎对非空 `httpUser` 注入的
-/// `Authorization` 会覆盖捕获头，留空则沿用浏览器头 / 已保存站点凭据。
+/// 捕获的 `User-Agent` 头，表单来源页非空且与捕获的不同时去掉捕获的 `Referer` 头
+/// （引擎优先取请求头里的 `Referer`，不去掉则用户的修改不生效；留空或未改则保留浏览器
+/// 真实发出的 `Referer`，它可能与记录的来源页不同）。表单的 HTTP 认证原样保留：引擎对非空
+/// `httpUser` 注入的 `Authorization` 会覆盖捕获头，留空则沿用浏览器头 / 已保存站点凭据。
 fn merge_confirmed_request(
     captured: DownloadRequest,
     mut confirmed: CreateTaskRequest,
@@ -737,10 +766,14 @@ fn merge_confirmed_request(
     };
     fill_if_blank(&mut confirmed.save_dir, base.save_dir);
     fill_if_blank(&mut confirmed.cookies, base.cookies);
+    let referrer_edited = referrer_edited(&confirmed.referrer, &base.referrer);
     fill_if_blank(&mut confirmed.referrer, base.referrer);
     let mut headers = base.headers.unwrap_or_default();
     if !confirmed.user_agent.trim().is_empty() {
         headers.retain(|name, _| !name.eq_ignore_ascii_case("user-agent"));
+    }
+    if referrer_edited {
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("referer"));
     }
     for (name, value) in confirmed.headers.take().unwrap_or_default() {
         headers.retain(|existing, _| !existing.eq_ignore_ascii_case(&name));
@@ -788,10 +821,14 @@ fn merge_group_request(
     }
     request.source_url = base.url;
     fill_if_blank(&mut request.cookies, base.cookies);
+    let referrer_edited = referrer_edited(&request.referrer, &base.referrer);
     fill_if_blank(&mut request.referrer, base.referrer);
     let mut headers = base.headers.unwrap_or_default();
     if !request.user_agent.trim().is_empty() {
         headers.retain(|name, _| !name.eq_ignore_ascii_case("user-agent"));
+    }
+    if referrer_edited {
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("referer"));
     }
     for (name, value) in request.extra_headers {
         headers.retain(|existing, _| !existing.eq_ignore_ascii_case(&name));
@@ -950,6 +987,46 @@ impl DaemonBlobClient {
             .map(str::to_owned)
             .ok_or(BlobError::Decode)
     }
+
+    /// Read a sanitized PNG through the currently authenticated daemon HTTP session.
+    pub async fn plugin_image(&self, session: &str, id: &str) -> Result<Vec<u8>, BlobError> {
+        let Some(access) = self.session.access() else {
+            return Err(BlobError::Status(503));
+        };
+        let mut url = access.base_url;
+        url.path_segments_mut()
+            .map_err(|()| BlobError::Url("daemon base URL cannot hold path segments".to_owned()))?
+            .clear()
+            .extend(["plugin-images", session, id]);
+        let mut response = self
+            .http
+            .get(url)
+            .bearer_auth(access.credential)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(BlobError::Status(response.status().as_u16()));
+        }
+        let limit = 4 * 1024 * 1024;
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+        {
+            return Err(BlobError::Status(502));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if chunk.len() > limit - bytes.len() {
+                return Err(BlobError::Status(502));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Err(BlobError::Status(502));
+        }
+        Ok(bytes)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -979,8 +1056,8 @@ mod tests {
 
     use super::{
         CaptureError, CaptureOrigin, CaptureService, CategoryPlan, DownloadRequest, ExternalPolicy,
-        captured_create_request, into_preview_request, merge_confirmed_request,
-        merge_group_request, pending_capture_dto, split_batch,
+        SILENT_DOWNLOAD_PREF, captured_create_request, into_preview_request,
+        merge_confirmed_request, merge_group_request, pending_capture_dto, split_batch,
     };
 
     fn preferences(
@@ -1041,6 +1118,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn system_open_follows_silent_download_preference() {
+        // 免打扰关闭：系统打开的链接入确认队列（弹新建下载窗口），不建任务。
+        let capture = service(json!({ "download.silent_download": false }));
+        let queued = capture
+            .submit(captured(), CaptureOrigin::SystemOpen)
+            .await
+            .expect("queued for confirmation");
+        assert_eq!(queued["transactionIds"].as_array().map(Vec::len), Some(1));
+        assert_eq!(capture.list().await.len(), 1);
+
+        // 偏好缺省视同关闭。
+        let capture = service(json!({}));
+        capture
+            .submit(captured(), CaptureOrigin::SystemOpen)
+            .await
+            .expect("queued for confirmation");
+        assert_eq!(capture.list().await.len(), 1);
+
+        // 免打扰开启：直接提交 daemon（断开的 daemon 下失败即证明走了建任务路径），不入队。
+        let capture = service(json!({ "download.silent_download": true }));
+        let result = capture.submit(captured(), CaptureOrigin::SystemOpen).await;
+        assert!(matches!(result, Err(super::CaptureError::Daemon(_))));
+        assert!(capture.list().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn oversized_batch_is_rejected_whole_without_partial_enqueue() {
         let capture = service(json!({}));
         let too_many = (0..=super::CAPTURE_CAPACITY).map(|_| captured()).collect();
@@ -1054,6 +1157,79 @@ mod tests {
             .await
             .expect("whole batch fits");
         assert_eq!(capture.list().await.len(), super::CAPTURE_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn silent_category_toggle_keeps_last_directory_as_fallback_not_category() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (capture, mut calls, _events, stop, server) = daemon_service().await;
+            // 上次目录恰好是另一分类的目录：新下载仍按自己的规则分类，
+            // 关闭自动分类后才直接沿用该目录；显式请求目录始终优先。
+            for (enabled, explicit, expected) in [
+                (None, "", "/binary"),
+                (Some(false), "", "/pictures"),
+                (Some(true), "", "/binary"),
+                (Some(true), "/chosen", "/chosen"),
+                (Some(false), "/chosen", "/chosen"),
+            ] {
+                let mut prefs = preferences(json!({
+                    "download.silent_download": true,
+                    "download.remember_last_save_dir": true,
+                    "download.last_save_dir": "/pictures",
+                    "custom_categories": [
+                        { "id": "bin", "name": "Binary", "extensions": ["bin"], "saveDir": "/binary" },
+                        { "id": "img", "name": "Pictures", "extensions": ["jpg"], "saveDir": "/pictures" }
+                    ]
+                }));
+                if let Some(enabled) = enabled {
+                    prefs.insert(super::SILENT_AUTO_CATEGORY_PREF.to_owned(), json!(enabled));
+                }
+                capture.events.publish(AgentEvent::PreferencesChanged(
+                    fluxdown_protocol::AgentPreferencesDto {
+                        revision: 1,
+                        values: prefs,
+                    },
+                ));
+                let mut request = captured();
+                request.save_dir = explicit.to_owned();
+                let submitted = {
+                    let capture = Arc::clone(&capture);
+                    tokio::spawn(
+                        async move { capture.submit(request, CaptureOrigin::External).await },
+                    )
+                };
+                let (request, reply) = calls.recv().await.expect("silent create");
+                let params: fluxdown_protocol::DaemonCreateTaskParams =
+                    serde_json::from_value(request.params.expect("create params"))
+                        .expect("decode create");
+                let effective_dir = params
+                    .category_route
+                    .as_ref()
+                    .and_then(|route| {
+                        crate::category_dir::route_save_dir(
+                            route,
+                            &params.request.file_name,
+                            &params.request.url,
+                        )
+                    })
+                    .unwrap_or(&params.request.save_dir);
+                assert_eq!(
+                    effective_dir, expected,
+                    "enabled={enabled:?}, explicit={explicit}"
+                );
+                reply
+                    .send(Ok(json!({"taskId": "silent"})))
+                    .expect("created");
+                submitted
+                    .await
+                    .expect("submit task")
+                    .expect("silent capture");
+            }
+            stop.send(()).expect("stop daemon");
+            server.await.expect("daemon server");
+        })
+        .await
+        .expect("silent category policy");
     }
 
     #[test]
@@ -1088,6 +1264,77 @@ mod tests {
         let mut spec = captured_create_request(captured());
         plan.apply(&mut spec, None);
         assert_eq!(spec.request.save_dir, "");
+    }
+
+    #[tokio::test]
+    async fn manual_category_directory_disables_capture_route() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (capture, mut calls, _events, stop, server) = daemon_service().await;
+            capture.events.publish(AgentEvent::PreferencesChanged(
+                fluxdown_protocol::AgentPreferencesDto {
+                    revision: 1,
+                    values: [(
+                        fluxdown_protocol::CUSTOM_CATEGORIES_PREF_KEY.to_owned(),
+                        json!([{
+                            "id": "bin",
+                            "name": "Binary",
+                            "extensions": ["bin"],
+                            "position": 1,
+                            "saveDir": "/category"
+                        }]),
+                    )]
+                    .into(),
+                },
+            ));
+            let mut original = captured();
+            original.save_dir.clear();
+            let queued = capture
+                .submit(original, CaptureOrigin::External)
+                .await
+                .expect("queue capture");
+            let transaction_id = queued["transactionIds"][0]
+                .as_str()
+                .expect("transaction id")
+                .to_owned();
+            let confirming = {
+                let capture = capture.clone();
+                tokio::spawn(async move {
+                    capture
+                        .resolve(
+                            &transaction_id,
+                            true,
+                            true,
+                            Some(form(json!({
+                                "url": "https://example.com/a.bin",
+                                "saveDir": "/category"
+                            }))),
+                        )
+                        .await
+                })
+            };
+            let (request, reply) = calls.recv().await.expect("task create RPC");
+            assert_eq!(
+                request.method,
+                fluxdown_protocol::method::DAEMON_TASK_CREATE
+            );
+            let params: fluxdown_protocol::DaemonCreateTaskParams =
+                serde_json::from_value(request.params.expect("task create params"))
+                    .expect("decode task create params");
+            assert_eq!(params.request.save_dir, "/category");
+            assert!(params.category_route.is_none());
+            reply
+                .send(Ok(json!({"taskId": "manual-category"})))
+                .expect("daemon reply");
+            confirming
+                .await
+                .expect("confirmation task")
+                .expect("confirm capture");
+            stop.send(()).expect("stop test daemon");
+            drop(capture);
+            server.await.expect("daemon server");
+        })
+        .await
+        .expect("manual capture category lifecycle");
     }
 
     #[test]
@@ -1291,11 +1538,11 @@ mod tests {
             ));
             assert_eq!(capture.list().await.len(), 1);
             capture
-                .resolve(&id, false, None)
+                .resolve(&id, false, false, None)
                 .await
                 .expect("legacy rejection");
             assert!(matches!(
-                capture.resolve(&id, false, None).await,
+                capture.resolve(&id, false, false, None).await,
                 Err(CaptureError::NotFound)
             ));
         }
@@ -1347,7 +1594,7 @@ mod tests {
             assert_eq!(capture.list().await.len(), 1);
         }
         capture
-            .resolve(&id, false, None)
+            .resolve(&id, false, false, None)
             .await
             .expect("transaction remains rejectable");
     }
@@ -1535,12 +1782,20 @@ mod tests {
     async fn capture_notifications_preserve_single_intents_and_batch_boundaries() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let (capture, mut calls, daemon_events, stop, server) = daemon_service().await;
+            capture.events.publish(AgentEvent::PreferencesChanged(
+                fluxdown_protocol::AgentPreferencesDto {
+                    revision: 1,
+                    values: [(SILENT_DOWNLOAD_PREF.to_owned(), json!(true))].into(),
+                },
+            ));
             let (mut events, _) = capture.events.subscribe_and_snapshot();
             let single = {
                 let capture = Arc::clone(&capture);
-                tokio::spawn(
-                    async move { capture.submit(get_capture(), CaptureOrigin::Direct).await },
-                )
+                tokio::spawn(async move {
+                    capture
+                        .submit(get_capture(), CaptureOrigin::SystemOpen)
+                        .await
+                })
             };
             let (request, reply) = calls.recv().await.expect("single create");
             assert_eq!(
@@ -1555,8 +1810,8 @@ mod tests {
                 .expect("single caller")
                 .expect("single capture");
             assert!(matches!(
-                events.try_recv().expect("single notification").event,
-                ServiceEvent::Agent(AgentEvent::CaptureTasksStarted(ids)) if ids == ["single"]
+                &events.try_recv().expect("single notification").event,
+                ServiceEvent::Agent(AgentEvent::CaptureTasksStarted(ids)) if *ids == ["single"]
             ));
 
             for fail_second in [false, true] {
@@ -1564,7 +1819,10 @@ mod tests {
                     let capture = Arc::clone(&capture);
                     tokio::spawn(async move {
                         capture
-                            .submit_many(vec![get_capture(), get_capture()], CaptureOrigin::Direct)
+                            .submit_many(
+                                vec![get_capture(), get_capture()],
+                                CaptureOrigin::SystemOpen,
+                            )
                             .await
                     })
                 };
@@ -1605,9 +1863,9 @@ mod tests {
                         .expect("second created");
                     batch.await.expect("batch caller").expect("batch capture");
                     assert!(matches!(
-                        events.try_recv().expect("batch notification").event,
+                        &events.try_recv().expect("batch notification").event,
                         ServiceEvent::Agent(AgentEvent::CaptureTasksStarted(ids))
-                            if ids == ["first", "second"]
+                            if *ids == ["first", "second"]
                     ));
                 }
             }
@@ -1630,13 +1888,13 @@ mod tests {
 
             capture.announce_page_started(&ids(&["new"]), &[]);
             assert!(matches!(
-                events.try_recv().expect("created notification").event,
-                ServiceEvent::Agent(AgentEvent::CaptureTasksStarted(ids)) if ids == ["new"]
+                &events.try_recv().expect("created notification").event,
+                ServiceEvent::Agent(AgentEvent::CaptureTasksStarted(ids)) if *ids == ["new"]
             ));
             capture.announce_page_started(&[], &ids(&["old"]));
             assert!(matches!(
-                events.try_recv().expect("resumed notification").event,
-                ServiceEvent::Agent(AgentEvent::CaptureTasksResumed(ids)) if ids == ["old"]
+                &events.try_recv().expect("resumed notification").event,
+                ServiceEvent::Agent(AgentEvent::CaptureTasksResumed(ids)) if *ids == ["old"]
             ));
             capture.announce_page_started(&ids(&["a"]), &ids(&["b"]));
             capture.announce_page_started(&ids(&["a", "b"]), &[]);
@@ -1689,7 +1947,7 @@ mod tests {
                 assert!(!wire.contains(secret), "{secret}");
             }
             assert_eq!(capture.list().await[0].transaction_id, id);
-            capture.resolve(&id, false, None).await.expect("still rejectable");
+            capture.resolve(&id, false, false, None).await.expect("still rejectable");
             assert!(calls.try_recv().is_err(), "preview did not create any task");
             stop.send(()).expect("stop test daemon");
             drop(capture);
@@ -1719,7 +1977,7 @@ mod tests {
             assert_eq!(request.method, fluxdown_protocol::method::DAEMON_GROUP_CREATE);
             for accepted in [false, true] {
                 assert!(matches!(
-                    capture.resolve(&id, accepted, Some(form(json!({ "url": "" })))).await,
+                    capture.resolve(&id, accepted, false, Some(form(json!({ "url": "" })))).await,
                     Err(CaptureError::Busy)
                 ));
             }
@@ -1737,7 +1995,7 @@ mod tests {
             reply.send(Ok(json!({ "groupId": "created-group" }))).expect("create group");
             let event = events.recv().await.expect("consumption published");
             assert!(matches!(
-                event.event,
+                &event.event,
                 ServiceEvent::Agent(AgentEvent::PendingCapturesChanged(pending)) if pending.is_empty()
             ));
             assert!(capture.list().await.is_empty());
@@ -1746,7 +2004,7 @@ mod tests {
                 Err(CaptureError::NotFound)
             ));
             assert!(matches!(
-                capture.resolve(&id, true, None).await,
+                capture.resolve(&id, true, false, None).await,
                 Err(CaptureError::NotFound)
             ));
             assert!(calls.try_recv().is_err(), "no duplicate group or ordinary task");
@@ -1943,6 +2201,100 @@ mod tests {
             headers.get("Authorization").map(String::as_str),
             Some("Basic YTpi")
         );
+    }
+
+    fn captured_with_referer_header() -> DownloadRequest {
+        let mut request = get_capture();
+        request
+            .headers
+            .get_or_insert_default()
+            .insert("referer".to_owned(), "https://example.com/root/".to_owned());
+        request
+    }
+
+    fn referer_header(headers: &Option<HashMap<String, String>>) -> Option<&str> {
+        headers
+            .as_ref()?
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn edited_referrer_replaces_captured_referer_header() {
+        let merged = merge_confirmed_request(
+            captured_with_referer_header(),
+            form(json!({ "url": "", "referrer": "https://edited.example/other" })),
+        )
+        .request;
+        assert_eq!(merged.referrer, "https://edited.example/other");
+        assert_eq!(referer_header(&merged.headers), None);
+        // 表单自带 Referer 头仍按同名覆盖规则保留。
+        let merged = merge_confirmed_request(
+            captured_with_referer_header(),
+            form(json!({
+                "url": "",
+                "referrer": "https://edited.example/other",
+                "headers": { "Referer": "https://explicit.example/" },
+            })),
+        )
+        .request;
+        assert_eq!(
+            referer_header(&merged.headers),
+            Some("https://explicit.example/")
+        );
+    }
+
+    #[test]
+    fn unchanged_or_blank_referrer_keeps_captured_referer_header() {
+        for referrer in [
+            "",
+            "  ",
+            "https://example.com/page",
+            " https://example.com/page ",
+        ] {
+            let merged = merge_confirmed_request(
+                captured_with_referer_header(),
+                form(json!({ "url": "", "referrer": referrer })),
+            )
+            .request;
+            assert_eq!(
+                referer_header(&merged.headers),
+                Some("https://example.com/root/"),
+                "{referrer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_edited_referrer_replaces_captured_referer_header() {
+        let context = form(json!({ "url": "" }));
+        let mut edited = group();
+        edited.referrer = "https://edited.example/other".to_owned();
+        let merged = merge_group_request(captured_with_referer_header(), edited, &context)
+            .expect("merge edited group");
+        assert_eq!(merged.referrer, "https://edited.example/other");
+        assert!(
+            !merged
+                .extra_headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("referer"))
+        );
+        for referrer in ["", "https://example.com/page"] {
+            let mut kept = group();
+            kept.referrer = referrer.to_owned();
+            let merged = merge_group_request(captured_with_referer_header(), kept, &context)
+                .expect("merge kept group");
+            assert_eq!(
+                merged
+                    .extra_headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
+                    .map(|(_, value)| value.as_str()),
+                Some("https://example.com/root/"),
+                "{referrer:?}"
+            );
+        }
     }
 
     /// 读到请求头结束与整个请求体为止，返回头部文本（小写化便于断言）。

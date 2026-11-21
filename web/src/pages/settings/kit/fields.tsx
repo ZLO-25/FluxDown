@@ -54,7 +54,7 @@ export function NumberField({
   const clamp = (n: number) => Math.min(max ?? Number.POSITIVE_INFINITY, Math.max(min ?? Number.NEGATIVE_INFINITY, n))
   const shown = draft ?? formatNumber(value)
   return (
-    <div className={cn('inline-flex items-center gap-2', WIDTH_NUMBER, unit && 'mobile:w-full', className)}>
+    <div className={cn('inline-flex items-center gap-2', unit ? 'mobile:w-full' : WIDTH_NUMBER, className)}>
       <Input
         type="number"
         inputMode={float ? 'decimal' : 'numeric'}
@@ -64,17 +64,25 @@ export function NumberField({
         max={max}
         step={step}
         disabled={disabled}
-        className="min-w-0 flex-1 tabular"
+        className={cn('min-w-0 tabular', unit ? 'flex-1 desktop:w-[104px] desktop:flex-none' : 'flex-1')}
         onFocus={() => setDraft(formatNumber(value))}
         onChange={(event) => {
           const text = event.target.value
           setDraft(text)
+          // 输入中只提交范围内的值；删空、输到一半、越界的草稿留待失焦再钳制。
           const parsed = Number(text)
+          if (text.trim() === '' || !Number.isFinite(parsed)) return
+          const next = float ? parsed : Math.round(parsed)
+          if (next === clamp(next) && next !== value) onCommit(next)
+        }}
+        onBlur={() => {
+          const text = draft ?? ''
+          const parsed = Number(text)
+          setDraft(null)
           if (text.trim() === '' || !Number.isFinite(parsed)) return
           const next = float ? clamp(parsed) : clamp(Math.round(parsed))
           if (next !== value) onCommit(next)
         }}
-        onBlur={() => setDraft(null)}
       />
       {unit ? <span className="shrink-0 text-xs text-muted-foreground">{unit}</span> : null}
     </div>
@@ -224,11 +232,28 @@ export function DaemonTextRow({
   )
 }
 
-/** 枚举下拉：选项取自协议目录，文案键 `{labelPrefix}{CamelValue}`。 */
-export function DaemonEnumRow({ configKey, titleKey, descKey, labelPrefix, disabled }: RowText & { configKey: string; labelPrefix: string; disabled?: boolean }) {
+/** 枚举下拉：选项取自协议目录。文案优先 `labels`，否则 `{labelPrefix}{CamelValue}`。 */
+export function DaemonEnumRow({
+  configKey,
+  titleKey,
+  descKey,
+  labelPrefix,
+  labels,
+  disabled,
+}: RowText & {
+  configKey: string
+  /** i18n 键前缀；与 `labels` 二选一。 */
+  labelPrefix?: string
+  /** 显式选项文案（技术名等不走 i18n）。缺省项回退 `labelPrefix` 或原值。 */
+  labels?: Readonly<Record<string, string>>
+  disabled?: boolean
+}) {
   const { t, title, description } = useRowText({ titleKey, descKey })
   const value = useDaemonValue(configKey)
-  const options = (daemonConfigField(configKey)?.options ?? []).map((option) => ({ value: option, label: t(`${labelPrefix}${camel(option)}`) }))
+  const options = (daemonConfigField(configKey)?.options ?? []).map((option) => ({
+    value: option,
+    label: labels?.[option] ?? (labelPrefix !== undefined ? t(`${labelPrefix}${camel(option)}`) : option),
+  }))
   return (
     <SettingsRow title={title} description={description} disabled={disabled}>
       <DropdownField value={value} options={options} aria-label={title} onValueChange={(next) => setDaemon(configKey, next)} />
@@ -243,7 +268,7 @@ export function PrefSwitchRow({ prefKey, fallback, titleKey, descKey, disabled, 
   const checked = usePrefBoolean(prefKey, fallback)
   return (
     <SettingsRow title={title} description={description} compact disabled={disabled}>
-      <Switch checked={checked} onCheckedChange={(next) => setPref(prefKey, next, { immediate: immediate === true })} aria-label={title} />
+      <Switch checked={checked} disabled={disabled} onCheckedChange={(next) => setPref(prefKey, next, { immediate: immediate === true })} aria-label={title} />
     </SettingsRow>
   )
 }

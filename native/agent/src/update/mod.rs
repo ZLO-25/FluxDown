@@ -17,6 +17,7 @@
 //! 下载 / 安装中不再重新检查；就绪时照常检查，但只有查到比就绪包更新的版本才取代它，
 //! 失败或同版本保留就绪状态——常驻不重启的机器也能跟上后续发布。
 
+mod automatic;
 mod download;
 pub(crate) mod install;
 mod release;
@@ -274,14 +275,14 @@ impl UpdateService {
         let user_agent = format!("{product}/{current_version}");
         let api_agent = user_agent.clone();
         let api_http = EgressClient::new(move || {
-            reqwest::Client::builder()
+            crate::tls::client_builder(crate::tls::HttpVersion::Any)
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(REQUEST_TIMEOUT)
                 .user_agent(api_agent.clone())
         });
         // 更新包体积大：不设整体超时，只限制连接与读停顿。
         let download_http = EgressClient::new(move || {
-            reqwest::Client::builder()
+            crate::tls::client_builder(crate::tls::HttpVersion::Any)
                 .connect_timeout(Duration::from_secs(10))
                 .read_timeout(Duration::from_secs(30))
                 .user_agent(user_agent.clone())
@@ -310,13 +311,17 @@ impl UpdateService {
         }
     }
 
-    /// 启动后台任务：清理上次替换残留、对账 `pending.json`，`auto_check` 时进入周期检查。
-    /// 只用于 agent 宿主；委托宿主由 App 自行调度并调用 [`Self::reconcile`]。
+    /// 启动后台任务：清理上次替换残留、修复 macOS 已安装 bundle 的隔离标记、对账 `pending.json`，
+    /// `auto_check` 时进入周期检查。只用于 agent 宿主；委托宿主由 App 自行调度并调用 [`Self::reconcile`]。
     pub fn start(self: &Arc<Self>, cancel: CancellationToken, auto_check: bool) {
         let service = Arc::clone(self);
         tokio::spawn(async move {
             if let Err(error) = tokio::task::spawn_blocking(install::cleanup_leftovers).await {
                 tracing::debug!(error = %error, "update leftover cleanup task failed");
+            }
+            #[cfg(target_os = "macos")]
+            if service.target.kind == fluxdown_protocol::UpdateInstallKind::MacosApp {
+                install::heal_installed_quarantine().await;
             }
             service.reconcile().await;
             if auto_check {
@@ -848,10 +853,14 @@ impl UpdateService {
     }
 
     fn spawn_install(self: &Arc<Self>, candidate: Candidate) {
-        tokio::spawn(Arc::clone(self).install_task(candidate));
+        tokio::spawn(Arc::clone(self).install_task(candidate, None));
     }
 
-    async fn install_task(self: Arc<Self>, candidate: Candidate) {
+    async fn install_task(
+        self: Arc<Self>,
+        candidate: Candidate,
+        automatic: Option<automatic::AutomaticInstall>,
+    ) {
         let dir = self.version_dir(&candidate.version);
         let package = dir.join(&candidate.asset_name);
         match &self.host {
@@ -863,8 +872,24 @@ impl UpdateService {
                     self.fail(UpdateFailure::Storage, format!("{error:#}"));
                     return;
                 }
+                if let Some(automatic) = &automatic
+                    && (automatic.cancel.is_cancelled()
+                        || !self.silent_update_allowed(&automatic.shell))
+                {
+                    self.remove_pending().await;
+                    self.mutate(|core| core.status.phase = UpdatePhase::Ready);
+                    return;
+                }
                 match install::apply(&self.target, &package, &work_dir).await {
                     Ok(plan) => {
+                        let plan = if let Some(automatic) = automatic {
+                            if !automatic.wait_for_idle(&self).await {
+                                return;
+                            }
+                            plan.in_background(automatic.restart)
+                        } else {
+                            plan
+                        };
                         restart::schedule(plan);
                         request_restart();
                     }

@@ -1,5 +1,5 @@
 /**
- * 发送层：把下载交给 FluxDown（NMH / 远程 / fluxdown:// 协议），以及失败回退。
+ * 发送层：把下载交给 FluxDown（NMH / 远程 / Android Intent，经 download-dispatch 路由；或 fluxdown:// 协议），以及失败回退。
  */
 import { browser } from "wxt/browser";
 import type { Browser } from "wxt/browser";
@@ -19,6 +19,10 @@ import { incrementStat } from "./stats";
 import { maybeArmTaskPollForChannel } from "./tasks";
 import { getEngine } from "./rules-store";
 import { logError, logWarn } from "@/utils/error-log";
+import { hasDownloadsApi, isAndroidPlatform } from "@/utils/platform";
+import { ANDROID_UNSUPPORTED_MESSAGES } from "./android-handoff";
+import { openInHandoffTab } from "./handoff-tab";
+import { createSendDeduper, interceptDedupeKey } from "./send-dedupe";
 
 /**
  * 补上 request 阶段 headers 规则为该 URL 声明的请求头，只补缺失的名字（浏览器真实请求头优先）。
@@ -49,6 +53,8 @@ export interface SendInput {
   origin?: "intercept";
   /** 页面 host：用于查站点配置（保存目录）；缺省取 referrer / URL 的 host。 */
   pageHost?: string;
+  /** 触发本次发送的浏览器 download id（仅用于去重命中时的诊断日志）。 */
+  downloadId?: number;
 }
 
 export type SendOutcome = SendResult & { data?: unknown };
@@ -81,14 +87,9 @@ export async function resolveSaveDir(input: SendInput): Promise<string | undefin
   return undefined;
 }
 
-/** 协议唤起复用的标签页 id（避免每次下载都泄漏一个空白标签页）。 */
-let protocolTabId: number | null = null;
-let protocolTabCloseTimer: ReturnType<typeof setTimeout> | undefined;
-
 /**
  * 打开 fluxdown://download?url=...&filename=... 协议 URL，触发系统唤起
- * 已注册该协议的应用。复用单个标签页（连续下载不开一排标签），并在最后
- * 一次唤起 4s 后自动回收标签页。
+ * 已注册该协议的应用（交接标签页复用与回收见 handoff-tab.ts）。
  */
 export async function openProtocolUrl(
   url: string,
@@ -98,39 +99,7 @@ export async function openProtocolUrl(
   if (filename) params.set("filename", filename);
   const protocolUrl = `fluxdown://download?${params.toString()}`;
   console.log("[FluxDown] protocol mode — opening:", protocolUrl);
-  try {
-    if (protocolTabId !== null) {
-      try {
-        await browser.tabs.update(protocolTabId, {
-          url: protocolUrl,
-          active: true,
-        });
-      } catch {
-        // 标签页已被用户关闭 — 重新创建
-        protocolTabId = null;
-      }
-    }
-    if (protocolTabId === null) {
-      const tab = await browser.tabs.create({
-        url: protocolUrl,
-        active: true,
-      });
-      protocolTabId = tab.id ?? null;
-    }
-    // 每次唤起重置回收定时器：4s 无新请求则关闭遗留的空白/错误标签页
-    if (protocolTabCloseTimer) clearTimeout(protocolTabCloseTimer);
-    protocolTabCloseTimer = setTimeout(() => {
-      const id = protocolTabId;
-      protocolTabId = null;
-      if (id !== null) {
-        browser.tabs.remove(id).catch(() => {});
-      }
-    }, 4000);
-    return true;
-  } catch (e) {
-    logWarn("[FluxDown] failed to open fluxdown:// URL:", e);
-    return false;
-  }
+  return openInHandoffTab(protocolUrl);
 }
 
 // 投递失败的表单 POST 下载：原下载已被取消，回退时需要原 method/body 重放。
@@ -145,17 +114,40 @@ const rejectedSends = new Map<
 const REJECT_NOTIFY_INTERVAL_MS = 30_000;
 let _lastRejectNotifyAt = 0;
 
+// ===== 自动拦截的短窗去重（#1048） =====
+// 一次点击在部分 Chromium 分支会产生两个 download item，按 id 互斥拦不住；
+// 同 method + URL + 请求体在发送中 / 成功后 3s 内再次自动发送，复用第一次的结果（调用方照常取消多余的下载项）。
+const INTERCEPT_DEDUPE_WINDOW_MS = 3000;
+const interceptDeduper = createSendDeduper<SendOutcome>(INTERCEPT_DEDUPE_WINDOW_MS);
+
 // ===== 核心：发送下载请求到 FluxDown App =====
-export async function sendToFluxDown(input: SendInput): Promise<SendOutcome> {
+export function sendToFluxDown(input: SendInput): Promise<SendOutcome> {
+  // 只对自动拦截去重：用户从菜单 / 弹窗 / 面板显式发起的发送，重复点击就是想要两份。
+  if (input.origin !== "intercept" || input.channel) return deliverToFluxDown(input);
+  // 键必须在同步段（任何 await 之前）算出：deliverToFluxDown 之后会消费并清掉该 URL 的请求记录。
+  // 与 deliverToFluxDown 一致只认下载 URL 自身的记录，键才对应真正送出的 method / body。
+  const key = interceptDedupeKey(input.url, lookupRequestRecord(requestRecordCache, input.url));
+  const { promise, reused } = interceptDeduper.run(key, () => deliverToFluxDown(input));
+  if (reused) {
+    console.info(
+      "[FluxDown] duplicate intercept send suppressed:",
+      { url: input.url, downloadId: input.downloadId },
+      new Error("intercept dedupe").stack,
+    );
+  }
+  return promise;
+}
+
+async function deliverToFluxDown(input: SendInput): Promise<SendOutcome> {
   const { url, referrer, filename, fileSize, mimeType, originalUrl, storedCookies, storedHeaders, audioUrl, channel } = input;
   // === fluxdown:// 自定义协议模式 ===
   // 开启后跳过 NMH/远端投递，经协议 URL 唤起 FluxDown 客户端。
-  // 限制：不经过 NMH，Cookie/Headers/method/body 无法携带，适用于公开文件。
+  // 限制：不经过 NMH，Cookie/Headers/method/body 无法携带，适用于公开文件。仅桌面：Android 由 Intent 交接（可携带 Cookie / 请求头）取代。
   {
     const protocolSettings = await getCachedSettings();
     // fluxdown:// 只承载单 URL；音视频分轨对必须继续走 NMH/远程，
     // 否则音频轨会被静默丢弃，最终得到无声视频。
-    if (protocolSettings.enableFluxdownProtocol && !audioUrl && !channel) {
+    if (protocolSettings.enableFluxdownProtocol && !audioUrl && !channel && !(await isAndroidPlatform())) {
       const ok = await openProtocolUrl(url, filename);
       await incrementStat(ok ? "sent" : "failed");
       if (ok && (await shouldNotifyChannel("local"))) {
@@ -278,6 +270,8 @@ export function describeSendError(message?: string): string {
     return t("remote.testNotConfigured");
   if (message?.startsWith("remote_unreachable"))
     return t("remote.testUnreachable");
+  if (message && ANDROID_UNSUPPORTED_MESSAGES.has(message)) return t("notify.androidUnsupported");
+  if (message === "android_handoff_failed") return t("notify.androidHandoffFailed");
   return t("notify.connectionFailed", { message: message || "unknown" });
 }
 
@@ -352,21 +346,32 @@ export async function fallbackToBrowserDownload(
   const post = failedPostRecords.get(url);
   failedPostRecords.delete(url);
   try {
-    const opts: Browser.downloads.DownloadOptions = { url };
-    if (filename) opts.filename = filename;
-    if (post) {
-      const replay = buildPostReplay(url, post.body);
-      if (!replay) {
-        // 多部分/二进制请求体无法无损重建，GET 重发只会落盘一个损坏文件。
+    if (!hasDownloadsApi()) {
+      // Firefox for Android 没有 downloads API：在新标签页导航到该链接，交给浏览器自己下载
+      // （上面的 bypass 令牌让 blocking 拦截放行）。POST 事务无法以导航重放。
+      if (post) {
         notify(t("notify.sendFailed"), url);
         return;
       }
-      opts.method = "POST";
-      opts.body = replay.body;
-      opts.headers = replay.headers;
+      await browser.tabs.create({ url, active: true });
+      console.log("[FluxDown] Fallback: opened link for browser download:", url);
+    } else {
+      const opts: Browser.downloads.DownloadOptions = { url };
+      if (filename) opts.filename = filename;
+      if (post) {
+        const replay = buildPostReplay(url, post.body);
+        if (!replay) {
+          // 多部分/二进制请求体无法无损重建，GET 重发只会落盘一个损坏文件。
+          notify(t("notify.sendFailed"), url);
+          return;
+        }
+        opts.method = "POST";
+        opts.body = replay.body;
+        opts.headers = replay.headers;
+      }
+      await browser.downloads.download(opts);
+      console.log("[FluxDown] Fallback: re-initiated browser download:", url);
     }
-    await browser.downloads.download(opts);
-    console.log("[FluxDown] Fallback: re-initiated browser download:", url);
   } catch (e) {
     logError(
       "[FluxDown] Fallback: failed to re-initiate browser download:",

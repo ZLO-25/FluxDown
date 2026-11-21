@@ -34,7 +34,28 @@ public enum HostMethod {
     public static let daemonTaskResumeAll = "daemon.task.resumeAll"
     public static let daemonTaskRescan = "daemon.task.rescan"
     public static let daemonTaskSetSeedLimits = "daemon.task.setSeedLimits"
+    /// 修改 BT 任务选片方式（`SetTaskPiecePickingParams`，缺省字段不变）；不存在或非 BT 返回 `notFound`。
+    public static let daemonTaskSetPiecePicking = "daemon.task.setPiecePicking"
+    /// BT 任务文件表（`{taskId}` → `BtFiles`，不含 padding 文件）；供详情「文件」页轮询。非 BT 任务返回 `notFound`。
+    public static let daemonTaskBtFiles = "daemon.task.btFiles"
+    /// 修改 BT 文件优先级（`SetBtFilePrioritiesParams`，部分更新：0 不下载 / 1 普通 / 6 高 / 7 最高）。
+    /// 已完成任务 → `taskStateConflict`；会导致没有文件要下载 → `invalidArgument`。
+    public static let daemonTaskSetFilePriorities = "daemon.task.setFilePriorities"
+    /// 重命名 BT 任务内单个文件（`{taskId, index, path}`；移动端不提供，仅保持方法表一一对应）。
+    public static let daemonTaskRenameBtFile = "daemon.task.renameBtFile"
+    /// 强制重新校验未完成的 BT 任务（`{taskId}`）；已完成任务 → `taskStateConflict`（改用 `daemonTaskVerify`）。
+    public static let daemonTaskRecheck = "daemon.task.recheck"
+    /// 移动 BT 任务数据到新的保存目录（`{taskId, saveDir}`，慢方法；移动端不提供，仅保持方法表一一对应）。
+    public static let daemonTaskMoveStorage = "daemon.task.moveStorage"
+    /// 任务级 BT 限速（`SetBtLimitsParams`，字节/秒，0 = 不限，缺省字段不变）。
+    public static let daemonTaskSetBtLimits = "daemon.task.setBtLimits"
+    /// 超级做种开关（`{taskId, enabled}`）：完成（做种）后才实际生效，可提前设置。
+    public static let daemonTaskSetSuperSeeding = "daemon.task.setSuperSeeding"
+    /// 立即向 tracker 重新汇报（`{taskId}`；移动端没有 Tracker 页，仅保持方法表一一对应）。
+    public static let daemonTaskReannounce = "daemon.task.reannounce"
     public static let daemonTaskVerify = "daemon.task.verify"
+    /// 已完成任务落盘文件的哈希（`{taskId, algorithm}` → `{fileHash}`），结果同时记入任务 `fileHash`。
+    public static let daemonTaskHash = "daemon.task.hash"
     /// 批量暂停 / 恢复（`{taskIds}`）：整批只推一次任务快照；未知 id 忽略，空列表为空操作。
     public static let daemonTaskPauseMany = "daemon.task.pauseMany"
     public static let daemonTaskResumeMany = "daemon.task.resumeMany"
@@ -61,6 +82,7 @@ public enum HostMethod {
     public static let daemonConfigGet = "daemon.config.get"
     public static let daemonConfigPatch = "daemon.config.patch"
     public static let daemonConfigProxyTest = "daemon.config.proxyTest"
+    public static let daemonConfigProxyRoute = "daemon.config.proxyRoute"
     public static let daemonConfigConnPolicy = "daemon.config.connPolicy"
     public static let daemonConfigClearConnPolicy = "daemon.config.clearConnPolicy"
     public static let daemonConfigSystemProxy = "daemon.config.systemProxy"
@@ -132,6 +154,34 @@ public enum HostMethod {
     public static let daemonEgressPlan = "daemon.egress.plan"
     public static let daemonBtTrackerSubscriptionRefresh = "daemon.bt.trackerSubscription.refresh"
     public static let daemonEd2kServerSubscriptionRefresh = "daemon.ed2k.serverSubscription.refresh"
+    /// 立即刷新 Kad 节点（nodes.dat）订阅（无参 → `Ed2kNodesSubRefreshResponse`，慢方法）。
+    public static let daemonEd2kNodesSubscriptionRefresh = "daemon.ed2k.nodesSubscription.refresh"
+    /// HighID / LowID 检测（无参 → `Ed2kNetworkDto`，慢方法，可达 ~30 s）。
+    public static let daemonEd2kIdCheck = "daemon.ed2k.idCheck"
+    /// eD2K 任务实况（`{taskId}` → `Ed2kStatusDto`；移动端不消费，仅保持方法表一一对应）。
+    public static let daemonTaskEd2kStatus = "daemon.task.ed2kStatus"
+    /// BT 监听端口与端口映射实况（无参 → `BtPortStatus`），设置「连接」页签可见时每 5 秒轮询。
+    public static let daemonBtPortStatus = "daemon.bt.portStatus"
+    /// BT 防吸血状态总览（`BtGuardState`）。
+    public static let daemonBtGuardState = "daemon.bt.guard.state"
+    /// 过滤条目分页（`BtGuardEntriesListParams` → `BtGuardEntriesPage`）。
+    public static let daemonBtGuardEntriesList = "daemon.bt.guard.entries.list"
+    /// 手动添加条目 / 白名单（`BtGuardEntriesAddParams` → `BtGuardEntry`）。
+    public static let daemonBtGuardEntriesAdd = "daemon.bt.guard.entries.add"
+    /// 按 id 移除条目（`BtGuardEntriesRemoveParams` → `BtGuardEntriesRemoveResult`）；云层条目被拒绝，应改为加白。
+    public static let daemonBtGuardEntriesRemove = "daemon.bt.guard.entries.remove"
+    /// 事件日志分页。
+    public static let daemonBtGuardEventsList = "daemon.bt.guard.events.list"
+    /// 导出条目文本（`BtGuardExportParams` → `BtGuardExportResult`）。慢方法。
+    public static let daemonBtGuardExport = "daemon.bt.guard.export"
+    /// 立即刷新过滤文件订阅（无参 → `BtGuardFilterSourcesRefresh`）。慢方法。
+    public static let daemonBtGuardFilterSourcesRefresh = "daemon.bt.guard.filterSources.refresh"
+    /// 请求立即检查云名单更新（无参）；结果经 `btGuardChanged` 通知。
+    public static let daemonBtGuardCloudRefresh = "daemon.bt.guard.cloud.refresh"
+    /// 仅 agent 调用：已验签的云名单整层替换。移动端不得调用（`native/mobile` 通用通道会拒绝）。
+    public static let daemonBtGuardCloudApply = "daemon.bt.guard.cloud.apply"
+    /// 仅 agent 调用：弹出待上报证据。移动端不得调用（`native/mobile` 通用通道会拒绝）。
+    public static let daemonBtGuardEvidenceDrain = "daemon.bt.guard.evidence.drain"
     public static let daemonDiagnosticsDescribe = "daemon.diagnostics.describe"
     public static let daemonDiagnosticsPrepareLogExport = "daemon.diagnostics.prepareLogExport"
     /// Doctor 动态探测：在 daemon 进程内真实写入各下载目录 / 数据目录并运行外部组件，
@@ -225,6 +275,8 @@ public enum HostMethod {
     public static let agentReferralValidate = "agent.referral.validate"
     public static let agentPlatformOpenTask = "agent.platform.openTask"
     public static let agentPlatformRevealTask = "agent.platform.revealTask"
+    /// 把任务产物以文件写入主机系统剪贴板；仅桌面主机本机来源，移动端不使用。
+    public static let agentPlatformCopyTaskFiles = "agent.platform.copyTaskFiles"
     public static let agentPlatformOpenPath = "agent.platform.openPath"
     public static let agentPlatformIntegrationGet = "agent.platform.integrationGet"
     public static let agentPlatformSetAutostart = "agent.platform.setAutostart"
@@ -232,6 +284,12 @@ public enum HostMethod {
     public static let agentPlatformSetUrlProtocol = "agent.platform.setUrlProtocol"
     /// 系统文件管理器为文件显示的图标（PNG）；参数见 `PlatformFileIconParams`。
     public static let agentPlatformFileIcon = "agent.platform.fileIcon"
+    /// 切换 / 导入桌面应用图标；仅桌面，移动端不使用。
+    public static let agentPlatformSetAppIcon = "agent.platform.setAppIcon"
+    /// 当前自定义桌面应用图标的 PNG；仅桌面，移动端不使用。
+    public static let agentPlatformAppIconImage = "agent.platform.appIconImage"
+    /// 为桌面界面进程现有窗口补设应用图标；仅桌面，移动端不使用。
+    public static let agentPlatformSyncWindowIcons = "agent.platform.syncWindowIcons"
     /// 由 agent 在本机播放一次提示音偏好值；仅桌面，移动端不使用。
     public static let agentSoundPreview = "agent.sound.preview"
     public static let agentCaptureSubmit = "agent.capture.submit"
@@ -253,7 +311,7 @@ public enum HostMethod {
     public static let agentUpdateDownload = "agent.update.download"
     public static let agentUpdateInstall = "agent.update.install"
     public static let agentUpdateCancel = "agent.update.cancel"
-    /// 完成后关机：`{delaySecs}`；无活跃任务时拒绝（`InvalidArgument`）。
+    /// 定时关机 / 睡眠：`{delaySecs, action}` → `{armed}`；没有任务时立即倒计时，`delaySecs = 0` 仅有任务时受理。
     public static let agentPowerArm = "agent.power.arm"
     public static let agentPowerDisarm = "agent.power.disarm"
     public static let agentCloudNotifyGet = "agent.cloudNotify.get"
@@ -294,5 +352,7 @@ public enum HostCapability {
     public static let agentExternalCapture = "agent.externalCapture"
     /// 按连接下发：本连接可在 agent 所在主机上打开 / 定位任务产物（`agent.platform.openTask` / `revealTask`）。
     public static let agentOpenTaskFiles = "agent.openTaskFiles"
+    /// 按连接下发：本连接可把任务产物写入 agent 所在主机的系统剪贴板（`agent.platform.copyTaskFiles`）。
+    public static let agentCopyTaskFiles = "agent.copyTaskFiles"
     public static let clientSelections = "client.selections"
 }

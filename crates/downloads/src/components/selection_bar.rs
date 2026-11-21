@@ -98,7 +98,7 @@ impl DownloadView {
 
     /// [`Self::icon_action`] 的可禁用版本：`disabled` 时保留悬浮提示但不响应点击。
     #[allow(clippy::too_many_arguments)]
-    fn icon_action_with_state(
+    pub(crate) fn icon_action_with_state(
         &self,
         id: &'static str,
         label: SharedString,

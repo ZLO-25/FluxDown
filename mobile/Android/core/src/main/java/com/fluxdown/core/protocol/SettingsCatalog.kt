@@ -50,10 +50,16 @@ sealed interface Normalized {
 object SettingsCatalog {
     val fileExistsBehaviors = listOf("rename", "overwrite", "skip", "ask")
     val fileMissingActions = listOf("keep", "delete")
+    val hashAlgorithms = listOf("md5", "sha1", "sha256", "sha512")
     val btSeedTimeUnits = listOf("minutes", "hours", "days")
     val btSeedLimitOperators = listOf("or", "and")
+    val btGuardModes = listOf("off", "observe", "enforce")
+    val btGuardDownloadingActions = listOf("observe", "throttle", "choke", "ban")
     val btSeedThenActions = listOf("stop", "delete", "delete_files")
     val btMseModes = listOf("disabled", "enabled", "forced")
+    val btPieceOrders = listOf("rarest", "sequential")
+    val btUtpCongestions = listOf("ledbat", "cubic")
+    val btProxySources = listOf("manual", "system")
     val proxyModes = listOf("none", "system", "manual", "auto")
     val proxyTypes = listOf("http", "https", "socks4", "socks5")
     val themeModes = listOf("system", "light", "dark")
@@ -93,6 +99,8 @@ object SettingsCatalog {
         daemon("file_missing_action", choice(fileMissingActions), "keep"),
         daemon("completed_record_retention_days", int(0, 3650), "0"),
         daemon("idle_file_scan", bool, "false"),
+        daemon("hash_after_download", bool, "false"),
+        daemon("hash_algorithm", choice(hashAlgorithms), "sha256"),
         daemon("global_user_agent", text, ""),
         daemon("default_queue_id", text, ""),
         daemon("domain_conn_caps", readOnly, ""),
@@ -104,11 +112,30 @@ object SettingsCatalog {
         daemon("bt_port_start", int(1, 65_535), "6881"),
         daemon("bt_port_end", int(1, 65_535), "6891"),
         daemon("bt_mse_mode", choice(btMseModes), "enabled"),
+        daemon("bt_upload_slots", int(0, 512), "0"),
         daemon("bt_custom_trackers", text, ""),
+        daemon("bt_piece_order", choice(btPieceOrders), "rarest"),
+        daemon("bt_first_last_pieces_first", bool, "false"),
+        daemon("bt_selection_auto_default", bool, "true"),
         daemon("bt_tracker_sub_enabled", bool, "true"),
         daemon("bt_tracker_sub_urls", text, ""),
         daemon("bt_tracker_sub_cache", readOnly, ""),
         daemon("bt_tracker_sub_updated_at", readOnly, "0"),
+        // BT 连接 / 汇报策略 / 代理 / I2P（设备本地，不进云同步目录）
+        daemon("bt_enable_lsd", bool, "true"),
+        daemon("bt_utp_congestion", choice(btUtpCongestions), "ledbat"),
+        daemon("bt_max_connections", int(0, 65_535), "0"),
+        daemon("bt_max_connections_per_torrent", int(1, 4096), "512"),
+        daemon("bt_enable_webseed", bool, "true"),
+        daemon("bt_announce_all_tiers", bool, "true"),
+        daemon("bt_announce_all_trackers", bool, "true"),
+        daemon("bt_proxy_enabled", bool, "false"),
+        daemon("bt_proxy_source", choice(btProxySources), "manual"),
+        daemon("bt_proxy_peers", bool, "true"),
+        daemon("bt_i2p_enabled", bool, "false"),
+        daemon("bt_i2p_sam_host", text, "127.0.0.1"),
+        daemon("bt_i2p_sam_port", int(1, 65_535), "7656"),
+        daemon("bt_i2p_mixed", bool, "false"),
         daemon("bt_seed_enabled", bool, "true"),
         daemon("bt_auto_reseed", bool, "true"),
         daemon("bt_seed_max_active", int(0, MAX), "0"),
@@ -120,6 +147,28 @@ object SettingsCatalog {
         daemon("bt_seed_inactive_time_limit_unit", choice(btSeedTimeUnits), "minutes"),
         daemon("bt_seed_limit_operator", choice(btSeedLimitOperators), "or"),
         daemon("bt_seed_then_action", choice(btSeedThenActions), "stop"),
+        // BT 防吸血（热更新；`bt_guard_report_enabled` 设备本地不同步）
+        daemon("bt_guard_enabled", bool, "true"),
+        daemon("bt_guard_rule_excessive", choice(btGuardModes), "observe"),
+        daemon("bt_guard_rule_rerequest", choice(btGuardModes), "observe"),
+        daemon("bt_guard_rule_rewind", choice(btGuardModes), "observe"),
+        daemon("bt_guard_rule_lag", choice(btGuardModes), "observe"),
+        daemon("bt_guard_rule_fingerprint", choice(btGuardModes), "enforce"),
+        daemon("bt_guard_cloud_mode", choice(btGuardModes), "observe"),
+        daemon("bt_guard_excess_ratio_pct", int(110, 2000), "200"),
+        daemon("bt_guard_min_torrent_mib", int(0, 1_048_576), "64"),
+        daemon("bt_guard_rewind_tolerance_pct", int(0, 100), "7"),
+        daemon("bt_guard_throttle_kib", int(1, 1_048_576), "32"),
+        daemon("bt_guard_ban_base_hours", int(1, 720), "24"),
+        daemon("bt_guard_ban_max_days", int(1, 365), "30"),
+        daemon("bt_guard_downloading_max_action", choice(btGuardDownloadingActions), "throttle"),
+        daemon("bt_guard_skip_private", bool, "true"),
+        daemon("bt_guard_skip_lan", bool, "true"),
+        daemon("bt_guard_ipv6_prefix", int(48, 128), "64"),
+        daemon("bt_guard_filter_urls", text, ""),
+        daemon("bt_guard_client_rules", text, ""),
+        daemon("bt_guard_cloud_enabled", bool, "true"),
+        daemon("bt_guard_report_enabled", bool, "false"),
         // ED2K
         daemon("ed2k_enable_kad", bool, "true"),
         daemon("ed2k_enable_upnp", bool, "true"),
@@ -130,6 +179,8 @@ object SettingsCatalog {
         daemon("ed2k_server_sub_cache", readOnly, ""),
         daemon("ed2k_server_sub_updated_at", readOnly, "0"),
         daemon("ed2k_nodes_dat_url", text, ""),
+        daemon("ed2k_nodes_dat_count", readOnly, "0"),
+        daemon("ed2k_nodes_dat_updated_at", readOnly, "0"),
         // 代理
         daemon("proxy_mode", choice(proxyModes), "none"),
         daemon("proxy_type", choice(proxyTypes), "http"),
@@ -138,6 +189,7 @@ object SettingsCatalog {
         daemon("proxy_username", text, ""),
         daemon("proxy_password", text, ""),
         daemon("proxy_no_list", text, ""),
+        daemon("proxy_rules", text, ""),
         // Webhook / 组件 / 日志
         daemon("webhook.endpoints", text, ""),
         daemon("component.ffmpeg.path", text, ""),
@@ -169,6 +221,7 @@ object SettingsCatalog {
         pref("download.remember_last_save_dir", bool, "false"),
         pref("download.notify_on_complete", bool, "true"),
         pref("download.silent_download", bool, "false"),
+        pref("download.silent_auto_category", bool, "true"),
         pref("download.silent_skip_selection", bool, "false"),
         pref("download.keep_awake", bool, "false"),
     )
@@ -200,7 +253,7 @@ object SettingsCatalog {
     /** 自定义主题集合的范围键：只承载分组 / 本机专属开关，从不承载值（逐主题键 `appearance.custom_themes.<id>`）。 */
     const val customThemesScopeKey = "appearance.custom_themes"
 
-    /** daemon 存储键 → 云同步键（`SYNC_SETTING_SPECS` 中 owner = Daemon，29 项）。 */
+    /** daemon 存储键 → 云同步键（`SYNC_SETTING_SPECS` 中 owner = Daemon，51 项，含 19 个 `bt.guard.*`）。 */
     val daemonSyncNames: Map<String, String> = mapOf(
         "max_concurrent_tasks" to "download.max_concurrent_tasks",
         "default_segments" to "download.default_segments",
@@ -218,6 +271,8 @@ object SettingsCatalog {
         "bt_enable_upnp" to "bt.enable_upnp",
         "bt_enable_utp" to "bt.enable_utp",
         "bt_custom_trackers" to "bt.custom_trackers",
+        "bt_piece_order" to "bt.piece_order",
+        "bt_first_last_pieces_first" to "bt.first_last_pieces_first",
         "bt_tracker_sub_enabled" to "bt.tracker_sub_enabled",
         "bt_tracker_sub_urls" to "bt.tracker_sub_urls",
         "bt_seed_ratio_limit" to "bt.seed_ratio_limit",
@@ -227,6 +282,26 @@ object SettingsCatalog {
         "bt_seed_limit_operator" to "bt.seed_limit_operator",
         "bt_seed_then_action" to "bt.seed_then_action",
         "bt_seed_max_active" to "bt.seed_max_active",
+        "bt_guard_enabled" to "bt.guard.enabled",
+        "bt_guard_rule_excessive" to "bt.guard.rule_excessive",
+        "bt_guard_rule_rerequest" to "bt.guard.rule_rerequest",
+        "bt_guard_rule_rewind" to "bt.guard.rule_rewind",
+        "bt_guard_rule_lag" to "bt.guard.rule_lag",
+        "bt_guard_rule_fingerprint" to "bt.guard.rule_fingerprint",
+        "bt_guard_cloud_mode" to "bt.guard.cloud_mode",
+        "bt_guard_excess_ratio_pct" to "bt.guard.excess_ratio_pct",
+        "bt_guard_min_torrent_mib" to "bt.guard.min_torrent_mib",
+        "bt_guard_rewind_tolerance_pct" to "bt.guard.rewind_tolerance_pct",
+        "bt_guard_throttle_kib" to "bt.guard.throttle_kib",
+        "bt_guard_ban_base_hours" to "bt.guard.ban_base_hours",
+        "bt_guard_ban_max_days" to "bt.guard.ban_max_days",
+        "bt_guard_downloading_max_action" to "bt.guard.downloading_max_action",
+        "bt_guard_skip_private" to "bt.guard.skip_private",
+        "bt_guard_skip_lan" to "bt.guard.skip_lan",
+        "bt_guard_ipv6_prefix" to "bt.guard.ipv6_prefix",
+        "bt_guard_filter_urls" to "bt.guard.filter_urls",
+        "bt_guard_client_rules" to "bt.guard.client_rules",
+        "bt_guard_cloud_enabled" to "bt.guard.cloud_enabled",
         "ed2k_enable_kad" to "ed2k.enable_kad",
         "ed2k_enable_upnp" to "ed2k.enable_upnp",
         "ed2k_server_list" to "ed2k.server_list",

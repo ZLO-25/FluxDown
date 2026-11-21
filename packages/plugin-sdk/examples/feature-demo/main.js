@@ -550,27 +550,59 @@ function forgetSession(session) {
 // 视图：设置页（扩展 → 插件 → 设置 → 「插件设置」tab）
 // ---------------------------------------------------------------------------
 flux.ui.view("settings", {
-  init(ctx) {
+  async init(ctx) {
     openViews.add(ctx);
-    return { greeting: String(flux.settings.greeting), saved: "", session: ctx.session };
+    const state = {
+      greeting: String(flux.settings.greeting),
+      saved: "",
+      savedGreeting: "",
+      archiveRules: null,
+      archiveRulesError: "",
+      session: ctx.session,
+    };
+    try {
+      state.archiveRules = await flux.archiveRules.status();
+    } catch (error) {
+      state.archiveRulesError = String(error);
+    }
+    return state;
   },
-  render(state) {
+  render(state, ctx) {
+    const chinese = /^zh(?:-|_|$)/i.test(ctx.locale);
+    const text = (zh, en) => chinese ? zh : en;
     return h(
       "stack",
       { gap: "md", padding: "md" },
       h("callout", {
         tone: "info",
-        title: "自定义设置视图",
-        text: "这里由插件自己渲染；「基础设置」tab 是 manifest.settings 自动生成的表单。",
+        title: text("自定义设置视图", "Custom settings view"),
+        text: text("这里由插件自己渲染；「基础设置」tab 是 manifest.settings 自动生成的表单。", "This view is rendered by the plugin; the Basic settings tab is generated from manifest.settings."),
       }),
-      h("input", { key: "greeting", value: state.greeting, placeholder: "问候语" }),
+      h("text", {
+        text: state.archiveRules
+          ? text(`分类规则 v${state.archiveRules.sequence} · ${state.archiveRules.ruleCount} 条`, `Archive rules v${state.archiveRules.sequence} · ${state.archiveRules.ruleCount} rules`)
+          : state.archiveRulesError || text("分类规则状态不可用", "Archive rule status unavailable"),
+        tone: state.archiveRulesError ? "danger" : "muted",
+      }),
       h(
         "stack",
         { direction: "row", gap: "sm" },
-        h("button", { key: "save", text: "保存问候语", variant: "primary" }),
-        h("button", { key: "mode", text: `切换模式（当前 ${flux.settings.mode}）`, variant: "outline" }),
+        h("button", { key: "rules-status", text: text("读取分类规则状态", "Read archive rule status"), variant: "outline" }),
+        h("button", { key: "rules-update", text: text("手动更新分类规则", "Update archive rules"), variant: "outline" }),
       ),
-      state.saved ? h("text", { text: state.saved, tone: "success" }) : null,
+      h("input", { key: "greeting", value: state.greeting, placeholder: text("问候语", "Greeting") }),
+      h(
+        "stack",
+        { direction: "row", gap: "sm" },
+        h("button", { key: "save", text: text("保存问候语", "Save greeting"), variant: "primary" }),
+        h("button", { key: "mode", text: text(`切换模式（当前 ${flux.settings.mode}）`, `Toggle mode (currently ${flux.settings.mode})`), variant: "outline" }),
+      ),
+      state.saved ? h("text", {
+        text: state.saved === "greeting"
+          ? text(`已保存：${state.savedGreeting}`, `Saved: ${state.savedGreeting}`)
+          : text("模式已切换", "Mode changed"),
+        tone: "success",
+      }) : null,
       h("kv", {
         items: Object.entries(flux.settings).map(([key, value]) => ({ key, value: String(value) })),
       }),
@@ -579,14 +611,26 @@ flux.ui.view("settings", {
   async event(state, ev) {
     const id = ev.node.split("/").pop();
     if (ev.type === "change" && id === "greeting") state.greeting = ev.value;
+    if (ev.type === "press" && (id === "rules-status" || id === "rules-update")) {
+      state.archiveRulesError = "";
+      try {
+        state.archiveRules =
+          id === "rules-update"
+            ? await flux.archiveRules.update()
+            : await flux.archiveRules.status();
+      } catch (error) {
+        state.archiveRulesError = String(error);
+      }
+    }
     if (ev.type === "submit" && id === "greeting") state.greeting = ev.value;
     if (ev.type === "press" && id === "save") {
       await flux.settings.update({ greeting: state.greeting });
-      state.saved = `已保存：${state.greeting}`;
+      state.saved = "greeting";
+      state.savedGreeting = state.greeting;
     }
     if (ev.type === "press" && id === "mode") {
       await flux.settings.update({ mode: flux.settings.mode === "calm" ? "loud" : "calm" });
-      state.saved = "模式已切换";
+      state.saved = "mode";
     }
   },
   dispose(state) {

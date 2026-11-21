@@ -5,6 +5,18 @@ import { call } from '../client';
 import { normalizeTask } from '../normalize';
 import { METHOD } from '../protocol';
 import type {
+  BtGuardEntriesAddParams,
+  BtGuardEntriesListDto,
+  BtGuardEntriesListParams,
+  BtGuardEntriesRemoveDto,
+  BtGuardEntriesRemoveParams,
+  BtGuardEntryDto,
+  BtGuardEventsListDto,
+  BtGuardEventsListParams,
+  BtGuardExportDto,
+  BtGuardExportParams,
+  BtGuardFilterSourcesRefreshDto,
+  BtGuardStateDto,
   ComponentInstallParams,
   ComponentParams,
   ComponentStatusDto,
@@ -13,8 +25,11 @@ import type {
   CreateGroupRequest,
   CreateGroupResponse,
   CreatedTask,
+  SeedLocalResult,
   DaemonConfigPatch,
   DaemonConfigSnapshot,
+  Aria2OptionsRequest,
+  Aria2OptionsResponse,
   DaemonCreateTasksParams,
   DaemonCreateTasksResult,
   DaemonCreateTaskParams,
@@ -29,6 +44,8 @@ import type {
   InstalledPlugin,
   MarketEntryDto,
   OkResult,
+  PluginArchiveRulesDto,
+  PluginArchiveRulesParams,
   PluginAuthRequest,
   PluginAuthResponse,
   PluginDto,
@@ -45,6 +62,7 @@ import type {
   PluginViewOpenParams,
   PluginViewOpenedDto,
   PluginViewSessionParams,
+  PluginViewSetLocaleParams,
   PluginViewSnapshotDto,
   PluginIdentityParams,
   PluginInstallDevParams,
@@ -57,6 +75,8 @@ import type {
   LinkProbeParams,
   LinkProbeResult,
   PrepareLogExportResult,
+  ProxyRouteRequest,
+  ProxyRouteResponse,
   ProxyTestRequest,
   ProxyTestResponse,
   QueueDto,
@@ -79,6 +99,8 @@ import type {
   SelectionResolutionDto,
   SetSeedLimitsParams,
   TaskVerifyResult,
+  TaskHashResult,
+  TorrentShareDto,
   SiteAuthCredentialDto,
   SiteAuthDeleteParams,
   SiteAuthEntryDto,
@@ -90,11 +112,30 @@ import type {
   TaskActivityQuery,
   TaskSpeedHistoryDto,
   TaskSpeedHistoryQuery,
+  BtStatusDto,
+  BtFilesDto,
+  BtPortStatusDto,
+  MoveTaskStorageParams,
+  RenameBtFileParams,
+  SetTaskBtLimitsParams,
+  SetTaskFilePrioritiesParams,
+  SetTaskSuperSeedingParams,
+  Ed2kIdCheckParams,
+  Ed2kKadBootstrapDto,
+  Ed2kKadBootstrapParams,
+  Ed2kNetworkDto,
+  Ed2kNodesSubRefreshResponse,
+  Ed2kStatusDto,
   TaskDeleteManyParams,
   TaskDeleteParams,
   TaskChangeUrlParams,
   TaskSetSegmentsParams,
+  TaskSetPiecePickingParams,
+  SetTaskProxyParams,
   TaskDtoWire,
+  DaemonSeedLocalParams,
+  DaemonTaskHashParams,
+  DaemonTorrentShareParams,
   TaskIdParams,
   TaskIdsParams,
   TaskRenameParams,
@@ -103,23 +144,31 @@ import type {
   WebhookEndpointDraft,
   WebhookSimulateResponse,
   WebhookTestResponse,
+  EditTaskParams,
+  TaskEditSnapshot,
 } from '../protocol';
 
 /** 服务端逐源串行拉取镜像（每源 20s），最坏远超默认 30s。 */
 const SLOW_MIRROR_TIMEOUT_MS = 120_000;
 
-/** BT 完整性校验需读盘比对全部分块，耗时随数据量增长。 */
-const VERIFY_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+/** 读写盘类慢方法（完整性校验、文件哈希、本机做种、移动 BT 数据）耗时与数据量成正比。 */
+const SLOW_DISK_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 
 // `daemon.task.list` 在任务数超过 5000 时服务端报错（需分页），Web 不再封装：任务表一律来自
 // store 的快照 + `system.taskPage` 载入。
 const task = {
   get: async (params: TaskIdParams) =>
     normalizeTask(await call<TaskDtoWire>(METHOD.DAEMON_TASK_GET, params)),
+  editInfo: (params: TaskIdParams) => call<TaskEditSnapshot>(METHOD.DAEMON_TASK_EDIT_INFO, params),
+  /** Unified edit can move data across volumes; match moveStorage's disk-operation timeout. */
+  edit: (params: EditTaskParams) =>
+    call<OkResult>(METHOD.DAEMON_TASK_EDIT, params, { timeoutMs: SLOW_DISK_TIMEOUT_MS }),
   activity: (params: TaskActivityQuery) =>
     call<TaskActivityPage>(METHOD.DAEMON_TASK_ACTIVITY, params),
   speedHistory: (params: TaskSpeedHistoryQuery) =>
     call<TaskSpeedHistoryDto | null>(METHOD.DAEMON_TASK_SPEED_HISTORY, params),
+  btStatus: (params: TaskIdParams) => call<BtStatusDto>(METHOD.DAEMON_TASK_BT_STATUS, params),
+  ed2kStatus: (params: TaskIdParams) => call<Ed2kStatusDto>(METHOD.DAEMON_TASK_ED2K_STATUS, params),
   create: (params: DaemonCreateTaskParams) => call<CreatedTask>(METHOD.DAEMON_TASK_CREATE, params),
   /** 批量建任务：一块（≤512 条）共享同一份选项，整块一个事务，按 `batchId` 幂等。 */
   createMany: (params: DaemonCreateTasksParams) =>
@@ -129,9 +178,29 @@ const task = {
   rename: (params: TaskRenameParams) => call<OkResult>(METHOD.DAEMON_TASK_RENAME, params),
   changeUrl: (params: TaskChangeUrlParams) =>
     call<OkResult>(METHOD.DAEMON_TASK_CHANGE_URL, params),
-  /** 修改线程数：已下进度保留；下载中任务由引擎静默暂停 → 改配置 → 恢复。 */
+  /** 修改任务代理；后端对活动任务重连、对失败任务自动重试。 */
+  setProxy: (params: SetTaskProxyParams) => call<OkResult>(METHOD.DAEMON_TASK_SET_PROXY, params),
   setSegments: (params: TaskSetSegmentsParams) =>
     call<OkResult>(METHOD.DAEMON_TASK_SET_SEGMENTS, params),
+  /** BT 选块：只传本次切换的字段，另一项保持不变。 */
+  setPiecePicking: (params: TaskSetPiecePickingParams) =>
+    call<OkResult>(METHOD.DAEMON_TASK_SET_PIECE_PICKING, params),
+  /** BT 文件表（详情页「文件」页签轮询）。 */
+  btFiles: (params: TaskIdParams) => call<BtFilesDto>(METHOD.DAEMON_TASK_BT_FILES, params),
+  /** BT 文件优先级：只改列出的文件。 */
+  setFilePriorities: (params: SetTaskFilePrioritiesParams) =>
+    call<OkResult>(METHOD.DAEMON_TASK_SET_FILE_PRIORITIES, params),
+  renameBtFile: (params: RenameBtFileParams) => call<OkResult>(METHOD.DAEMON_TASK_RENAME_BT_FILE, params),
+  /** 强制重新校验（未完成 BT 任务）：daemon 受理即返回，校验在后台进行。 */
+  recheck: (params: TaskIdParams) => call<OkResult>(METHOD.DAEMON_TASK_RECHECK, params),
+  /** 移动任务数据（BT 与非 BT 都可）：跨卷时耗时与数据量成正比，使用 6 小时超时。 */
+  moveStorage: (params: MoveTaskStorageParams) =>
+    call<OkResult>(METHOD.DAEMON_TASK_MOVE_STORAGE, params, { timeoutMs: SLOW_DISK_TIMEOUT_MS }),
+  /** 任务级限速：只传改动的字段。 */
+  setBtLimits: (params: SetTaskBtLimitsParams) => call<OkResult>(METHOD.DAEMON_TASK_SET_BT_LIMITS, params),
+  setSuperSeeding: (params: SetTaskSuperSeedingParams) =>
+    call<OkResult>(METHOD.DAEMON_TASK_SET_SUPER_SEEDING, params),
+  reannounce: (params: TaskIdParams) => call<OkResult>(METHOD.DAEMON_TASK_REANNOUNCE, params),
   delete: (params: TaskDeleteParams) => call<OkResult>(METHOD.DAEMON_TASK_DELETE, params),
   pauseAll: () => call<OkResult>(METHOD.DAEMON_TASK_PAUSE_ALL),
   resumeAll: () => call<OkResult>(METHOD.DAEMON_TASK_RESUME_ALL),
@@ -139,9 +208,20 @@ const task = {
   rescan: () => call<OkResult>(METHOD.DAEMON_TASK_RESCAN),
   setSeedLimits: (params: SetSeedLimitsParams) =>
     call<OkResult>(METHOD.DAEMON_TASK_SET_SEED_LIMITS, params),
+  /** 本机做种：生成种子并哈希校验全部数据，耗时与数据量成正比；使用 6 小时超时，创建类提交不重试。 */
+  seedLocal: (params: DaemonSeedLocalParams) =>
+    call<SeedLocalResult>(METHOD.DAEMON_TASK_SEED_LOCAL, params, { timeoutMs: SLOW_DISK_TIMEOUT_MS }),
+  /** BT 任务的磁力链接（含 tracker）与可选 .torrent 字节（base64）。 */
+  torrentShare: (params: DaemonTorrentShareParams) =>
+    call<TorrentShareDto>(METHOD.DAEMON_TASK_TORRENT_SHARE, params),
   /** BT 完整性校验：耗时与数据量成正比，使用 6 小时超时。 */
   verify: (params: TaskIdParams) =>
-    call<TaskVerifyResult>(METHOD.DAEMON_TASK_VERIFY, params, { timeoutMs: VERIFY_TIMEOUT_MS }),
+    call<TaskVerifyResult>(METHOD.DAEMON_TASK_VERIFY, params, { timeoutMs: SLOW_DISK_TIMEOUT_MS }),
+  /** 已完成任务的文件哈希：读整个文件，耗时与文件大小成正比。 */
+  hash: (taskId: string, algorithm: string) => {
+    const params: DaemonTaskHashParams = { taskId, algorithm }
+    return call<TaskHashResult>(METHOD.DAEMON_TASK_HASH, params, { timeoutMs: SLOW_DISK_TIMEOUT_MS })
+  },
   /** 批量操作：一次请求、整批只推一次任务快照（逐条调用会撞上 agent 的通道上限）。 */
   pauseMany: (taskIds: string[]) => {
     const params: TaskIdsParams = { taskIds };
@@ -187,8 +267,12 @@ const config = {
   /** 乐观并发：`expectedRevision` 落后时 conflict，`error.data.revision` 为当前版本。 */
   patch: (params: DaemonConfigPatch) =>
     call<DaemonConfigSnapshot>(METHOD.DAEMON_CONFIG_PATCH, params),
+  aria2Options: (params?: Aria2OptionsRequest) =>
+    call<Aria2OptionsResponse>(METHOD.DAEMON_CONFIG_ARIA2_OPTIONS, params ?? {}),
   proxyTest: (params: ProxyTestRequest) =>
     call<ProxyTestResponse>(METHOD.DAEMON_CONFIG_PROXY_TEST, params),
+  proxyRoute: (params: ProxyRouteRequest) =>
+    call<ProxyRouteResponse>(METHOD.DAEMON_CONFIG_PROXY_ROUTE, params),
   connPolicy: () => call<ConnPolicySummaryDto>(METHOD.DAEMON_CONFIG_CONN_POLICY),
   clearConnPolicy: () => call<ConnPolicySummaryDto>(METHOD.DAEMON_CONFIG_CLEAR_CONN_POLICY),
   systemProxy: () => call<SystemProxyDto>(METHOD.DAEMON_CONFIG_SYSTEM_PROXY),
@@ -265,6 +349,8 @@ const plugin = {
     call<InstalledPlugin>(METHOD.DAEMON_PLUGIN_RELOAD_DEV, params, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
   uninstall: (params: PluginIdentityParams) =>
     call<OkResult>(METHOD.DAEMON_PLUGIN_UNINSTALL, params),
+  archiveRules: (params: PluginArchiveRulesParams) =>
+    call<PluginArchiveRulesDto>(METHOD.DAEMON_PLUGIN_ARCHIVE_RULES, params, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
   marketList: () => call<MarketEntryDto[]>(METHOD.DAEMON_PLUGIN_MARKET_LIST, undefined, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
   marketInstall: (params: PluginMarketInstallParams) =>
     call<InstalledPlugin>(METHOD.DAEMON_PLUGIN_MARKET_INSTALL, params, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
@@ -285,6 +371,9 @@ const plugin = {
   /** 打开可移植视图会话（可能激活常驻宿主，按慢方法超时）。 */
   viewOpen: (params: PluginViewOpenParams) =>
     call<PluginViewOpenedDto>(METHOD.DAEMON_PLUGIN_VIEW_OPEN, params, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
+  /** 更新现有可移植视图会话的界面语言，不重新运行插件初始化。 */
+  viewSetLocale: (params: PluginViewSetLocaleParams) =>
+    call<OkResult>(METHOD.DAEMON_PLUGIN_VIEW_SET_LOCALE, params),
   /** 投递视图事件；入队即返回，结果经 `pluginViewFrame` 事件送出。 */
   viewEvent: (params: PluginViewEventParams) =>
     call<OkResult>(METHOD.DAEMON_PLUGIN_VIEW_EVENT, params),
@@ -333,13 +422,44 @@ const bt = {
     refresh: () =>
       call<TrackerSubRefreshResponse>(METHOD.DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH, undefined, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
   },
+  /** 监听端口与端口映射实况（设置页「连接」可见时轮询）。 */
+  portStatus: () => call<BtPortStatusDto>(METHOD.DAEMON_BT_PORT_STATUS),
+  /** 防吸血。`cloud.apply` / `evidence.drain` 是 agent 内部方法，这里刻意不封装。 */
+  guard: {
+    state: () => call<BtGuardStateDto>(METHOD.DAEMON_BT_GUARD_STATE),
+    entries: {
+      list: (params: BtGuardEntriesListParams) => call<BtGuardEntriesListDto>(METHOD.DAEMON_BT_GUARD_ENTRIES_LIST, params),
+      add: (params: BtGuardEntriesAddParams) => call<BtGuardEntryDto>(METHOD.DAEMON_BT_GUARD_ENTRIES_ADD, params),
+      remove: (params: BtGuardEntriesRemoveParams) => call<BtGuardEntriesRemoveDto>(METHOD.DAEMON_BT_GUARD_ENTRIES_REMOVE, params),
+    },
+    events: {
+      list: (params: BtGuardEventsListParams) => call<BtGuardEventsListDto>(METHOD.DAEMON_BT_GUARD_EVENTS_LIST, params),
+    },
+    export: (params: BtGuardExportParams) => call<BtGuardExportDto>(METHOD.DAEMON_BT_GUARD_EXPORT, params),
+    /** 立即抓取全部过滤文件订阅（逐个 HTTP 拉取，可能较慢）。 */
+    filterSourcesRefresh: () =>
+      call<BtGuardFilterSourcesRefreshDto>(METHOD.DAEMON_BT_GUARD_FILTER_SOURCES_REFRESH, undefined, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
+    /** 请求立即检查云名单更新；结果经 `BtGuardChanged` 通知。 */
+    cloudRefresh: () => call<Record<string, never>>(METHOD.DAEMON_BT_GUARD_CLOUD_REFRESH),
+  },
 };
+
+/** HighID / LowID 检测与 Kad 引导：最坏约 30 s。 */
+const ED2K_PROBE_TIMEOUT_MS = 60_000;
 
 const ed2k = {
   serverSubscription: {
     refresh: () =>
       call<Ed2kServerSubRefreshResponse>(METHOD.DAEMON_ED2K_SERVER_SUBSCRIPTION_REFRESH, undefined, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
   },
+  nodesSubscription: {
+    refresh: () =>
+      call<Ed2kNodesSubRefreshResponse>(METHOD.DAEMON_ED2K_NODES_SUBSCRIPTION_REFRESH, undefined, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
+  },
+  /** 省略参数 = auto（发 `{}`）。 */
+  idCheck: (params?: Ed2kIdCheckParams) => call<Ed2kNetworkDto>(METHOD.DAEMON_ED2K_ID_CHECK, params ?? {}, { timeoutMs: ED2K_PROBE_TIMEOUT_MS }),
+  kadBootstrap: (params: Ed2kKadBootstrapParams) =>
+    call<Ed2kKadBootstrapDto>(METHOD.DAEMON_ED2K_KAD_BOOTSTRAP, params, { timeoutMs: ED2K_PROBE_TIMEOUT_MS }),
 };
 
 const diagnostics = {

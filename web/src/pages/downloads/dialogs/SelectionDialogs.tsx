@@ -2,18 +2,22 @@
 // 数据来自 `DaemonSnapshot.pendingSelections`（连接 hello 已声明 `client.selections`），
 // 回答用 `daemon.selection.resolve`；服务端 `SelectionResolved` 事件把请求移出快照后对话框自然关闭。
 // 与 GPUI `pages/selection.rs` 对齐：默认选择取 `defaultChoice`，超过 `deadlineUnixMs` 服务端按默认自动决定，
-// HLS 没有取消入口。
+// HLS 没有取消入口。BT 可改名（只在改过时下发 `customName`）；BT 的「取消」按钮 = 连同已暂存数据删除任务
+// （删除撤回选择请求，对话框随之关闭），关闭对话框（Esc / 关闭按钮）仍答复 `cancelled` 暂停任务。
 
 import { ChevronDown, ChevronRight } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useT } from '../../../i18n'
-import { rpc, useTasks } from '../../../lib/rpc'
+import { hasSelectionDeadline, rpc, useAgent, useTasks } from '../../../lib/rpc'
 import type { BtFileDto, HlsQualityOptionDto, ResolveVariantOptionDto, SelectionKind, SelectionOutcome, SelectionRequestDto } from '../../../lib/rpc'
-import { Button, Checkbox, Dialog, DialogFooter, FieldHint, Icon, Input } from '../../../ui'
+import { SAVE_DIR_HISTORY_ENABLED_PREF, SAVE_DIR_HISTORY_PREF, readSaveDirHistory, saveDirChoices } from '../../../lib/saveDirHistory'
+import { Button, Checkbox, Dialog, DialogFooter, FieldHint, FormField, Icon, Input } from '../../../ui'
 import { toastRpcError } from '../../../lib/rpcToast'
 import { cn } from '../../../lib/cn'
 import { formatBytes, useNow } from './utils'
 import { PluginChoiceDialog } from './PluginChoiceDialog'
+import { SaveDirCombo } from './SaveDirCombo'
+import { btSelectionCanConfirm, btSelectionName, btSelectionSaveDir } from './btSelection'
 
 type ChoiceKind = Exclude<SelectionKind, { type: 'fileExists' | 'plugin' }>
 
@@ -38,7 +42,9 @@ function defaultIndex(request: SelectionRequestDto, kind: 'hls' | 'variant', fir
 function SelectionDialog({ request, kind }: { request: SelectionRequestDto; kind: ChoiceKind }) {
   const t = useT()
   const tasks = useTasks()
-  const now = useNow(1000)
+  const hasDeadline = hasSelectionDeadline(request)
+  // 无截止（用户关闭了自动选择默认项）时不显示倒计时，也不必每秒重绘文件列表。
+  const now = useNow(hasDeadline ? 1000 : null)
   const [submitting, setSubmitting] = useState(false)
   const [hlsIndex, setHlsIndex] = useState(() => defaultIndex(request, 'hls', kind.type === 'hls' ? (kind.options[0]?.index ?? 0) : 0))
   const [variantIndex, setVariantIndex] = useState(() => defaultIndex(request, 'variant', kind.type === 'variant' ? (kind.options[0]?.index ?? 0) : 0))
@@ -47,27 +53,44 @@ function SelectionDialog({ request, kind }: { request: SelectionRequestDto; kind
     if (choice.kind === 'bt' && choice.indices.length > 0) return new Set(choice.indices)
     return new Set(kind.type === 'bt' ? kind.files.map((file) => file.index) : [])
   })
+  const btPrefill = kind.type === 'bt' ? (kind.saveDir ?? '') : ''
+  const [btSaveDir, setBtSaveDir] = useState(btPrefill)
+  const historyEnabled = useAgent((snapshot) => snapshot.preferences.values[SAVE_DIR_HISTORY_ENABLED_PREF] !== false, true)
+  const historyValue = useAgent((snapshot) => snapshot.preferences.values[SAVE_DIR_HISTORY_PREF], undefined)
+  const saveDirHistory = useMemo(() => (historyEnabled ? readSaveDirHistory(historyValue) : []), [historyEnabled, historyValue])
 
   const task = tasks.find((item) => item.taskId === request.taskId)
   const taskName = task?.fileName || task?.originUrl || task?.url || ''
-  const remaining = Math.max(0, Math.floor((request.deadlineUnixMs - now) / 1000))
+  // 名称预填任务当前名称（与 GPUI 一致）；下发只比对该预填。
+  const btNamePrefill = task?.fileName ?? ''
+  const [btName, setBtName] = useState(btNamePrefill)
+  const remaining = hasDeadline ? Math.max(0, Math.floor((request.deadlineUnixMs - now) / 1000)) : null
   const cancellable = kind.type !== 'hls'
 
-  const resolve = async (next: SelectionOutcome) => {
+  const submit = async (call: () => Promise<unknown>) => {
     if (submitting) return
     setSubmitting(true)
     try {
-      await rpc.daemon.selection.resolve({ requestId: request.requestId, outcome: next })
+      await call()
     } catch (error) {
       toastRpcError(error)
       setSubmitting(false)
     }
   }
 
+  const resolve = (next: SelectionOutcome) => submit(() => rpc.daemon.selection.resolve({ requestId: request.requestId, outcome: next }))
+
+  // BT 的取消即放弃这个任务：连同已暂存的数据一起删除，不留暂停项。
+  const cancel = () => (kind.type === 'bt' ? submit(() => rpc.daemon.task.delete({ taskId: request.taskId, deleteFiles: true })) : resolve({ kind: 'cancelled' }))
+
   const confirm = () => {
     if (kind.type === 'hls') void resolve({ kind: 'hls', index: hlsIndex })
     else if (kind.type === 'variant') void resolve({ kind: 'variant', index: variantIndex })
-    else void resolve({ kind: 'bt', indices: [...btSelected].sort((a, b) => a - b) })
+    else {
+      const saveDir = btSelectionSaveDir(btPrefill, btSaveDir)
+      const customName = btSelectionName(btNamePrefill, btName)
+      void resolve({ kind: 'bt', indices: [...btSelected].sort((a, b) => a - b), ...(saveDir ? { saveDir } : {}), ...(customName ? { customName } : {}) })
+    }
   }
 
   let title: string
@@ -86,7 +109,7 @@ function SelectionDialog({ request, kind }: { request: SelectionRequestDto; kind
   // BT：`indices` 为空数组在协议里表示「全部文件」，所以没有勾选时必须禁用确认。
   const btSize = kind.type === 'bt' ? kind.files.filter((file) => btSelected.has(file.index)).reduce((sum, file) => sum + Math.max(0, file.size), 0) : 0
   const confirmLabel = kind.type === 'bt' ? t('btFileSelectConfirm', { count: btSelected.size, size: formatBytes(btSize) }) : t('confirm')
-  const canConfirm = kind.type !== 'bt' || btSelected.size > 0
+  const canConfirm = kind.type !== 'bt' || btSelectionCanConfirm(btPrefill, btSaveDir, btSelected.size)
 
   return (
     <Dialog
@@ -100,10 +123,10 @@ function SelectionDialog({ request, kind }: { request: SelectionRequestDto; kind
       description={taskName ? `${description} · ${taskName}` : description}
       footer={
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <FieldHint className="tabular">{t('selectionAutoDefaultIn', { seconds: remaining })}</FieldHint>
+          {remaining === null ? <span /> : <FieldHint className="tabular">{t('selectionAutoDefaultIn', { seconds: remaining })}</FieldHint>}
           <DialogFooter className="ml-auto">
             {cancellable ? (
-              <Button variant="outline" disabled={submitting} onClick={() => void resolve({ kind: 'cancelled' })}>
+              <Button variant="outline" disabled={submitting} onClick={() => void cancel()}>
                 {t('cancel')}
               </Button>
             ) : null}
@@ -119,7 +142,22 @@ function SelectionDialog({ request, kind }: { request: SelectionRequestDto; kind
       ) : kind.type === 'variant' ? (
         <VariantOptions options={kind.options} value={variantIndex} onChange={setVariantIndex} />
       ) : (
-        <BtFiles files={kind.files} selected={btSelected} onSelectedChange={setBtSelected} />
+        <div className="flex flex-col gap-3">
+          <FormField label={t('btFileColumnName')} htmlFor="bt-selection-name">
+            <Input id="bt-selection-name" value={btName} onChange={(event) => setBtName(event.target.value)} />
+          </FormField>
+          <FormField label={t('saveDir')} htmlFor="bt-selection-save-dir">
+            <SaveDirCombo
+              id="bt-selection-save-dir"
+              value={btSaveDir}
+              placeholder={t('selectSaveDir')}
+              choices={saveDirChoices([], saveDirHistory, btSaveDir)}
+              label={t('saveDirRecent')}
+              onChange={setBtSaveDir}
+            />
+          </FormField>
+          <BtFiles files={kind.files} selected={btSelected} onSelectedChange={setBtSelected} />
+        </div>
       )}
     </Dialog>
   )

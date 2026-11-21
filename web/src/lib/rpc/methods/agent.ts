@@ -43,6 +43,9 @@ import type {
   CloudReferralRecordsResult,
   CloudReferralSummary,
   CloudReferralValidateResult,
+  InstalledPlugin,
+  PrivatePluginInstallRequest,
+  PrivatePluginListDto,
   PluginFavoriteResultDto,
   PluginFavoriteSetRequest,
   PluginFavoritesDto,
@@ -256,6 +259,16 @@ const pluginFavorite = {
     call<PluginFavoriteResultDto>(METHOD.AGENT_PLUGIN_FAVORITE_SET, params),
 };
 
+/** 慢调用：agent 取票据 → 拉包 → 校验 → daemon 安装，与 `daemon.plugin.marketInstall` 同量级。 */
+const PRIVATE_INSTALL_TIMEOUT_MS = 120_000;
+
+/** FluxCloud 私有插件商店：目录（未登录 `signedIn=false`）与安装。 */
+const privatePlugin = {
+  list: () => call<PrivatePluginListDto>(METHOD.AGENT_PRIVATE_PLUGIN_LIST),
+  install: (params: PrivatePluginInstallRequest) =>
+    call<InstalledPlugin>(METHOD.AGENT_PRIVATE_PLUGIN_INSTALL, params, { timeoutMs: PRIVATE_INSTALL_TIMEOUT_MS }),
+};
+
 const capture = {
   submit: (params: CaptureSubmitParams) =>
     call<CaptureSubmitResult>(METHOD.AGENT_CAPTURE_SUBMIT, params),
@@ -291,7 +304,7 @@ const update = {
 };
 
 const power = {
-  /** 完成后关机；无活跃任务时被拒绝（invalidArgument）。 */
+  /** One-shot completion or low-speed power action; lowSpeed requires download work and allows 30 seconds to cancel. */
   arm: (params: PowerArmParams) => call<PowerArmResult>(METHOD.AGENT_POWER_ARM, params),
   disarm: () => call<OkResult>(METHOD.AGENT_POWER_DISARM),
 };
@@ -324,12 +337,17 @@ const cloudNotify = {
     call<OkResult>(METHOD.AGENT_CLOUD_NOTIFY_VERIFY_EMAIL, params),
 };
 
+
 // 桌面集成：在 agent 所在主机上打开 / 定位任务产物。仅当本连接的 hello 带
 // `agent.openTaskFiles` 能力时可用（见 downloads/model/actions.ts）；否则 agent 返回 Unsupported。
+// `copyTaskFiles` 另需 `agent.copyTaskFiles` 能力。
 const platform = {
   openTask: (params: { taskId: string }) => call<OkResult>(METHOD.AGENT_PLATFORM_OPEN_TASK, params),
   revealTask: (params: { taskId: string }) =>
     call<OkResult>(METHOD.AGENT_PLATFORM_REVEAL_TASK, params),
+  /** 产物整体写入主机剪贴板；任一产物不在磁盘上 → `notFound`，不写半份。 */
+  copyTaskFiles: (params: { taskIds: string[] }) =>
+    call<OkResult>(METHOD.AGENT_PLATFORM_COPY_TASK_FILES, params),
 };
 
 export const agent = {
@@ -346,6 +364,7 @@ export const agent = {
   order,
   referral,
   pluginFavorite,
+  privatePlugin,
   capture,
   diagnostics,
   update,

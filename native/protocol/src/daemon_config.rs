@@ -45,8 +45,20 @@ pub const FILE_MISSING_ACTIONS: &[&str] = &["keep", "delete"];
 pub const BT_SEED_LIMIT_OPERATORS: &[&str] = &["or", "and"];
 pub const BT_SEED_THEN_ACTIONS: &[&str] = &["stop", "delete", "delete_files"];
 pub const BT_MSE_MODES: &[&str] = &["disabled", "enabled", "forced"];
+/// 新建 BT 任务的默认选片方式：最稀有优先 / 按顺序下载。
+pub const BT_PIECE_ORDERS: &[&str] = &["rarest", "sequential"];
+/// uTP 拥塞控制：LEDBAT（延迟敏感，主动给其他流量让路，BEP 29 的标准算法）/ CUBIC（只按丢包退让）。
+pub const BT_UTP_CONGESTIONS: &[&str] = &["ledbat", "cubic"];
+/// BT 代理来源：「代理」页的手动代理服务器 / 系统代理（建 BT 会话时检测）。
+pub const BT_PROXY_SOURCES: &[&str] = &["manual", "system"];
+/// BT 防吸血规则 / 云名单的执行模式。
+pub const BT_GUARD_MODES: &[&str] = &["off", "observe", "enforce"];
+/// BT 防吸血：下载中任务的动作上限。
+pub const BT_GUARD_DOWNLOADING_ACTIONS: &[&str] = &["observe", "throttle", "choke", "ban"];
 pub const PROXY_MODES: &[&str] = &["none", "system", "manual", "auto"];
 pub const PROXY_TYPES: &[&str] = &["http", "https", "socks4", "socks5"];
+/// 文件哈希算法（`hash_algorithm`、`daemon.task.hash`、任务 `fileHash` 的 `algo`）。
+pub const HASH_ALGORITHMS: &[&str] = &["md5", "sha1", "sha256", "sha512"];
 
 /// 单任务连接（线程）数上限：设置、队列默认值与新建任务共用；
 /// 与引擎 `segment_coordinator::MAX_SEGMENTS` 保持一致。
@@ -135,6 +147,13 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
     ),
     // 空闲（无活动/排队任务）时是否仍执行周期性文件跟踪扫描；默认关闭以免唤醒 NAS 硬盘。
     field("idle_file_scan", DaemonConfigKind::Bool, "false"),
+    // 下载完成后计算落盘文件的哈希（单文件产物；已由校验和校验得到哈希的任务不重复计算）。
+    field("hash_after_download", DaemonConfigKind::Bool, "false"),
+    field(
+        "hash_algorithm",
+        DaemonConfigKind::Enum(HASH_ALGORITHMS),
+        "sha256",
+    ),
     field("global_user_agent", DaemonConfigKind::Text, ""),
     field("default_queue_id", DaemonConfigKind::Text, ""),
     field("domain_conn_caps", DaemonConfigKind::ReadOnly, ""),
@@ -164,7 +183,79 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
         DaemonConfigKind::Enum(BT_MSE_MODES),
         "enabled",
     ),
+    // 每个种子同时上传给多少个对端（上传槽）：0 = 自动（按上传速率伸缩，至少 4 个）。
+    // 上限 = 引擎每个种子的 peer 上限（`bt_downloader.rs::BT_PEER_LIMIT`），再大没有意义。
+    // 设备本地：合适的槽数取决于本机上行带宽，不进云同步目录。
+    field(
+        "bt_upload_slots",
+        DaemonConfigKind::Integer { min: 0, max: 512 },
+        "0",
+    ),
+    // ── BT 连接（全部设备本地：取决于本机网络环境，不进云同步目录）──
+    // 本地节点发现（LSD，局域网多播）。
+    field("bt_enable_lsd", DaemonConfigKind::Bool, "true"),
+    field(
+        "bt_utp_congestion",
+        DaemonConfigKind::Enum(BT_UTP_CONGESTIONS),
+        "ledbat",
+    ),
+    // 全部 BT 任务合计的连接数上限（连接中 + 已连接）：0 = 不限。热生效，不重建会话。
+    field(
+        "bt_max_connections",
+        DaemonConfigKind::Integer {
+            min: 0,
+            max: 65_535,
+        },
+        "0",
+    ),
+    // 每个任务的连接数上限（连接中 + 已连接）。热生效，不重建会话。
+    field(
+        "bt_max_connections_per_torrent",
+        DaemonConfigKind::Integer { min: 1, max: 4096 },
+        "512",
+    ),
+    // HTTP 源（BEP 19 webseed）：种子 / 磁力自带的 HTTP 下载地址。
+    field("bt_enable_webseed", DaemonConfigKind::Bool, "true"),
+    // tracker 汇报策略（BEP 12，对齐 qBittorrent 的两项高级设置）：都关 = 逐层失败转移。
+    field("bt_announce_all_tiers", DaemonConfigKind::Bool, "true"),
+    field("bt_announce_all_trackers", DaemonConfigKind::Bool, "true"),
+    // BT 经代理出站（SOCKS5 / SOCKS4 / HTTP）；默认直连。`bt_proxy_source` 选代理来源：
+    // 「代理」页的手动代理服务器，或建 BT 会话时检测到的系统代理。
+    // `bt_proxy_peers` 关闭时只有 tracker 走代理，对端连接直连。
+    field("bt_proxy_enabled", DaemonConfigKind::Bool, "false"),
+    field(
+        "bt_proxy_source",
+        DaemonConfigKind::Enum(BT_PROXY_SOURCES),
+        "manual",
+    ),
+    field("bt_proxy_peers", DaemonConfigKind::Bool, "true"),
+    // I2P（经本机 I2P 路由的 SAM 桥）。`bt_i2p_mixed` = I2P 种子同时允许明网对端。
+    field("bt_i2p_enabled", DaemonConfigKind::Bool, "false"),
+    field("bt_i2p_sam_host", DaemonConfigKind::Text, "127.0.0.1"),
+    field(
+        "bt_i2p_sam_port",
+        DaemonConfigKind::Integer {
+            min: 1,
+            max: 65_535,
+        },
+        "7656",
+    ),
+    field("bt_i2p_mixed", DaemonConfigKind::Bool, "false"),
     field("bt_custom_trackers", DaemonConfigKind::Text, ""),
+    // 新建 BT 任务的默认选片方式与「先下载首尾文件块」；只作用于此后新建的任务，
+    // 单个任务经 `daemon.task.setPiecePicking` 修改。
+    field(
+        "bt_piece_order",
+        DaemonConfigKind::Enum(BT_PIECE_ORDERS),
+        "rarest",
+    ),
+    field(
+        "bt_first_last_pieces_first",
+        DaemonConfigKind::Bool,
+        "false",
+    ),
+    // 「选择要下载的文件」对话框 60 秒无人答复时按默认（全部文件）开始；关闭后一直等用户选择。
+    field("bt_selection_auto_default", DaemonConfigKind::Bool, "true"),
     field("bt_tracker_sub_enabled", DaemonConfigKind::Bool, "true"),
     field("bt_tracker_sub_urls", DaemonConfigKind::Text, ""),
     field("bt_tracker_sub_cache", DaemonConfigKind::ReadOnly, ""),
@@ -225,6 +316,96 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
         DaemonConfigKind::Enum(BT_SEED_THEN_ACTIONS),
         "stop",
     ),
+    // ── BT 防吸血（全部热更新，不重建 BT 会话）──
+    field("bt_guard_enabled", DaemonConfigKind::Bool, "true"),
+    field(
+        "bt_guard_rule_excessive",
+        DaemonConfigKind::Enum(BT_GUARD_MODES),
+        "observe",
+    ),
+    field(
+        "bt_guard_rule_rerequest",
+        DaemonConfigKind::Enum(BT_GUARD_MODES),
+        "observe",
+    ),
+    field(
+        "bt_guard_rule_rewind",
+        DaemonConfigKind::Enum(BT_GUARD_MODES),
+        "observe",
+    ),
+    field(
+        "bt_guard_rule_lag",
+        DaemonConfigKind::Enum(BT_GUARD_MODES),
+        "observe",
+    ),
+    // 名字规则默认直接执行；其余检测规则默认仅观察。
+    field(
+        "bt_guard_rule_fingerprint",
+        DaemonConfigKind::Enum(BT_GUARD_MODES),
+        "enforce",
+    ),
+    field(
+        "bt_guard_cloud_mode",
+        DaemonConfigKind::Enum(BT_GUARD_MODES),
+        "observe",
+    ),
+    field(
+        "bt_guard_excess_ratio_pct",
+        DaemonConfigKind::Integer {
+            min: 110,
+            max: 2000,
+        },
+        "200",
+    ),
+    field(
+        "bt_guard_min_torrent_mib",
+        DaemonConfigKind::Integer {
+            min: 0,
+            max: 1_048_576,
+        },
+        "64",
+    ),
+    field(
+        "bt_guard_rewind_tolerance_pct",
+        DaemonConfigKind::Integer { min: 0, max: 100 },
+        "7",
+    ),
+    field(
+        "bt_guard_throttle_kib",
+        DaemonConfigKind::Integer {
+            min: 1,
+            max: 1_048_576,
+        },
+        "32",
+    ),
+    field(
+        "bt_guard_ban_base_hours",
+        DaemonConfigKind::Integer { min: 1, max: 720 },
+        "24",
+    ),
+    field(
+        "bt_guard_ban_max_days",
+        DaemonConfigKind::Integer { min: 1, max: 365 },
+        "30",
+    ),
+    field(
+        "bt_guard_downloading_max_action",
+        DaemonConfigKind::Enum(BT_GUARD_DOWNLOADING_ACTIONS),
+        "throttle",
+    ),
+    field("bt_guard_skip_private", DaemonConfigKind::Bool, "true"),
+    field("bt_guard_skip_lan", DaemonConfigKind::Bool, "true"),
+    field(
+        "bt_guard_ipv6_prefix",
+        DaemonConfigKind::Integer { min: 48, max: 128 },
+        "64",
+    ),
+    field("bt_guard_filter_urls", DaemonConfigKind::Text, ""),
+    // 本机名字规则：JSON 数组（顺序即优先级），元素形态同云名单 `clientRules`。
+    field("bt_guard_client_rules", DaemonConfigKind::Text, ""),
+    field("bt_guard_cloud_enabled", DaemonConfigKind::Bool, "true"),
+    // 设备本地（不进云同步）：是否向 FluxCloud 上报命中规则的对端证据。
+    field("bt_guard_report_enabled", DaemonConfigKind::Bool, "false"),
     // ── ED2K ──
     field("ed2k_enable_kad", DaemonConfigKind::Bool, "true"),
     field("ed2k_enable_upnp", DaemonConfigKind::Bool, "true"),
@@ -245,7 +426,10 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
         DaemonConfigKind::ReadOnly,
         "0",
     ),
+    // Kad 引导节点订阅：每行一个 nodes.dat 地址，多源合并去重。
     field("ed2k_nodes_dat_url", DaemonConfigKind::Text, ""),
+    field("ed2k_nodes_dat_count", DaemonConfigKind::ReadOnly, "0"),
+    field("ed2k_nodes_dat_updated_at", DaemonConfigKind::ReadOnly, "0"),
     // ── 代理 ──
     field("proxy_mode", DaemonConfigKind::Enum(PROXY_MODES), "none"),
     field("proxy_type", DaemonConfigKind::Enum(PROXY_TYPES), "http"),
@@ -254,12 +438,14 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
     field("proxy_username", DaemonConfigKind::Text, ""),
     field("proxy_password", DaemonConfigKind::Text, ""),
     field("proxy_no_list", DaemonConfigKind::Text, ""),
+    // 站点代理规则：JSON 数组（顺序即优先级），模型见 `crate::proxy_rules`。
+    field("proxy_rules", DaemonConfigKind::Text, ""),
     // ── Webhook ──
     field("webhook.endpoints", DaemonConfigKind::Text, ""),
     // ── 受管组件手动路径（空 = 自动解析）──
     field("component.ffmpeg.path", DaemonConfigKind::Text, ""),
     field("component.ytdlp.path", DaemonConfigKind::Text, ""),
-    // 组件下载镜像基址（空 = 直连 GitHub）；只接受 https。
+    // 组件下载与插件市场（索引 / 插件包）的 GitHub 镜像基址（空 = 直连 GitHub）；只接受 https。
     field("component_mirror_base", DaemonConfigKind::Text, ""),
     // ── 日志 ──
     // 日志目录总大小上限（MB），daemon 启动与每次配置提交后应用到引擎 logger。
@@ -530,5 +716,79 @@ mod tests {
         );
         assert!(normalize_daemon_config_value("log_max_size_mb", "0").is_err());
         assert!(normalize_daemon_config_value("log_max_size_mb", "1025").is_err());
+    }
+
+    #[test]
+    fn bt_guard_keys_have_contract_ranges_and_defaults() {
+        let ok = |k: &str, v: &str| normalize_daemon_config_value(k, v).is_ok();
+        for (key, lo, hi) in [
+            ("bt_guard_excess_ratio_pct", 110, 2000),
+            ("bt_guard_min_torrent_mib", 0, 1_048_576),
+            ("bt_guard_rewind_tolerance_pct", 0, 100),
+            ("bt_guard_throttle_kib", 1, 1_048_576),
+            ("bt_guard_ban_base_hours", 1, 720),
+            ("bt_guard_ban_max_days", 1, 365),
+            ("bt_guard_ipv6_prefix", 48, 128),
+        ] {
+            assert!(ok(key, &lo.to_string()), "{key} min");
+            assert!(ok(key, &hi.to_string()), "{key} max");
+            assert!(!ok(key, &(lo - 1).to_string()), "{key} below min");
+            assert!(!ok(key, &(hi + 1).to_string()), "{key} above max");
+            assert!(!ok(key, "abc"), "{key} non-numeric");
+        }
+        for (key, default) in [
+            ("bt_guard_enabled", "true"),
+            ("bt_guard_rule_excessive", "observe"),
+            ("bt_guard_rule_rerequest", "observe"),
+            ("bt_guard_rule_rewind", "observe"),
+            ("bt_guard_rule_lag", "observe"),
+            ("bt_guard_rule_fingerprint", "enforce"),
+            ("bt_guard_cloud_mode", "observe"),
+            ("bt_guard_excess_ratio_pct", "200"),
+            ("bt_guard_min_torrent_mib", "64"),
+            ("bt_guard_rewind_tolerance_pct", "7"),
+            ("bt_guard_throttle_kib", "32"),
+            ("bt_guard_ban_base_hours", "24"),
+            ("bt_guard_ban_max_days", "30"),
+            ("bt_guard_downloading_max_action", "throttle"),
+            ("bt_guard_skip_private", "true"),
+            ("bt_guard_skip_lan", "true"),
+            ("bt_guard_ipv6_prefix", "64"),
+            ("bt_guard_filter_urls", ""),
+            ("bt_guard_client_rules", ""),
+            ("bt_guard_cloud_enabled", "true"),
+            ("bt_guard_report_enabled", "false"),
+        ] {
+            assert_eq!(daemon_config_default(key), default, "{key}");
+        }
+    }
+
+    #[test]
+    fn bt_guard_enums_are_validated() {
+        for mode in ["off", "observe", "enforce"] {
+            assert_eq!(
+                normalize_daemon_config_value("bt_guard_rule_lag", &format!(" {mode} ")).as_deref(),
+                Ok(mode)
+            );
+            assert!(normalize_daemon_config_value("bt_guard_cloud_mode", mode).is_ok());
+        }
+        assert!(normalize_daemon_config_value("bt_guard_rule_lag", "ban").is_err());
+        assert!(normalize_daemon_config_value("bt_guard_cloud_mode", "").is_err());
+        for action in ["observe", "throttle", "choke", "ban"] {
+            assert!(
+                normalize_daemon_config_value("bt_guard_downloading_max_action", action).is_ok()
+            );
+        }
+        assert!(normalize_daemon_config_value("bt_guard_downloading_max_action", "off").is_err());
+        assert!(is_public_daemon_config_key("bt_guard_filter_urls"));
+    }
+
+    #[test]
+    fn bt_guard_report_flag_is_device_local() {
+        assert!(
+            crate::settings::SYNC_SETTING_SPECS
+                .iter()
+                .all(|spec| spec.storage_key != "bt_guard_report_enabled")
+        );
     }
 }

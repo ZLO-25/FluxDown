@@ -38,7 +38,9 @@ import { sawNetworkRequest } from "./request-cache";
 import { fallbackAfterSendFailure, sendToFluxDown } from "./sender";
 import { getCachedProfiles, getCachedSettings, peekCachedProfiles, peekCachedSettings } from "./settings-cache";
 import { loadServiceWorkerScopes, peekServiceWorkerScopes } from "./sw-scopes";
+import { getTabPageUrl, whenRestored } from "./tab-state";
 import { logError, logWarn } from "@/utils/error-log";
+import { hasDownloadsApi } from "@/utils/platform";
 
 // 响应头缓存 —— 当 HTTP 响应指示"这是一个下载"时，缓存其元数据
 // 这是第三层兜底拦截的关键数据来源
@@ -53,6 +55,22 @@ export interface ResponseDownloadInfo {
   ts: number;
 }
 export const responseDownloadCache = new Map<string, ResponseDownloadInfo>();
+
+/**
+ * 发起下载导航的标签页当前页面 URL，只供站点配置（never / always）判定。
+ * 跨域 CDN 下载在来源站 `Referrer-Policy: same-origin`（Nexus Mods 等）时没有 referrer，
+ * downloadItem.referrer 为空；tab-state 记录的页面 URL 不受该策略影响。
+ * 不得当 Referer 发给引擎。
+ */
+function sourcePageUrlOf(urls: readonly (string | undefined)[]): string | undefined {
+  for (const u of urls) {
+    const tabId = u ? responseDownloadCache.get(u)?.tabId : undefined;
+    if (tabId === undefined || tabId < 0) continue;
+    const pageUrl = getTabPageUrl(tabId);
+    if (pageUrl) return pageUrl;
+  }
+  return undefined;
+}
 
 /** 下载 URL 的主机名（TLD 先验）；非法 URL 返回 undefined。 */
 export function urlHost(url: string): string | undefined {
@@ -167,8 +185,10 @@ function isBrowserOnly(urls: readonly (string | undefined)[], scopes: ServiceWor
 }
 
 // Firefox 不支持 onDeterminingFilename，兜底层是唯一拦截路径，
-// 需要更长等待让浏览器填充 downloadItem 元数据
-const hasDeterminingFilename = !!browser.downloads.onDeterminingFilename;
+// 需要更长等待让浏览器填充 downloadItem 元数据。
+// Firefox for Android 连 downloads 命名空间都没有：只剩 webRequest blocking 一条拦截路径。
+const downloadsApi = hasDownloadsApi() ? browser.downloads : undefined;
+const hasDeterminingFilename = !!downloadsApi?.onDeterminingFilename;
 
 // ──────────────────────────────────────────────────────────────
 // 弱网可靠性：统一等待元数据就绪
@@ -364,6 +384,7 @@ async function handleResponseCacheHit(
         rc.contentType,
       ) || undefined,
     referrerUrl: originalItem.referrer || undefined,
+    pageUrl: getTabPageUrl(rc.tabId) || undefined,
   };
 
   const intercept = shouldIntercept(itemInfo, settings, await getCachedProfiles());
@@ -504,6 +525,7 @@ async function executeFallbackIntercept(
         mimeType: itemInfo.mime,
         originalUrl,
         origin: "intercept",
+        downloadId,
       })
     ).success;
   } catch (e) {
@@ -583,9 +605,16 @@ const handleDeterminingFilename: DeterminingFilenameListener = (
       (cached && cached.fileSize > 0 ? cached.fileSize : undefined) ??
       -1;
     const filename = downloadItem.filename || cached?.filename || undefined;
-    const referrer = cached?.referrer || undefined;
+    const referrer = downloadItem.referrer || cached?.referrer || undefined;
     return {
-      itemInfo: { url, fileSize, mime, filename, referrerUrl: referrer },
+      itemInfo: {
+        url,
+        fileSize,
+        mime,
+        filename,
+        referrerUrl: referrer,
+        pageUrl: sourcePageUrlOf([url, downloadUrl]),
+      },
       referrer,
     };
   };
@@ -639,6 +668,7 @@ const handleDeterminingFilename: DeterminingFilenameListener = (
           // for request headers and captured form transactions.
           originalUrl: downloadUrl !== url ? url : undefined,
           origin: manual ? undefined : "intercept",
+          downloadId: downloadItem.id,
           channel: manual?.channel,
         })
       ).success;
@@ -674,6 +704,8 @@ const handleDeterminingFilename: DeterminingFilenameListener = (
 
   const resolveWithLoadedSettings = async () => {
     try {
+      // 冷启动：tab-state 快照恢复前页面 URL 为空
+      await whenRestored();
       const settings = await getCachedSettings();
       if (
         !settings.enabled ||
@@ -1012,6 +1044,7 @@ const onDownloadHeadersBlocking = (
     mime: contentType || undefined,
     filename: dispositionFilename || undefined,
     referrerUrl: referrer,
+    pageUrl: getTabPageUrl(details.tabId) || undefined,
   };
   if (!shouldIntercept(itemInfo, settings, profiles)) return undefined;
 
@@ -1145,12 +1178,12 @@ const blockingHeadersEvent = browser.webRequest.onHeadersReceived as unknown as 
 export function setInterceptListenersActive(active: boolean): void {
   if (active === interceptListenersActive) return;
   interceptListenersActive = active;
-  if (browser.downloads.onDeterminingFilename) {
-    if (active) browser.downloads.onDeterminingFilename.addListener(handleDeterminingFilename);
-    else browser.downloads.onDeterminingFilename.removeListener(handleDeterminingFilename);
+  if (downloadsApi?.onDeterminingFilename) {
+    if (active) downloadsApi.onDeterminingFilename.addListener(handleDeterminingFilename);
+    else downloadsApi.onDeterminingFilename.removeListener(handleDeterminingFilename);
   }
-  if (active) browser.downloads.onCreated.addListener(handleDownloadCreated);
-  else browser.downloads.onCreated.removeListener(handleDownloadCreated);
+  if (active) downloadsApi?.onCreated.addListener(handleDownloadCreated);
+  else downloadsApi?.onCreated.removeListener(handleDownloadCreated);
   if (!hasDeterminingFilename) {
     try {
       if (active) {
@@ -1170,6 +1203,11 @@ export function setInterceptListenersActive(active: boolean): void {
 /** 同步注册拦截监听；由 startBackground 调用一次。 */
 export function installIntercept(): void {
   setInterceptListenersActive(true);
+}
+
+/** 拦截监听当前是否挂着（总开关关闭时已整体摘除）。 */
+export function isInterceptActive(): boolean {
+  return interceptListenersActive;
 }
 
 /**

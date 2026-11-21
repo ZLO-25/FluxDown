@@ -5,14 +5,16 @@ import { STATE_RANK } from './task'
 import type { DownloadTaskView, TaskState } from './task'
 
 export const VIEW_PREFS_KEY = 'desktop.downloads.view'
+/** 设备本地偏好（缺省关，GPUI 与 Web 共用）：下载列表 / 详情副标题不展示来源站点（对应 GPUI `HIDE_TASK_SOURCE_PREF`）。 */
+export const HIDE_TASK_SOURCE_PREF = 'ui.hide_task_source'
 
 export type ViewDensity = 'comfortable' | 'compact' | 'relaxed'
-export type ViewGroupBy = 'none' | 'status' | 'date' | 'type' | 'queue' | 'site'
+export type ViewGroupBy = 'none' | 'status' | 'date' | 'type' | 'queue' | 'site' | 'directory'
 export type ViewSortKey = 'smart' | 'created' | 'name' | 'size' | 'progress' | 'speed' | 'status'
 export type SortDir = 'asc' | 'desc'
 export type DetailPlacement = 'bottom' | 'right'
 
-export const GROUP_BY_OPTIONS: readonly ViewGroupBy[] = ['none', 'status', 'date', 'type', 'queue', 'site']
+export const GROUP_BY_OPTIONS: readonly ViewGroupBy[] = ['none', 'status', 'date', 'type', 'queue', 'site', 'directory']
 export const SORT_KEY_OPTIONS: readonly ViewSortKey[] = ['smart', 'created', 'name', 'size', 'progress', 'speed', 'status']
 
 export type ColumnKind =
@@ -64,7 +66,8 @@ const DEFAULT_WIDTH: Record<ColumnKind, number> = {
   speed: 90,
   eta: 84,
   status: 140,
-  created: 150,
+  // `YYYY-MM-DD HH:MM:SS` + 左右内边距；与 GPUI `DownloadColumnKind` 对齐。
+  created: 164,
   protocol: 64,
   source: 148,
   queue: 88,
@@ -77,7 +80,7 @@ export const MIN_WIDTH: Record<ColumnKind, number> = {
   speed: 72,
   eta: 64,
   status: 84,
-  created: 140,
+  created: 152,
   protocol: 56,
   source: 96,
   queue: 72,
@@ -85,9 +88,6 @@ export const MIN_WIDTH: Record<ColumnKind, number> = {
 
 export const MAX_COLUMN_WIDTH = 480
 export const FILE_NAME_MAX_WIDTH = 1600
-
-/** 数字列：单元格与表头右对齐。 */
-export const NUMERIC_COLUMNS = new Set<ColumnKind>(['size', 'speed', 'eta', 'created'])
 
 /** 点击表头切换到的排序键（「智能排序」不对应任何列）；「状态」列按状态优先级排序。 */
 export const COLUMN_SORT_KEY: Partial<Record<ColumnKind, ViewSortKey>> = {
@@ -105,8 +105,12 @@ export interface ColumnPref {
   width: number
 }
 
+/** 任务表表头文字对齐（视图菜单 › 显示）；默认左对齐，单元格内容对齐不受影响。 */
+export type HeaderAlign = 'left' | 'center' | 'right'
+
 export interface ViewPrefs {
   density: ViewDensity
+  header_align: HeaderAlign
   group_by: ViewGroupBy
   sort_key: ViewSortKey
   sort_dir: SortDir
@@ -132,6 +136,7 @@ export const DETAIL_SIZE_RANGE: Record<DetailPlacement, readonly [number, number
 export function defaultViewPrefs(): ViewPrefs {
   return {
     density: 'comfortable',
+    header_align: 'left',
     group_by: 'none',
     sort_key: 'smart',
     sort_dir: 'desc',
@@ -177,6 +182,7 @@ export function parseViewPrefs(value: unknown): ViewPrefs {
     : []
   return {
     density: oneOf(['comfortable', 'compact', 'relaxed'], json.density, defaults.density),
+    header_align: oneOf(['left', 'center', 'right'], json.header_align, defaults.header_align),
     group_by: oneOf(GROUP_BY_OPTIONS, json.group_by, defaults.group_by),
     sort_key: oneOf(SORT_KEY_OPTIONS, json.sort_key, defaults.sort_key),
     sort_dir: oneOf(['asc', 'desc'], json.sort_dir, defaults.sort_dir),
@@ -414,6 +420,6 @@ export const stateGroupKey = (state: TaskState): string => state
 export function matchesQuery(view: DownloadTaskView, query: string): boolean {
   if (query === '') return true
   // 三个字段以换行拼接（搜索框是单行输入，查询词里不会有换行，不会跨字段误命中）。
-  if (view.searchFold === '') view.searchFold = `${view.nameFold}\n${view.url.toLowerCase()}\n${view.site.toLowerCase()}`
+  if (view.searchFold === '') view.searchFold = `${view.nameFold}\n${view.url.toLowerCase()}\n${view.site.toLowerCase()}\n${(view.dto?.properties?.tags ?? []).join('\n').toLowerCase()}`
   return view.searchFold.includes(query)
 }

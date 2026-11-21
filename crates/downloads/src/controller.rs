@@ -14,7 +14,7 @@ use fluxdown_protocol::{
 };
 
 use crate::model::{
-    CategoryIndex, DownloadTaskView, TaskStore,
+    CategoryIndex, DownloadTaskView, TaskState, TaskStore,
     devices::{DeviceEntry, local_device_id, other_devices},
     file_conflict::FileConflictSet,
     group_tree::{GroupAggregate, GroupMeta},
@@ -22,12 +22,17 @@ use crate::model::{
 
 /// 本机偏好：新建下载对话框上次使用的保存目录（设备本地，不进云同步）。
 pub const LAST_SAVE_DIR_PREF: &str = "download.last_save_dir";
+/// 本机偏好：新建下载分类模式（`auto` / `none` / `category:<id>`；设备本地，不进云同步）。
+pub(crate) const LAST_CATEGORY_MODE_PREF: &str = "download.last_category_mode";
 /// 偏好：新建下载默认沿用上次保存目录。
 pub const REMEMBER_LAST_SAVE_DIR_PREF: &str = "download.remember_last_save_dir";
 /// 本机偏好：新建下载保存目录历史（字符串数组，最新在前；设备本地，不进云同步）。
 pub const SAVE_DIR_HISTORY_PREF: &str = "download.save_dir_history";
 /// 本机偏好：是否记录并在新建下载中列出保存目录历史（缺省开启；设备本地）。
 pub const SAVE_DIR_HISTORY_ENABLED_PREF: &str = "download.save_dir_history_enabled";
+/// 本机偏好：按分类记住的手动保存目录（`{分类 id: 字符串数组}`，最新在前；设备本地，不进云
+/// 同步，与保存目录历史共用开关与清空）。
+pub const CATEGORY_SAVE_DIR_HISTORY_PREF: &str = "download.category_save_dir_history";
 /// 本机偏好：下载限速最近自定义值（KB/s 整数数组，最新在前；设备本地，不进云同步）。
 pub const SPEED_LIMIT_RECENT_PREF: &str = "download.speed_limit_recent_kbps";
 /// 本机偏好：上传限速最近自定义值（KB/s 整数数组，最新在前；设备本地，不进云同步）。
@@ -35,6 +40,9 @@ pub const UPLOAD_LIMIT_RECENT_PREF: &str = "download.upload_limit_recent_kbps";
 /// 本机偏好：新建下载「下载到」上次选择的目标（`local` / `cloud:<id>` / `link:<fp>`），
 /// 设备本地，不进云同步。
 pub const LAST_DOWNLOAD_TARGET_PREF: &str = "download.last_target";
+/// 本机偏好：新建下载「下载到」是否恢复上次的目标设备（缺省关闭 = 总是默认本机；设备
+/// 本地，不进云同步）。
+pub const REMEMBER_LAST_TARGET_PREF: &str = "download.remember_last_target";
 
 pub type PortFuture<T> =
     Pin<Box<dyn Future<Output = Result<T, fluxdown_protocol::RpcErrorData>> + Send + 'static>>;
@@ -98,6 +106,31 @@ pub enum DownloadsCommand {
     TaskActivity(TaskActivityQuery),
     /// 读取 daemon 持久化的任务全生命周期速度曲线与统计（`daemon.task.speedHistory`）。
     TaskSpeedHistory(fluxdown_protocol::TaskSpeedHistoryQuery),
+    /// 读取 BT 任务的 peer / tracker 实况（`daemon.task.btStatus`），详情页轮询。
+    BtStatus(fluxdown_protocol::DaemonBtStatusParams),
+    /// 读取 eD2K 任务的来源 / 服务器 / Kad / 本机网络实况（`daemon.task.ed2kStatus`），详情页轮询。
+    Ed2kStatus(fluxdown_protocol::DaemonEd2kStatusParams),
+    /// eD2K HighID / LowID 检测（`daemon.ed2k.idCheck`，慢方法），结果为
+    /// [`DownloadsResult::Ed2kNetwork`]。
+    Ed2kIdCheck,
+    /// 防吸血：给 IP 组加封禁 / 限速 / 加白条目（`daemon.bt.guard.entries.add`），连接页右键菜单用。
+    BtGuardAddEntry(fluxdown_protocol::BtGuardEntriesAddParams),
+    /// 防吸血「封禁此客户端」：基于最新 `bt_guard_client_rules` 追加
+    /// `clientName contains <value> → ban`（见 [`crate::append_ban_client_rule`]），冲突时重取重放。
+    /// 结果为 [`DownloadsResult::Value`]：`true` 新增、`false` 已有同名规则。
+    BtGuardBanClient {
+        value: String,
+    },
+    /// 防吸血「查看证据」：读取该 IP 组相关的名单条目与近期事件。
+    BtGuardEvidence {
+        ip_group: String,
+    },
+    /// Unified task properties editor snapshot.
+    TaskEditInfo {
+        task_id: String,
+    },
+    /// Save changed properties in one optimistic transaction.
+    EditTask(Box<fluxdown_protocol::EditTaskParams>),
     Create(Box<fluxdown_protocol::DaemonCreateTaskParams>),
     /// 批量建任务（`daemon.task.createMany`）：整块一个事务、按 `batch_id` 幂等，
     /// 结果不确定时可原样重发。
@@ -118,15 +151,63 @@ pub enum DownloadsCommand {
         task_id: String,
         url: String,
     },
+    /// 修改任务代理（`daemon.task.setProxy`）；活跃任务由引擎静默重连。
+    SetProxy {
+        task_id: String,
+        proxy_url: String,
+    },
     /// 修改线程数（`daemon.task.setSegments`）：`<= 0` = 自动，已下进度保留；
-    /// 下载中任务由引擎静默暂停 → 改配置 → 恢复。
+    /// 下载中任务由引擎静默暂停 → 改配置 → 恢复（eD2K 任务不暂停，直接热生效）。
     SetSegments {
         task_id: String,
         segments: i32,
     },
+    /// 修改 BT 任务选片（`daemon.task.setPiecePicking`）：缺省字段保持不变。
+    /// 每个任务一次调用；不存在或非 BT 返回 `notFound`。
+    SetPiecePicking {
+        task_id: String,
+        sequential: Option<bool>,
+        first_last_pieces_first: Option<bool>,
+    },
     /// 已完成 BT 任务的完整性校验（`daemon.task.verify`，慢方法）：结果为
     /// [`DownloadsResult::TaskVerify`]；同一任务校验在途时为 `conflict`。
     VerifyTask {
+        task_id: String,
+    },
+    /// 已完成任务的文件哈希（`daemon.task.hash`，慢方法）：结果为
+    /// [`DownloadsResult::TaskHash`]；同一任务计算在途时为 `conflict`。
+    HashTask {
+        task_id: String,
+        algorithm: String,
+    },
+    /// BT 任务的分享材料（`daemon.task.torrentShare`）：结果为
+    /// [`DownloadsResult::TorrentShare`]。
+    TorrentShare {
+        task_id: String,
+        include_torrent: bool,
+    },
+    /// BT 任务文件表（`daemon.task.btFiles`），详情「文件」页签轮询；结果为
+    /// [`DownloadsResult::BtFiles`]。
+    BtFiles {
+        task_id: String,
+    },
+    /// 部分更新 BT 文件优先级（`daemon.task.setFilePriorities`）：已完成为 `taskStateConflict`，
+    /// 会导致没有文件要下载为 `invalidArgument`。
+    SetFilePriorities(fluxdown_protocol::SetTaskFilePrioritiesParams),
+    /// 改种子内单个文件的相对路径（`daemon.task.renameBtFile`）。
+    RenameBtFile(fluxdown_protocol::RenameBtFileParams),
+    /// 未完成 BT 任务丢弃进度、按磁盘数据全量重新校验（`daemon.task.recheck`）。
+    RecheckTask {
+        task_id: String,
+    },
+    /// 把 BT 任务数据移到新的保存目录（`daemon.task.moveStorage`，慢方法）。
+    MoveStorage(fluxdown_protocol::MoveTaskStorageParams),
+    /// 任务级 BT 限速（`daemon.task.setBtLimits`）：缺省字段不变，`0` = 不限。
+    SetBtLimits(fluxdown_protocol::SetTaskBtLimitsParams),
+    /// 超级做种开关（`daemon.task.setSuperSeeding`）。
+    SetSuperSeeding(fluxdown_protocol::SetTaskSuperSeedingParams),
+    /// 立即向 tracker 重新汇报（`daemon.task.reannounce`）；不在运行为 `taskStateConflict`。
+    Reannounce {
         task_id: String,
     },
     Delete {
@@ -237,6 +318,11 @@ pub enum DownloadsCommand {
     RevealTask {
         task_id: String,
     },
+    /// 把已完成任务的产物以文件形式写入系统剪贴板（`agent.platform.copyTaskFiles`，可在文件管理器
+    /// 里粘贴）；任一产物已不在磁盘上即整体失败（`notFound`）。
+    CopyTaskFiles {
+        task_ids: Vec<String>,
+    },
     /// 重扫已完成任务的产物是否仍在下载目录（`daemon.task.rescan`，结果经
     /// `fileMissingChanged` 事件回流）。
     RescanFiles,
@@ -251,6 +337,12 @@ pub enum DownloadsCommand {
         queue_id: Option<String>,
         start_paused: Option<bool>,
     },
+    /// 本机做种（`daemon.task.seedLocal`，慢方法：无现成种子时 daemon 要为数据做哈希）：
+    /// 把 daemon 主机上已有的文件 / 文件夹登记为已完成 BT 任务并开始做种。结果为
+    /// [`fluxdown_protocol::SeedLocalResultDto`]（`DownloadsResult::Value`；`duplicate` 为真时未新建任务，
+    /// `taskId` 是已持有同 info hash 的现有任务；`createOnly` 时只写出 `torrentPath`、`taskId` 为空）；
+    /// 路径 / 种子不匹配或 BT 被禁用为 `invalidArgument`。提交类命令，失败后不自动重试。
+    SeedLocal(Box<fluxdown_protocol::DaemonSeedLocalParams>),
     /// 系统文件管理器为该文件显示的图标（`agent.platform.fileIcon`，结果为 PNG）。
     FileIcon(fluxdown_protocol::PlatformFileIconParams),
     /// 设备本地偏好写入（`sync:false`，不进云同步）。
@@ -282,16 +374,48 @@ impl DownloadsCommand {
 pub enum DownloadsResult {
     Unit,
     Value(serde_json::Value),
+    TaskEditInfo(Box<fluxdown_protocol::TaskEditSnapshot>),
     TaskActivity(TaskActivityPage),
     /// 无记录（从未下载或已重新下载重置）时为 `None`。
     TaskSpeedHistory(Option<fluxdown_protocol::TaskSpeedHistoryDto>),
-    Preview(fluxdown_protocol::ResolvePreviewResponse),
+    /// `BtStatus` 的 peer / tracker 实况。
+    BtStatus(fluxdown_protocol::BtStatusDto),
+    /// `BtFiles` 的文件表。
+    BtFiles(fluxdown_protocol::BtFilesDto),
+    /// `Ed2kStatus` 的 eD2K 实况（体积大，装箱保持结果枚举小）。
+    Ed2kStatus(Box<fluxdown_protocol::Ed2kStatusDto>),
+    /// `Ed2kIdCheck` 的本机网络状态。
+    Ed2kNetwork(fluxdown_protocol::Ed2kNetworkDto),
+    /// `BtGuardEvidence` 的名单条目与事件。
+    BtGuardEvidence(BtGuardEvidence),
+    /// Rare, metadata-heavy payload stays boxed so every command result remains small.
+    Preview(Box<fluxdown_protocol::ResolvePreviewResponse>),
     /// `FileIcon` 的 PNG 字节。
     FileIcon(Vec<u8>),
     /// `CreateMany` 的逐条结果（与请求条目同序）。
     CreateMany(fluxdown_protocol::DaemonCreateTasksResult),
     /// `VerifyTask` 的校验报告。
     TaskVerify(fluxdown_protocol::TaskVerifyResult),
+    /// `HashTask` 写入的文件哈希（`algo=hex`）。
+    TaskHash(fluxdown_protocol::TaskHashResult),
+    /// `TorrentShare` 的磁力链接与（按需）已解码的 `.torrent` 字节。
+    TorrentShare(TorrentShare),
+}
+
+/// [`DownloadsResult::TorrentShare`] 载荷。
+pub struct TorrentShare {
+    pub name: String,
+    pub magnet: String,
+    /// `.torrent` 文件内容；未请求或纯磁力任务（库里没有种子字节）为 `None`。
+    pub torrent: Option<Vec<u8>>,
+}
+
+/// [`DownloadsResult::BtGuardEvidence`] 载荷：宿主按 IP 组精确查询得到的条目（覆盖该 IP 的
+/// 全部名单层）与事件（该 IP 组的事件），UI 直接展示，不再客户端筛选。
+#[derive(Clone, Debug, Default)]
+pub struct BtGuardEvidence {
+    pub entries: Vec<fluxdown_protocol::BtGuardEntryDto>,
+    pub events: Vec<fluxdown_protocol::BtGuardEventDto>,
 }
 
 impl DownloadsResult {
@@ -616,6 +740,20 @@ impl DownloadsController {
         self.store.pausable_count() > 0
     }
 
+    pub(crate) fn retry_failed_commands(&self) -> Vec<DownloadsCommand> {
+        if self.is_stale() || self.tables_loading() {
+            return Vec::new();
+        }
+        self.store
+            .local()
+            .iter()
+            .filter(|row| row.state == TaskState::Failed)
+            .map(|row| DownloadsCommand::Resume {
+                task_id: row.key.task_id().to_owned(),
+            })
+            .collect()
+    }
+
     /// 状态栏「全部开始」的作用对象：与引擎 `eligible_resume_task_ids` 同判定——
     /// 已暂停（status 2）且所在队列运行中；队列不在快照里（孤儿）视作运行中；
     /// 另含用户停止做种（status 3、seeding_status 4）且产物仍在的任务（不受队列约束）。
@@ -679,6 +817,12 @@ impl DownloadsController {
         self.preference(key)
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(default)
+    }
+
+    /// 设置「隐藏任务来源」是否开启。
+    #[must_use]
+    pub(crate) fn hide_task_source(&self) -> bool {
+        self.preference_bool(crate::model::view_prefs::HIDE_TASK_SOURCE_PREF, false)
     }
 
     pub fn execute(&self, command: DownloadsCommand) -> PortFuture<DownloadsResult> {
@@ -1467,6 +1611,63 @@ mod tests {
             assert_eq!(runtime.segments.len(), 1);
             assert_eq!(runtime.active_transfers, Some(0));
         }
+    }
+
+    #[test]
+    fn retry_failed_targets_only_local_failures_and_tracks_readiness() {
+        let mut controller = DownloadsController::new(Arc::new(NullPort));
+        controller.stale = false;
+        let mut failed = task("failed");
+        failed.status = 4;
+        let mut rows = vec![failed.clone()];
+        for (id, status) in [
+            ("waiting", 0),
+            ("running", 1),
+            ("paused", 2),
+            ("completed", 3),
+            ("preparing", 5),
+        ] {
+            let mut row = task(id);
+            row.status = status;
+            rows.push(row);
+        }
+        controller.apply_daemon_event(&DaemonEvent::Engine(WsServerMsg::TasksSnapshot {
+            tasks: rows,
+        }));
+        let mut remote = controller.store.local()[0].clone();
+        remote.key = crate::model::RowKey::Remote("remote-failed".into());
+        remote.source = crate::model::TaskSource::Remote;
+        controller.store.replace_remote(vec![remote]);
+        let retry_ids = |controller: &DownloadsController| {
+            controller
+                .retry_failed_commands()
+                .into_iter()
+                .map(|command| match command {
+                    DownloadsCommand::Resume { task_id } => task_id,
+                    _ => panic!("retry must use the existing local resume operation"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(retry_ids(&controller), ["failed"]);
+        assert_eq!(controller.store.failed_count(), 1);
+        controller.store.set_loading(Some(6));
+        assert!(retry_ids(&controller).is_empty());
+        controller.store.set_loading(None);
+        controller.stale = true;
+        assert!(retry_ids(&controller).is_empty());
+        controller.stale = false;
+        failed.status = 1;
+        controller.apply_daemon_event(&DaemonEvent::TaskChanged(failed.clone()));
+        assert_eq!(controller.store.failed_count(), 0);
+        assert!(retry_ids(&controller).is_empty());
+        failed.status = 4;
+        controller.apply_daemon_event(&DaemonEvent::TaskChanged(failed));
+        assert_eq!(retry_ids(&controller), ["failed"]);
+        controller.apply_daemon_event(&DaemonEvent::Engine(WsServerMsg::TasksSnapshot {
+            tasks: Vec::new(),
+        }));
+        assert_eq!(controller.store.failed_count(), 0);
+        assert!(retry_ids(&controller).is_empty());
     }
 
     #[test]

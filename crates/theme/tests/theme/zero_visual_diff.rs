@@ -13,31 +13,29 @@ use gpui::{FontWeight, Hsla, Rgba, px, rgb};
 
 mod legacy {
     use fluxdown_ui_theme::{
-        ColorTokens, RadiusTokens, SemanticThemeTokens, ShadowTokens, SpacingTokens,
-        TextStyleToken, TypographyTokens,
+        ColorTokens, SemanticThemeTokens, ShadowTokens, TextStyleToken, TypographyTokens,
     };
     use gpui::{FontWeight, Hsla, Rgba, px, rgb};
 
     pub fn semantic_tokens(colors: ColorTokens) -> SemanticThemeTokens {
-        SemanticThemeTokens {
-            colors,
-            radius: RadiusTokens::default(),
-            spacing: SpacingTokens::default(),
-            typography: TypographyTokens {
-                sm: TextStyleToken {
-                    size: px(13.),
-                    line_height: px(18.),
-                    weight: FontWeight::NORMAL,
-                },
-                ..TypographyTokens::default()
-            },
-            shadow: ShadowTokens::elevations(Hsla {
-                h: 0.,
-                s: 0.,
-                l: 0.,
-                a: 46.0 / 255.0,
-            }),
-        }
+        let mut typography = TypographyTokens::default();
+        typography.sm = {
+            let mut style = TextStyleToken::default();
+            style.size = px(13.);
+            style.line_height = px(18.);
+            style.weight = FontWeight::NORMAL;
+            style
+        };
+        let mut tokens = SemanticThemeTokens::default();
+        tokens.colors = colors;
+        tokens.typography = typography;
+        tokens.shadow = ShadowTokens::elevations(Hsla {
+            h: 0.,
+            s: 0.,
+            l: 0.,
+            a: 46.0 / 255.0,
+        });
+        tokens
     }
 
     fn luminance(value: Hsla) -> f32 {
@@ -213,9 +211,13 @@ fn legacy_tokens(id: BuiltinThemeId, accent: Hsla, scale: f32) -> SemanticThemeT
     tokens
 }
 
+/// 旧版运行时只有调色板预设；石墨等带整套形状 / 密度的预设不在对比范围内。
 #[test]
 fn builtin_runtime_tokens_equal_legacy_for_every_preset_accent_and_scale() {
-    for id in BuiltinThemeId::ALL {
+    for id in BuiltinThemeId::ALL
+        .into_iter()
+        .filter(|id| !matches!(id, BuiltinThemeId::Graphite | BuiltinThemeId::GraphiteLight))
+    {
         for scheme in AccentScheme::ALL {
             let accent = scheme.color(0xFFFA_FAFA);
             for scale in [0.8, 1., 1.5] {
@@ -353,56 +355,54 @@ fn default_colors(mode: ThemeMode) -> ColorTokens {
 
 #[test]
 fn default_light_colors_match_flutter_tokens() {
-    assert_eq!(
-        default_colors(ThemeMode::Light),
-        ColorTokens {
-            background: color(0xF8F9FA),
-            foreground: color(0x09090B),
-            surface: color(0xFFFFFF),
-            surface_foreground: color(0x09090B),
-            primary: color(0x3B82F6),
-            primary_foreground: color(0xFFFFFF),
-            secondary: color(0xF1F3F5),
-            secondary_foreground: color(0x09090B),
-            muted: color(0xF1F3F5),
-            muted_foreground: color(0x71717A),
-            accent: color_with_alpha(0x3B82F6, 26.0 / 255.0),
-            accent_foreground: color(0x3B82F6),
-            destructive: color(0xEF4444),
-            destructive_foreground: color(0xFFFFFF),
-            border: color(0xE4E4E7),
-            input: color(0xE4E4E7),
-            ring: color(0x3B82F6),
-            selection: color_with_alpha(0x3B82F6, 0.3),
-        }
-    );
+    assert_eq!(default_colors(ThemeMode::Light), {
+        let mut expected = ColorTokens::default();
+        expected.background = color(0xF8F9FA);
+        expected.foreground = color(0x09090B);
+        expected.surface = color(0xFFFFFF);
+        expected.surface_foreground = color(0x09090B);
+        expected.primary = color(0x3B82F6);
+        expected.primary_foreground = color(0xFFFFFF);
+        expected.secondary = color(0xF1F3F5);
+        expected.secondary_foreground = color(0x09090B);
+        expected.muted = color(0xF1F3F5);
+        expected.muted_foreground = color(0x71717A);
+        expected.accent = color_with_alpha(0x3B82F6, 26.0 / 255.0);
+        expected.accent_foreground = color(0x3B82F6);
+        expected.destructive = color(0xEF4444);
+        expected.destructive_foreground = color(0xFFFFFF);
+        expected.border = color(0xE4E4E7);
+        expected.input = color(0xE4E4E7);
+        expected.ring = color(0x3B82F6);
+        expected.selection = color_with_alpha(0x3B82F6, 0.3);
+        expected
+    });
 }
 
 #[test]
 fn default_dark_colors_match_flutter_tokens() {
-    assert_eq!(
-        default_colors(ThemeMode::Dark),
-        ColorTokens {
-            background: color(0x1C1C1E),
-            foreground: color(0xF5F5F7),
-            surface: color(0x2C2C2E),
-            surface_foreground: color(0xF5F5F7),
-            primary: color(0x3B82F6),
-            primary_foreground: color(0xFFFFFF),
-            secondary: color(0x3A3A3C),
-            secondary_foreground: color(0xF5F5F7),
-            muted: color(0x3A3A3C),
-            muted_foreground: color(0xA1A1A6),
-            accent: color_with_alpha(0x3B82F6, 46.0 / 255.0),
-            accent_foreground: color(0x3B82F6),
-            destructive: color(0xEF4444),
-            destructive_foreground: color(0xFFFFFF),
-            border: color(0x48484A),
-            input: color(0x48484A),
-            ring: color(0x3B82F6),
-            selection: color_with_alpha(0x3B82F6, 0.3),
-        }
-    );
+    assert_eq!(default_colors(ThemeMode::Dark), {
+        let mut expected = ColorTokens::default();
+        expected.background = color(0x1C1C1E);
+        expected.foreground = color(0xF5F5F7);
+        expected.surface = color(0x2C2C2E);
+        expected.surface_foreground = color(0xF5F5F7);
+        expected.primary = color(0x3B82F6);
+        expected.primary_foreground = color(0xFFFFFF);
+        expected.secondary = color(0x3A3A3C);
+        expected.secondary_foreground = color(0xF5F5F7);
+        expected.muted = color(0x3A3A3C);
+        expected.muted_foreground = color(0xA1A1A6);
+        expected.accent = color_with_alpha(0x3B82F6, 46.0 / 255.0);
+        expected.accent_foreground = color(0x3B82F6);
+        expected.destructive = color(0xEF4444);
+        expected.destructive_foreground = color(0xFFFFFF);
+        expected.border = color(0x48484A);
+        expected.input = color(0x48484A);
+        expected.ring = color(0x3B82F6);
+        expected.selection = color_with_alpha(0x3B82F6, 0.3);
+        expected
+    });
 }
 
 #[test]

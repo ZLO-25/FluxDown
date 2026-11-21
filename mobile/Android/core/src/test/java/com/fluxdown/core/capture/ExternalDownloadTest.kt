@@ -42,6 +42,23 @@ class ExternalDownloadTest {
         assertNull(ExternalIntake.fromView(null))
     }
 
+    @Test fun extensionIntentExtrasCarryFileNameAndHeaders() {
+        val d = ExternalIntake.fromView(
+            "https://cdn.test/a.zip",
+            userAgent = "UA/extra",
+            fileName = "  报告 v2;final.zip ",
+            headersJson = """{"user-agent":"UA/json","Authorization":"Bearer x"}""",
+        )!!
+        assertEquals("报告 v2;final.zip", d.fileName)
+        // 请求头里已有 User-Agent（不区分大小写）时不再用 extra 覆盖或重复。
+        assertEquals(mapOf("user-agent" to "UA/json", "Authorization" to "Bearer x"), d.headers)
+
+        val noUaInJson = ExternalIntake.fromView("magnet:?xt=urn:btih:abc", userAgent = "UA/1", headersJson = """{"X-T":"1"}""")!!
+        assertEquals(mapOf("X-T" to "1", "User-Agent" to "UA/1"), noUaInJson.headers)
+        // 损坏的请求头 JSON 整体丢弃，不影响其余字段。
+        assertEquals(mapOf("User-Agent" to "UA/1"), ExternalIntake.fromView("https://h.test/x", userAgent = "UA/1", headersJson = "{oops")!!.headers)
+    }
+
     // ── fluxdown://download 协议 ──
 
     @Test fun protocolDecodesQueryParameters() {
@@ -129,7 +146,7 @@ class ExternalDownloadTest {
             "download.remember_last_save_dir" to true,
             "download.last_save_dir" to " /last ",
         )
-        // 跟随上次 > 主机默认；分类目录不再在 Kotlin 侧决定，offeredSaveDir 交给 Rust 路由
+        // 目录仍按跟随上次 > 默认优先；分类开关开启（缺省）才交由 Rust 路由。
         val withCategories = SilentCapture.plan(video, state(remembered + ("custom_categories" to categories)))!!.request
         assertEquals("/last", withCategories.saveDir)
         assertEquals("/last", withCategories.offeredSaveDir)
@@ -137,6 +154,12 @@ class ExternalDownloadTest {
         val fallback = SilentCapture.plan(video, state(remembered - "download.remember_last_save_dir"))!!.request
         assertEquals("/dl", fallback.saveDir)
         assertEquals("/dl", fallback.offeredSaveDir)
+        val disabled = SilentCapture.plan(video, state(remembered + (SilentCapture.AUTO_CATEGORY_PREF to false)))!!.request
+        assertEquals("/last", disabled.saveDir)
+        assertNull(disabled.offeredSaveDir)
+        val defaultOnly = SilentCapture.plan(video, state(remembered + (SilentCapture.AUTO_CATEGORY_PREF to false) - "download.remember_last_save_dir"))!!.request
+        assertEquals("/dl", defaultOnly.saveDir)
+        assertNull(defaultOnly.offeredSaveDir)
         // 一个目录都算不出：退回确认弹层
         assertNull(SilentCapture.plan(video, state(mapOf(SilentCapture.SILENT_PREF to true), config = emptyMap())))
     }

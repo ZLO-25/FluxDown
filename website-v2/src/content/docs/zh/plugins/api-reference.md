@@ -3,7 +3,7 @@ title: 插件 API 参考
 description: 全部入口函数、flux.* 接口、JavaScript 运行环境、运行时限制，以及插件会遇到的错误信息。
 section: plugins
 order: 11
-sourceHash: "d901816ec8e5"
+sourceHash: "e868448f5533"
 ---
 
 本页列出插件脚本能看到的一切：FluxDown 会调用的入口函数、注入的 `flux` 对象、JavaScript 运行环境、运行时限制，以及开发中会遇到的错误信息。这是一份参考手册；分步教程请看[你的第一个插件](/docs/zh/plugins/your-first-plugin/)、[TypeScript 项目](/docs/zh/plugins/typescript-project/)、[事件钩子指南](/docs/zh/plugins/hooks-guide/)、[账号登录指南](/docs/zh/plugins/auth-guide/)、[订阅源指南](/docs/zh/plugins/subscription-guide/)、[可移植界面指南](/docs/zh/plugins/ui-guide/)和[桌面原生界面指南](/docs/zh/plugins/desktop-ui-guide/)。
@@ -28,6 +28,21 @@ sourceHash: "d901816ec8e5"
 | [`authenticate(ctx)`](#authenticatectx) | 宿主驱动一次登录动作（`begin` / `poll` / `cancel` / `logout` / `status`）。 | `auth.entry` + 权限 `auth` | `auth.entry` | [`AuthResult`](#authenticatectx) 对象 |
 | [`subscribe(ctx)`](#subscribectx) | 属于你的 provider 的订阅源被刷新。 | `subscriptions[0]` | `subscriptions[0].entry` | 规范化的订阅内容对象 |
 | [`main`](#main-常驻脚本) | daemon（或某个视图）激活你的常驻脚本。 | `main` | `main.entry` | —（用于注册处理器） |
+| [`archive(ctx)`](#archivectx) | 授权默认保存目录的任务进入路由时调用，不要求命中分类规则。 | `contributes.archive` + 权限 `archive` | `contributes.archive` 指定的 `.js` 文件 | `{ category }`、`{ directories }`、旧格式 `{ folderName }` 或 `null` |
+
+这是一个纯本地回调，可依据已知文件名、可选来源元数据，以及完成时由宿主有界识别的内容事实分类；不解析 URL，也不访问文件或网络。宿主会对使用授权默认保存目录的任务调用它，不依赖普通分类规则是否命中。用户明确指定保存目录时跳过；eD2K 任务不会移动。BT 任务仅在首次完成时恰有一个实际选中的非 padding 文件才可归档，包括多文件种子中只选了一个文件。完成前不预测目标目录。回调沿用原有上下文契约，使用实际选中文件名、`isGroup: false` 和从该最终文件识别的内容。每次调用使用新的 QuickJS 运行时，可读取 `flux.settings`，但没有 `flux.fetch`、文件系统、任务或进程接口。此上下文要求宿主 0.6.5 或匹配的开发宿主，不代表版本已发布。
+
+`ctx` 形如 `{ fileName, metadata?, isGroup?, phase, createdDate, detectedType?, categoryRouting? }`。`categoryRouting: true` 表示支持按分类路由；旧宿主会省略它。使用分类结果的插件必须显式检查此能力，并在缺失时拒绝（例如返回 `null`）。`fileName` 是已知的最终文件名；`metadata` 是可选来源元数据（`platform`、`mediaKind`（`""`、`"series"` 或 `"post"`）、`creatorId`、`creatorName`、`seriesId`、`seriesTitle`、`collectionId`、`collectionTitle`）。每个标签最多 180 UTF-8 字节，且不得含控制字符。来源元数据与内容事实不同。回调不会收到文件字节、本地路径、URL、请求头或凭据。
+
+`phase` 为下载前的 `"start"` 或后处理完成后的 `"complete"`。`createdDate` 是任务固定的 UTC 创建日期（`YYYY-MM-DD`）；无效的旧时间戳为空字符串，绝不会改用今天。存在 `detectedType` 时，内容事实仅为宿主观察到的 `{ kind, mime, extension }`。`kind` 为 `archive`、`audio`、`compressed`、`database`、`diagram`、`disk`、`document`、`ebook`、`executable`、`font`、`formula`、`geospatial`、`image`、`metadata`、`model`、`other`、`package`、`playlist`、`presentation`、`rom`、`spreadsheet`、`subtitle`、`video` 之一。未知类型或识别不可用时省略该字段；不把服务器提供的 MIME 当作证据。
+
+符合条件的文件在开始时调用，并在完成时重新调用，即使开始阶段已有目录选择。完成阶段检查最终处理后的产物，成功结果可替换缓存的开始目录；返回 `null`、非法结果或错误会保留之前有效的选择。插件可以在普通文件的开始阶段返回 `null`，等完成阶段依据内容作决定。任务组只在开始时对组根路由（`isGroup: true`），没有 `detectedType`，也不会读取内容。
+
+任务组在组根路由一次，成员路径与文件名保持不变。返回 `null` / `undefined` 表示不改变目录；也可返回 `{ category: "audio" }`，路由到已配置的内置分类保存目录。稳定标识符为 `video`、`audio`、`document`、`image`、`program`、`archive`、`other`。宿主依据提交时的分类配置快照，解析到可见分类配置的保存目录；分类改名不改变其稳定标识符（`builtinType`）。分类缺失、隐藏或没有保存目录时宿主会拒绝移动；不会推断自定义分类。分类结果与 `directories`、`folderName` 互斥；也可返回 `{ directories: ["视频", "哔哩哔哩", "创作者", "合集"] }`，每项是一个安全路径分量，最多 8 层，且相对任务获准使用的默认保存目录，而非分类目录。旧 `{ folderName: "The Expanse" }` 保持原有分类子目录语义。显式目录绕过自动分类解析。空值或不安全输出会被忽略（fail-open），不会使任务失败。每阶段多个插件按 identity 排序，首个有效结果生效。符合条件的 BT 单文件选择会经 BT 存储迁移移动整个任务根目录并恢复做种，保留种子相对路径、文件名与边界块。多选、显式目录、识别不可用、回调错误或移动冲突均留在当前目录；首次完成时消费选择，之后改选、做种或重启都不再路由。完成后的异步移动可能使文件短暂位于原位置，随后由位置变更事件更新；不新增侧栏分类。显式目录绕过归档。
+
+分类结果仅接受于已完成的非组文件。宿主会拒绝开始阶段和任务组的 `{ category }`；组路由仍支持 `{ directories }` 和旧格式 `{ folderName }`。
+
+常驻 `main` 脚本可调用 `flux.archiveRules.status()` 查询当前已验证规则包状态，或调用 `flux.archiveRules.update()` 显式请求更新；两者均要求 `archive` 权限及 `contributes.archiveRules` 声明。规则是由固定发布者公钥验证的有界签名 JSON。启用自动更新后每日检查；获取或验证失败会保留最后一份已验证规则，新规则不会重新分类历史文件。
 
 脚本如何运行：
 
@@ -36,7 +51,7 @@ sourceHash: "d901816ec8e5"
 - 文件顶层代码在**每次**调用时、入口之前都会执行。顶层抛出异常会让这次调用以 `脚本编译失败: …` 失败。
 - `resolve`、`authenticate`、`subscribe` 未定义时，调用失败，错误信息含 `入口 resolve 未定义`（`authenticate` / `subscribe` 同理）。**钩子**未定义则被静默跳过。
 - `resolve`、`authenticate`、`subscribe` 的返回值会被 `JSON.stringify` 后交给宿主解析：请直接返回普通对象，不要返回已经序列化的 JSON 字符串（会被二次编码，校验失败）。`undefined`、函数、symbol 会被 `JSON.stringify` 丢弃。
-- 类型化的 `flux.settings`、`flux.info` 和入口参数会在脚本运行前注入。
+- 类型化的 `flux.settings`、`flux.info` 和入口参数会在脚本运行前注入。`archive` 入口只会得到 `flux.settings`、`flux.logger`、`console` 和它的参数（见 [`archive(ctx)`](#archivectx)）。
 
 ### `resolve(ctx)`
 
@@ -75,7 +90,9 @@ sourceHash: "d901816ec8e5"
 | `rangeSupported` | boolean | `true` 表示你保证解析后的主机支持 HTTP Range 请求（例如 googlevideo）。与 `ephemeral` 同时使用时，FluxDown 仍然跳过探测，但会立即规划完整的多段下载，而不是保守的单流起步。默认 `false`：没有探测时，Range 能力由首个响应判断。 |
 | `variants` | array | 多个画质 / 格式选项，见[变体](#变体variants)。 |
 | `defaultVariantIndex` | integer | 默认变体（选择弹窗 60 秒超时、免打扰、无界面运行时使用）。越界回退到 `0`。默认 `0`。 |
-| `manifest` | object | 多文件结果，见[清单结果](#清单结果manifest)。与 `url`、`variants`、`audioUrl` 互斥。 |
+| `manifest` | object | 多文件结果，见[清单结果](#清单结果manifest)，包括其可选根字段 `archiveMetadata`。与 `url`、`variants`、`audioUrl` 互斥。 |
+
+普通 resolve 结果也可在顶层返回 `archiveMetadata`。结果为 manifest 且 resolve 结果与 manifest 根都提供元数据时，以 manifest 的 `archiveMetadata` 为准。
 
 解析之后，FluxDown 会重新检查*解析后*的 URL 来选择协议引擎——resolver 可以返回 HLS 播放列表、磁力链接或 FTP URL，由对应的引擎接手。
 
@@ -118,6 +135,7 @@ sourceHash: "d901816ec8e5"
 ```text
 { name?, items: [{ id, name, path?, size?, kind?, variants?: [{ id, label, size? }] }] }
 ```
+`manifest.archiveMetadata` 是可选的根级来源元数据。resolve 结果与 manifest 根同时提供元数据时，以 manifest 值为准。它仅是来源元数据，不会提取文件内容。
 
 | 字段 | 规则 |
 |---|---|
@@ -271,22 +289,63 @@ flux.timers.setInterval(() => flux.logger.info("tick"), 60000);
 
 ## 各入口里有哪些 `flux` 接口
 
-注入的 `flux` 对象在所有入口中都一样，除非下表另有说明。「权限」指清单的 `permissions` 里必须声明对应项；没声明时该属性是 `undefined`（用 `if (flux.ytdlp)` 判断）。
+注入的 `flux` 对象在所有入口中都一样，除非下表另有说明。`archive` 入口是例外：它运行在最小沙箱里，只有 `flux.settings`、`flux.logger` 和 `console`；下表其余各行在那里都不存在（`flux.info`、`flux.storage`、`flux.fetch`、`flux.fs`、`flux.task`、`flux.ffmpeg`、`flux.ffprobe`、`flux.ytdlp`、`flux.auth`、`flux.ui` / `rpc` 及其余接口，以及任何文件、网络、任务或进程接口）。「权限」指清单的 `permissions` 里必须声明对应项；没声明时该属性是 `undefined`（用 `if (flux.ytdlp)` 判断）。
 
-| 接口 | `resolve` | 钩子（`onDone` 以外） | `onDone` | `authenticate` | `subscribe` | `main` |
-|---|---|---|---|---|---|---|
-| `flux.fetch` | 有 | 有 | 有 | 有 | 有 | 有 |
-| `flux.storage`、`flux.fs` | 有 | 有 | 有 | 有 | 有 | 有 |
-| `flux.settings`、`flux.info`、`flux.logger`、`console` | 有 | 有 | 有 | 有 | 有 | 有 |
-| `flux.auth` | 权限 `auth` | 权限 `auth` | 权限 `auth` | 始终有（入口本身要求 `auth`） | 权限 `auth` | 权限 `auth` |
-| `flux.task.requestRetry` | 无效果（警告） | 仅 `onError` | 无效果 | 无效果 | 无效果 | 无效果 |
-| `flux.task.recordArtifact` | reject | reject | 可用 | reject | reject | reject |
-| `flux.ffmpeg`、`flux.ffprobe` | `undefined` | 权限 `ffmpeg`：对象存在，`run` 会 reject，`ffmpeg.available()` 可用 | 权限 `ffmpeg`，`run` 可用 | `undefined` | `undefined` | 权限 `ffmpeg`：对象存在，`run` 会 reject |
-| `flux.ytdlp` | 权限 `ytdlp` | 权限 `ytdlp` | 权限 `ytdlp` | **`undefined`** | 权限 `ytdlp` | 权限 `ytdlp` |
-| `flux.ui`、`commands`、`rpc`、`events`、`timers`、`settings.update` | — | — | — | — | — | 有 |
-| `flux.tasks` | — | — | — | — | — | 权限 `tasks` |
+| 接口 | `resolve` | 钩子（`onDone` 以外） | `onDone` | `authenticate` | `subscribe` | `main` | `archive` |
+|---|---|---|---|---|---|---|---|
+| `flux.fetch` | 有 | 有 | 有 | 有 | 有 | 有 | **`undefined`** |
+| `flux.storage`、`flux.fs` | 有 | 有 | 有 | 有 | 有 | 有 | **`undefined`** |
+| `flux.settings`、`flux.logger`、`console` | 有 | 有 | 有 | 有 | 有 | 有 | 有 |
+| `flux.info` | 有 | 有 | 有 | 有 | 有 | 有 | **`undefined`** |
+| `flux.auth` | 权限 `auth` | 权限 `auth` | 权限 `auth` | 始终有（入口本身要求 `auth`） | 权限 `auth` | 权限 `auth` | **`undefined`** |
+| `flux.task.requestRetry` | 无效果（警告） | 仅 `onError` | 无效果 | 无效果 | 无效果 | 无效果 | **`undefined`** |
+| `flux.task.recordArtifact` | reject | reject | 可用 | reject | reject | reject | **`undefined`** |
+| `flux.ffmpeg`、`flux.ffprobe` | `undefined` | 权限 `ffmpeg`：对象存在，`run` 会 reject，`ffmpeg.available()` 可用 | 权限 `ffmpeg`，`run` 可用 | `undefined` | `undefined` | 权限 `ffmpeg`：对象存在，`run` 会 reject | `undefined` |
+| `flux.ytdlp` | 权限 `ytdlp` | 权限 `ytdlp` | 权限 `ytdlp` | **`undefined`** | 权限 `ytdlp` | 权限 `ytdlp` | **`undefined`** |
+| `flux.ui`、`commands`、`rpc`、`events`、`timers`、`settings.update` | — | — | — | — | — | 有 | **`undefined`** |
+| `flux.tasks` | — | — | — | — | — | 权限 `tasks` | **`undefined`** |
+| `ctx.images` / `flux.images` | — | — | — | — | — | 仅 `flux.images` | **`undefined`** |
 
 `flux.auth.*` 和 `flux.fetch` 的 `authRef` 选项都需要在 `permissions` 里声明 `auth`；没有该权限却显式传入 `authRef`，`flux.fetch` 会 reject（见[错误](#你会遇到的错误)）。
+
+### 图片加载（仅视图会话）
+
+可移植视图回调中可用 `ctx.images.load(opts)`，请求会绑定到该视图会话。常驻 `main` 脚本也可调用 `flux.images.load({ session: ctx.session, ...opts })`，其中 `session` 使用视图上下文里的会话 ID。两者都返回 `Promise<string>`，内容为小写的 `flux-image:<uuid>` 资源引用。把它作为图片节点的 `src` 使用即可，和现有 PNG/JPEG/WebP data URI 一样；视图协议传递的仍只是短字符串，不会承载图片字节。原有 data URI 图片行为保持不变。
+
+宿主按净化后 PNG 的内容在同一会话内去重：即使 `cache: false` 或来源缓存过期，相同内容也复用同一个引用。禁用缓存仍会重新校验认证并请求源站；不同会话不共享引用。
+
+长时间打开的图集应在图片不再使用后调用 `await ctx.images.release(src)`，或 `await flux.images.release({ session: ctx.session, src })`。必须先移除**所有**用途，包括预加载状态和重复图片节点：相同内容共享同一引用，释放会令该会话中此引用的所有用途失效。重复释放已移除的引用无副作用，不能释放其他会话的资源。宿主不会根据可见性或最近 HTTP 读取时间自动淘汰图片。
+
+`flux-image:` 是 `image.src` 字符串取值的增量扩展，不是新的 RPC 事件或消息结构。旧渲染器不能显示此引用；面向旧客户端时继续使用 data URI。
+
+```jsx
+flux.ui.view("profile", {
+  async init(ctx) {
+    const src = await ctx.images.load({
+      url: "https://images.example.com/avatar.jpg",
+      maxWidth: 256,
+      maxHeight: 256,
+    });
+    return { src };
+  },
+  render: ({ src }) => <image src={src} alt="Profile" />,
+});
+```
+
+图片请求遵循 FluxDown 出站代理/TUN 路由与 SSRF 防护（包括现有的开发模式私有网络例外）；显式配置为可信的代理也与 `flux.fetch` 一样使用。重定向必须仍在获准主机范围内，且不允许从 HTTPS 降级。不会自动推断凭据：只有声明 `auth` 权限时才能传 `authRef`。提供请求头或 `authRef` 时，重定向仅允许同源。声明 `auth` 的插件不缓存图片请求，避免凭据轮换后继续使用旧的认证响应。
+
+`opts` 字段：
+
+| 字段 | 默认值 | 规则 |
+|---|---|---|
+| `url` | — | 必填 HTTP(S) URL，使用 `GET`。主机必须获准；禁止 userinfo 和 HTTPS 降级重定向。 |
+| `headers` | 无 | 可选的字符串请求头。 |
+| `authRef` | 无 | 可选的已保存凭据引用；需要 `auth` 权限。 |
+| `maxWidth`、`maxHeight` | 各 `512` | 1–2048 的整数。宿主保持宽高比且不会放大图片。 |
+| `cache` | `true` | `false` 跳过来源/选项结果复用；图片永不落盘，HTTP 响应始终为 `no-store`。相同输出仍共享引用，直到显式释放或会话关闭。 |
+
+输入格式根据内容识别，只接受 PNG、JPEG、WebP，不信任声明的 Content-Type。输入每边最多 8192 像素、总计最多 1600 万像素，解码内存最多 64 MiB；网络响应体最多 8 MiB，请求最多 10 秒。宿主输出净化后的静态 PNG 缩略图，最多 4 MiB，并以 `image/png` 提供。每个会话最多 128 个资源 / 16 MiB；全局图片资源最多 64 MiB。超过配额会明确报错，不会隐式驱逐引用。缓存的来源/选项结果保留五分钟，但返回引用直到显式释放或会话关闭前有效。视图会话关闭或插件卸载时，其图片资源会释放。以上限制由宿主强制执行。
+所有插件合计最多同时进行四次未命中缓存的图片加载，超出时排队等待，最多三秒后报过载；解码/缩略图处理最多并发两次，等待解码的源图也受加载并发限制。全局资源数量上限为 4096。
 
 ## `flux` 对象
 
@@ -316,13 +375,13 @@ HTTP 客户端。`opts`：
 | 规则 | 值 |
 |---|---|
 | 协议 | 仅 `http` / `https` |
-| 目标地址 | 仅限公网可路由地址。环回、局域网、链路本地、CGNAT、文档 / 基准测试地址段和云元数据 IP 都被拦截——对字面量 URL、DNS 解析结果（因此能防 DNS rebinding）以及每一跳重定向都会检查。用户在应用里配置了代理时，DNS 由代理解析，只有字面量 IP 与重定向检查生效。 |
-| 开发模式例外 | 通过「从目录安装（开发模式）」加载的插件不受上述公网限制，可访问 `localhost`、局域网等地址（直连，不走全局代理），便于连接本机服务联调；正式安装的插件行为不变。 |
+| 目标地址 | 仅限公网可路由地址。环回、局域网、链路本地、CGNAT、文档 / 基准测试地址段和云元数据 IP 都被拦截——对字面量 URL、DNS 解析结果（因此能防 DNS rebinding）以及每一跳重定向都会检查。用户在应用里配置了代理时，DNS 由代理解析，只有字面量 IP 与重定向检查生效。例外：DNS 应答全部落在 198.18.0.0/15（Clash / sing-box 等 TUN 代理的 fake-ip）时按 TUN 隧道放行，由代理软件解析真实目标，此时与配置代理相同，只有字面量 IP 与重定向检查生效。 |
+| 开发模式例外 | 通过「从目录安装（开发模式）」加载的插件不受上述公网限制，可访问 `localhost`、局域网等地址，便于连接本机服务联调。它与其他插件一样遵循代理设置与站点规则，只是环回、局域网私网段与本地域名（`.local`、`.lan`、`.home.arpa`、`.internal`）恒直连；正式安装的插件行为不变。 |
 | 响应体上限 | 8 MB，超出截断 |
 | 单请求超时 | 10 秒 |
 | 并发请求 | 8，所有插件共享 |
 | 最大重定向 | 30 |
-| 代理 | 使用应用的代理配置，取值为引擎启动时的快照（之后修改代理需重启才生效）。 |
+| 代理 | 跟随应用当前的代理设置（修改后下一个请求即生效）。请求 URL 命中站点代理规则时走该规则；其余请求走本次调用的出口：任务自带代理（此时不看站点规则），否则为任务链接命中的规则，再否则为全局模式。**Auto** 模式下调用先走直连（或该站点近期走得通的代理）；若因请求无法连通网络而失败，宿主会经每个候选代理各重跑一次整次调用，随后的下载沿用解析成功时的同一出口。 |
 
 凭据与重定向：真正带上了已存凭据（显式或隐式 `authRef`）的请求，会走更严格的客户端，它**不会跟随到另一个 origin 的重定向**（scheme、主机或端口任一不同）。你会拿到 `3xx` 响应本身（`status`、`headers.location`），由你自己决定是否跟随，从而保证凭据不会跨源泄漏。不带凭据的请求则正常跟随重定向。
 
@@ -524,7 +583,7 @@ FluxDown 替你添加的内容：
 - 始终前置 `--ignore-config`，所以 yt-dlp 自己的任何配置文件都不会被读取。
 - ffmpeg 已安装时，会注入指向解析出的托管 / 系统 ffmpeg 的 `--ffmpeg-location`，使合并（bestvideo+bestaudio）、`-x` 抽取音频、remux 和转码都能工作。插件自己传的 `--ffmpeg-location` 仍会被拒绝；只信任宿主自己的路径。
 - `--cache-dir <工作区>/.cache` 把 yt-dlp 的缓存收进工作区；你自己传的 `--cache-dir`（相对路径）会覆盖它。
-- `--proxy`：用户在应用里配置了代理时，宿主会把它的 `--proxy` 追加在你的参数**之后**，所以用户的代理优先。没有配置代理时，你自己的 `--proxy` 生效。代理取值在引擎启动时读取。
+- `--proxy`：应用为本次调用决定了出口时（配置了代理、命中站点规则、任务自带代理、Auto 改走代理），宿主会把它的 `--proxy` 追加在你的参数**之后**，所以应用的选择优先；规则或任务决定的直连会传 `--proxy ""`。未配置代理（或 Auto 正在尝试直连）时，你自己的 `--proxy` 生效。站点规则按第一个 URL 参数匹配。
 - 子进程会获得完整的 `PATH`（Windows 上包括用户级条目），使 yt-dlp 能找到 Node、Deno 等 JavaScript 运行时。
 
 所有插件合计最多同时运行 2 个 yt-dlp 进程；等待空闲名额的时间不计入脚本的时间预算。超时或取消时每个子进程都会被杀死。
@@ -590,6 +649,7 @@ globalThis.resolve = async (ctx) => {
 | `subscribe` | 默认 10 秒；`subscriptions[0].timeoutMs` 会替换它，上限 30 秒 | 相同 | 64 MB |
 | `authenticate` | 默认 30 秒；`auth.timeoutMs` 会替换它，上限 30 秒 | 相同 | 64 MB |
 | 钩子 | 5 秒 | 5 秒 | 32 MB |
+| `archive` | 5 秒 | 5 秒 | 与 `resolve` 默认值相同（64 MB） |
 | 拥有 `ytdlp` 权限（任何钩子）或拥有 `ffmpeg` 权限（在 `onDone` 中）的插件的钩子 | 约 30 分钟（1830 秒） | 30 秒 | 32 MB |
 | `main`（每次调用：渲染、命令、事件、定时器、rpc） | 30 秒 | 2 秒 | 整个运行时 64 MB |
 
@@ -614,13 +674,14 @@ globalThis.resolve = async (ctx) => {
 
 - `resolve` 和 `subscribe` 共用一个池。其大小跟随应用的并发下载上限（不低于运行时的 worker 数，worker 至多 4 个）。调用最多等待 **3 秒**获取空闲名额，超时则以 `插件运行时过载（并发已满）` 失败（fail-closed，任务进入错误状态）。
 - `authenticate` 有自己的池，容量 **2**，等待同样是 3 秒，所以登录轮询永远不会饿死 resolve。
+- `archive` 在整个应用内有自己的池，容量 **2**。调用最多等待 **3 秒**获取名额，超时则作为过载被跳过（不使用子文件夹，下载不受影响）。
 - 钩子使用大小等于 worker 数（至多 4）的池。池满时，后续的钩子通知会被**丢弃**（记为 `钩子并发已满，本次钩子被丢弃`），不会排队。
 - 拥有 `ffmpeg` 或 `ytdlp` 权限的插件，其钩子使用同样大小的独立池。池忙时，最多有 **64** 个通知排队等待；超出则丢弃（`外部工具钩子排队已满，本次钩子被丢弃`）。
 - `main` 每个插件一次只处理一个调用；调用按顺序排队。
 
 ### 熔断
 
-`resolve`、`subscribe` 或 `main` 的调用中，**连续** 3 次超时（`脚本执行超时`）或超内存（`脚本超出内存上限`）会自动禁用该插件。应用会弹出通知，插件保持关闭直到被手动重新启用。任何其他结果——成功，或其他类型的错误（如非法返回值、网络失败）——都会把计数清零。
+`resolve`、`subscribe`、`archive` 或 `main` 的调用中，**连续** 3 次超时（`脚本执行超时`）或超内存（`脚本超出内存上限`）会自动禁用该插件。应用会弹出通知，插件保持关闭直到被手动重新启用。任何其他结果——成功，或其他类型的错误（如非法返回值、网络失败）——都会把计数清零。
 
 不计入的：钩子（它们的超时和内存错误只记录日志）、`authenticate` 和过载拒绝。`main` 里的超时或内存溢出还会销毁运行时；下次调用会启动一个全新的运行时，**内存中的所有状态都会丢失**。
 
@@ -636,7 +697,7 @@ globalThis.resolve = async (ctx) => {
 |---|---|
 | `脚本编译失败: …` | 语法错误，或脚本顶层抛出了异常。 |
 | `插件运行时错误: …` | 你的代码抛了异常，或某个被 reject 的 `await` 没有捕获。冒号后面是你的错误文本。函数不存在时包含 `入口 resolve 未定义`。 |
-| `脚本执行超时` | 超出墙钟或 CPU 预算。计入熔断（对 `resolve` / `subscribe` / `main`）。 |
+| `脚本执行超时` | 超出墙钟或 CPU 预算。计入熔断（对 `resolve` / `subscribe` / `archive` / `main`）。 |
 | `脚本超出内存上限` | 超出内存限制。计入熔断。 |
 | `插件运行时过载（并发已满）` | 3 秒内没有空闲名额。见[并发与过载](#并发与过载)。 |
 | `缺少必填设置项: 插件 <id> 需先配置「<title>」` | `required` 设置没有值。请让用户填写。 |

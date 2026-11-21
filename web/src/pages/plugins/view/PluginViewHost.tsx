@@ -15,6 +15,8 @@ export interface PluginViewHostProps {
   /** 任务详情 tab 传入的任务 id。 */
   taskId?: string
   className?: string
+  /** 承载容器的关闭处理（弹窗等）；插件 `ctx.close()` 时调用。不传表示无可关闭容器。 */
+  onClose?: () => void
 }
 
 function Notice({ text, action }: { text: string; action?: { label: string; run: () => void } }) {
@@ -33,7 +35,8 @@ function Notice({ text, action }: { text: string; action?: { label: string; run:
 function SessionBody({ session }: { session: ViewSession }) {
   const { t } = useI18n()
   const state = useViewSession(session)
-  const ctx = useMemo(() => ({ send: session.send.bind(session) }), [session])
+  const sessionId = session.sessionId
+  const ctx = useMemo(() => ({ sessionId, send: session.send.bind(session) }), [session, sessionId])
   const reopen = { label: t('pluginViewReopen'), run: () => void session.open() }
 
   if (state.phase === 'failed') return <Notice text={t('pluginViewError', { message: state.error ?? '' })} action={reopen} />
@@ -59,19 +62,26 @@ function SessionBody({ session }: { session: ViewSession }) {
   )
 }
 
-export function PluginViewHost({ identity, view, taskId, className }: PluginViewHostProps) {
+export function PluginViewHost({ identity, view, taskId, className, onClose }: PluginViewHostProps) {
   const { locale } = useI18n()
   const [session, setSession] = useState<ViewSession | null>(null)
-  // 语言切换不重开会话（locale 只在打开时传给插件）。
+  // The open request captures the initial locale; later changes update that session in place.
   const localeRef = useRef(locale)
   localeRef.current = locale
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
+  const closable = onClose !== undefined
 
   useEffect(() => {
     const next = new ViewSession({ identity, view, taskId, locale: localeRef.current })
+    if (closable) next.onRequestClose = () => onCloseRef.current?.()
     setSession(next)
     void next.open()
     return () => next.dispose()
-  }, [identity, view, taskId])
+  }, [identity, view, taskId, closable])
+  useEffect(() => {
+    session?.setLocale(locale)
+  }, [locale, session])
 
   return <div className={cn('flex min-h-0 min-w-0 flex-col', className)}>{session ? <SessionBody session={session} /> : null}</div>
 }

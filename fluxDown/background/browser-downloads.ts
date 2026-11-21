@@ -15,6 +15,7 @@ import { t } from "@/utils/i18n";
 import type { BrowserDownloadNotice } from "./protocol";
 import { getCachedSettings } from "./settings-cache";
 import { logWarn } from "@/utils/error-log";
+import { hasDownloadsApi } from "@/utils/platform";
 
 const NOTIFICATION_PREFIX = "fluxdown-browser-download-";
 
@@ -31,8 +32,9 @@ interface Tracked {
 
 const tracked = new Map<number, Tracked>();
 
-/** 当前浏览器是否支持（因而会被本扩展）隐藏下载 UI；Firefox 没有这些 API。 */
+/** 当前浏览器是否支持（因而会被本扩展）隐藏下载 UI；Firefox（含没有 downloads API 的 Android 版）没有这些 API。 */
 function canHideDownloadUi(): boolean {
+  if (!hasDownloadsApi()) return false;
   const downloads = browser.downloads as unknown as Record<string, unknown>;
   return typeof downloads.setShelfEnabled === "function" || typeof downloads.setUiOptions === "function";
 }

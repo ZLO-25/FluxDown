@@ -1,13 +1,19 @@
 pub(crate) mod aria2c;
+pub(crate) mod bt_files;
+pub(crate) mod bt_guard;
+pub(crate) mod bt_trackers;
 pub(crate) mod categories;
 pub(crate) mod counts;
 pub(crate) mod devices;
+pub(crate) mod directory_tree;
 pub(crate) mod dispatch;
 pub(crate) mod file_conflict;
+pub(crate) mod file_hash;
 pub(crate) mod file_rescan;
 pub(crate) mod group_tree;
 pub(crate) mod manifest;
 pub(crate) mod new_download;
+pub(crate) mod new_task_button;
 pub(crate) mod preview;
 pub(crate) mod progress_window;
 pub(crate) mod refresh_gate;
@@ -18,6 +24,7 @@ pub(crate) mod shutdown;
 pub(crate) mod source_composition;
 pub(crate) mod speed_limit_recent;
 pub(crate) mod store;
+pub(crate) mod task_route;
 pub(crate) mod view_prefs;
 
 pub(crate) use categories::CategoryIndex;
@@ -351,14 +358,29 @@ pub(crate) struct DownloadTaskView {
     pub(crate) site_fold: String,
     pub(crate) referrer: String,
     pub(crate) save_dir: String,
+    pub(crate) category_override: String,
+    pub(crate) tags_fold: String,
     pub(crate) group_id: String,
+    pub(crate) category_fold: String,
     pub(crate) error_message: String,
     /// 该任务有待确认的「文件已存在」请求（任务表「待确认」角标）。
     pub(crate) conflict_pending: bool,
     pub(crate) file_missing: bool,
+    /// 落盘文件哈希，格式 `algo=hex`（空 = 尚未计算）。只对已完成的本地任务有意义。
+    pub(crate) file_hash: String,
     pub(crate) seeding_status: i32,
     pub(crate) uploaded_bytes: i64,
     pub(crate) boosted: bool,
+    /// BT 选片：按顺序下载（`TaskDto::bt_sequential`；缺省 false = 最稀有优先）。
+    pub(crate) bt_sequential: bool,
+    /// BT 选片：先下载首尾文件块（`TaskDto::bt_first_last_pieces_first`）。
+    pub(crate) bt_first_last_pieces_first: bool,
+    /// 任务级 BT 下载限速（字节/秒，`TaskDto::bt_download_limit_bps`；0 = 不限）。
+    pub(crate) bt_download_limit_bps: i64,
+    /// 任务级上传限速（字节/秒，`TaskDto::seed_upload_limit_bps`；0 = 不限，负值为跟随全局哨兵）。
+    pub(crate) seed_upload_limit_bps: i64,
+    /// 超级做种（`TaskDto::bt_super_seeding`）。
+    pub(crate) bt_super_seeding: bool,
     /// 远程任务的目标设备 id（`CloudDevice::device_id`；本地任务为空）。
     pub(crate) to_device: String,
     /// 远程任务的云端原始状态（本地任务为 `None`）；`Canceled` / `Unknown` 无法用
@@ -390,11 +412,26 @@ impl DownloadTaskView {
         view.referrer.clone_from(&task.referrer);
         view.save_dir.clone_from(&task.save_dir);
         view.group_id.clone_from(&task.group_id);
+        view.category_override.clone_from(&task.properties.category);
+        view.category_fold = task.properties.category.to_lowercase();
+        view.tags_fold = task
+            .properties
+            .tags
+            .iter()
+            .map(|tag| tag.to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
         view.error_message.clone_from(&task.error_message);
         view.file_missing = task.file_missing;
+        view.file_hash.clone_from(&task.file_hash);
         view.seeding_status = task.seeding_status;
         view.uploaded_bytes = task.uploaded_bytes;
         view.boosted = boosted;
+        view.bt_sequential = task.bt_sequential;
+        view.bt_first_last_pieces_first = task.bt_first_last_pieces_first;
+        view.bt_download_limit_bps = task.bt_download_limit_bps;
+        view.seed_upload_limit_bps = task.seed_upload_limit_bps;
+        view.bt_super_seeding = task.bt_super_seeding;
         view
     }
 
@@ -490,12 +527,21 @@ impl DownloadTaskView {
             referrer: String::new(),
             save_dir: String::new(),
             group_id: String::new(),
+            category_override: String::new(),
+            category_fold: String::new(),
+            tags_fold: String::new(),
             error_message: String::new(),
             conflict_pending: false,
             file_missing: false,
+            file_hash: String::new(),
             seeding_status: 0,
             uploaded_bytes: 0,
             boosted: false,
+            bt_sequential: false,
+            bt_first_last_pieces_first: false,
+            bt_download_limit_bps: 0,
+            seed_upload_limit_bps: 0,
+            bt_super_seeding: false,
             to_device: String::new(),
             remote_status: None,
         }
@@ -555,10 +601,26 @@ impl DownloadTaskView {
         }
     }
 
+    /// 「复制下载地址」能给出的真实链接：本地导入的 `.torrent` 没有来源时 `share_url`
+    /// 是 `torrent-file://` 哨兵，对用户无意义，返回 `None`（空串同理）。
+    pub(crate) fn copyable_share_url(&self) -> Option<&str> {
+        let url = self.share_url();
+        (!url.is_empty() && !url.starts_with("torrent-file://")).then_some(url)
+    }
+
     /// 来源站点：`referrer` host 为主，空则 url host。
     pub(crate) fn source_site(&self) -> &str {
         let host = url_host(&self.referrer);
         if host.is_empty() { &self.site } else { host }
+    }
+
+    /// 可在浏览器打开的来源页：仅 `http(s)://` 且有 host 的 `referrer`。
+    /// `referrer` 来自浏览器捕获 / API，不可信；`file://`、`javascript:` 等交给系统打开
+    /// 会触发本地文件或协议处理器，只能复制不能点开。
+    pub(crate) fn source_page_url(&self) -> Option<&str> {
+        let (scheme, _) = self.referrer.split_once("://")?;
+        let web = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
+        (web && !url_host(&self.referrer).is_empty()).then_some(self.referrer.as_str())
     }
 
     /// 文件扩展名（小写，无点）。
@@ -805,6 +867,32 @@ mod tests {
         assert_eq!(url_host("https://u:p@host.example:443/x"), "host.example");
         assert_eq!(url_host("http://[::1]:80/"), "::1");
         assert_eq!(url_host("magnet:?xt=abc"), "");
+    }
+
+    #[test]
+    fn source_page_url_only_opens_http_pages_with_host() {
+        let page = |referrer: &str| DownloadTaskView {
+            referrer: referrer.to_owned(),
+            ..local_task(1, 0, false)
+        };
+        for web in [
+            "https://a.example/p?q=1",
+            "HTTP://a.example",
+            "http://[::1]:8080/",
+        ] {
+            assert_eq!(page(web).source_page_url(), Some(web));
+        }
+        for blocked in [
+            "",
+            "https://",
+            "file:///etc/passwd",
+            "javascript:alert(1)//https://x",
+            "ftp://a.example/",
+            "chrome-extension://abc/page.html",
+            " https://a.example/",
+        ] {
+            assert_eq!(page(blocked).source_page_url(), None, "{blocked}");
+        }
     }
 
     #[test]

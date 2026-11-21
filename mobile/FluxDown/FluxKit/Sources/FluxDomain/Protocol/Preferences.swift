@@ -501,6 +501,85 @@ public struct DaemonConfigSnapshotDto: Sendable, Hashable, Codable {
     }
 }
 
+/// 列表型配置键写入依赖的主机端口（生产实现读 `HostStore` + `HostSession`；测试用假实现）。
+@MainActor
+public protocol DaemonConfigPort: AnyObject {
+    /// 快照里的最新配置；未连接为 nil。
+    var cachedConfig: DaemonConfigSnapshotDto? { get }
+    /// `daemon.config.get`。
+    func fetchConfig() async throws(HostError) -> DaemonConfigSnapshotDto
+    /// `daemon.config.patch`：revision 不符抛 `.conflict`。
+    func patchConfig(expectedRevision: UInt64, values: [String: String]) async throws(HostError)
+}
+
+/// 读-改-写 JSON 数组型配置键（AGENTS.md §5：写入始终基于最新配置重算，冲突时重读并重放）。
+///
+/// - 每次都基于最新快照重新计算；`expectedRevision` 冲突时重新 `daemon.config.get` 后再算一遍（最多 3 次）。
+/// - 写入串行化：连续操作不会互相制造冲突，也不会基于过期数组回写。
+@MainActor
+public final class DaemonConfigListWriter<Element> {
+    /// 与 GPUI `MAX_CONFLICT_RETRIES` 一致。
+    public static var maxConflictRetries: Int { 3 }
+
+    private let port: any DaemonConfigPort
+    private let key: String
+    private let parse: @MainActor (String?) -> [Element]
+    private let encode: @MainActor ([Element]) throws(HostError) -> String
+    private var tail: Task<Void, Never>?
+
+    public init(
+        port: any DaemonConfigPort,
+        key: String,
+        parse: @escaping @MainActor (String?) -> [Element],
+        encode: @escaping @MainActor ([Element]) throws(HostError) -> String
+    ) {
+        self.port = port
+        self.key = key
+        self.parse = parse
+        self.encode = encode
+    }
+
+    /// `transform` 返回 nil 表示无需写入。
+    public func mutate(_ transform: @escaping @MainActor ([Element]) -> [Element]?) async throws(HostError) {
+        let previous = tail
+        let run = Task { @MainActor [self] () async -> Result<Void, HostError> in
+            await previous?.value
+            return await perform(transform)
+        }
+        tail = Task { _ = await run.value }
+        try await run.value.get()
+    }
+
+    private func perform(_ transform: @MainActor ([Element]) -> [Element]?) async -> Result<Void, HostError> {
+        do throws(HostError) {
+            var config = port.cachedConfig
+            var attempt = 0
+            while true {
+                let current: DaemonConfigSnapshotDto
+                if let config {
+                    current = config
+                } else {
+                    current = try await port.fetchConfig()
+                }
+                guard let next = transform(parse(current.values[key])) else {
+                    return .success(())
+                }
+                let encoded = try encode(next)
+                do throws(HostError) {
+                    try await port.patchConfig(expectedRevision: current.revision, values: [key: encoded])
+                    return .success(())
+                } catch {
+                    guard error.code == .conflict, attempt < Self.maxConflictRetries else { throw error }
+                    attempt += 1
+                    config = try await port.fetchConfig()
+                }
+            }
+        } catch {
+            return .failure(error)
+        }
+    }
+}
+
 /// `daemon.config.connPolicy` / `clearConnPolicy` 结果：引擎学习到的按域连接上限条数。
 public struct ConnPolicySummaryDto: Sendable, Hashable, Codable {
     public var domainCount: UInt64
