@@ -1,0 +1,172 @@
+# 本 fork 专用：在 GitHub 的 Windows 机器上编译桌面版，产出便携 zip 供下载。
+#
+# 与官方 release.yml 的关系：构建命令、暂存文件与便携包布局照搬其 build-windows job，
+# 但不发 Release、不推镜像、不读取任何 secret，也不需要 tag。
+#
+# 触发：Actions 页面手动运行（workflow_dispatch），或推送 build/windows 分支。
+# 产物：运行页面底部 Artifacts 里的 FluxDown-fork-windows-x64-portable。
+name: Fork Windows build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - build/windows
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Windows x64 portable
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      CARGO_HTTP_MULTIPLEXING: "false"
+      CARGO_NET_RETRY: "10"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # 版本取 FORK.md 的「目前同步到」，与官方同版本号，App 内才不会把同版官方包当成新版。
+      - name: Read synced upstream version
+        id: version
+        shell: bash
+        run: |
+          version=$(grep -oE '目前同步到：`v[0-9]+\.[0-9]+\.[0-9]+`' FORK.md | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          if [ -z "$version" ]; then echo "FORK.md 里找不到同步版本" >&2; exit 1; fi
+          echo "VERSION=$version" >> "$GITHUB_OUTPUT"
+          echo "SHORT_SHA=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+          rustc --version && cargo --version
+
+      # 必须 release：debug 下 GPUI Windows 着色器按构建机绝对路径读取，换机即失效。
+      # 不设 FLUXCLOUD_BASE_URL / FLUXDOWN_ANALYTICS_APP_KEY：本构建不带云端地址与统计密钥。
+      - name: Build desktop, agent, daemon and browser relay
+        shell: bash
+        env:
+          FLUXDOWN_APP_VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          cargo build --locked --release --target "$TARGET" \
+            -p fluxdown_ui_app -p fluxdown_agent -p fluxdown_daemon -p fluxdown_nmh \
+            --features fluxdown_agent/desktop --bins
+
+      # MSVC CRT 随应用目录分发：干净系统（无 VCRedist）上否则 STATUS_DLL_NOT_FOUND。
+      - name: Stage portable folder
+        shell: pwsh
+        run: |
+          $stage = "build\fork\FluxDown"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          foreach ($bin in "fluxdown-desktop", "fluxdown-agent", "fluxdownd", "fluxdown_nmh", "flux_down") {
+            Copy-Item "target\$env:TARGET\release\$bin.exe" $stage
+          }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products * -property installationPath
+          if (-not $vsRoot) { throw "Visual Studio installation not found via vswhere" }
+          $crtDir = Get-ChildItem "$vsRoot\VC\Redist\MSVC\*\x64\Microsoft.VC1*.CRT" -Directory |
+            Sort-Object FullName | Select-Object -Last 1
+          if (-not $crtDir) { throw "MSVC CRT redist for x64 not found under $vsRoot" }
+          Copy-Item "$($crtDir.FullName)\msvcp140*.dll", "$($crtDir.FullName)\vcruntime140*.dll" $stage -Force
+          foreach ($required in 'msvcp140.dll', 'vcruntime140.dll') {
+            if (-not (Test-Path "$stage\$required")) { throw "$required missing after CRT copy" }
+          }
+          # portable 标记：agent / daemon 据此把数据写在同目录的 portable_data，不碰系统目录。
+          New-Item -Path "$stage\portable" -ItemType File -Force | Out-Null
+          Copy-Item "FORK.md" $stage
+          Copy-Item "LICENSE" $stage -ErrorAction SilentlyContinue
+          @(
+            "FluxDown fork build"
+            "source:  https://github.com/$env:GITHUB_REPOSITORY/commit/$env:GITHUB_SHA"
+            "version: ${{ steps.version.outputs.VERSION }} (upstream) + fork hardening"
+            "run:     https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            "start:   fluxdown-desktop.exe"
+          ) | Set-Content "$stage\BUILD-INFO.txt" -Encoding utf8
+          Get-ChildItem $stage
+
+      - name: Create zip and checksums
+        id: package
+        shell: pwsh
+        run: |
+          $name = "FluxDown-fork-${{ steps.version.outputs.VERSION }}-${{ steps.version.outputs.SHORT_SHA }}-windows-x64-portable"
+          New-Item -ItemType Directory -Force -Path "build\out" | Out-Null
+          Compress-Archive -Path "build\fork\FluxDown" -DestinationPath "build\out\$name.zip"
+          $zipHash = (Get-FileHash "build\out\$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$zipHash  $name.zip" | Set-Content "build\out\SHA256SUMS.txt" -Encoding ascii
+          Get-ChildItem "build\fork\FluxDown\*.exe" | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  FluxDown/$($_.Name)"
+          } | Add-Content "build\out\SHA256SUMS.txt" -Encoding ascii
+          "### SHA-256" | Add-Content $env:GITHUB_STEP_SUMMARY
+          '```' | Add-Content $env:GITHUB_STEP_SUMMARY
+          Get-Content "build\out\SHA256SUMS.txt" | Add-Content $env:GITHUB_STEP_SUMMARY
+          '```' | Add-Content $env:GITHUB_STEP_SUMMARY
+          "NAME=$name" | Add-Content $env:GITHUB_OUTPUT
+
+      # 先上传再做后面的检查：检查失败时产物仍在，但整个运行会标红，不要使用标红运行的产物。
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: FluxDown-fork-windows-x64-portable
+          path: |
+            build/out/*.zip
+            build/out/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      # 冒烟：从 zip 解压到全新目录启动，确认 UI、agent、daemon 都起来且没有立刻崩溃，
+      # 数据只写进 portable_data。
+      - name: Smoke test the packaged app
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "smoke"
+          Expand-Archive "build\out\${{ steps.package.outputs.NAME }}.zip" -DestinationPath $root
+          $app = Join-Path $root "FluxDown"
+          $desktop = Start-Process (Join-Path $app "fluxdown-desktop.exe") -WorkingDirectory $app -PassThru
+          $deadline = (Get-Date).AddSeconds(90)
+          $ok = $false
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 5
+            $agent = Get-Process "fluxdown-agent" -ErrorAction SilentlyContinue
+            $daemon = Get-Process "fluxdownd" -ErrorAction SilentlyContinue
+            $ui = Get-Process -Id $desktop.Id -ErrorAction SilentlyContinue
+            Write-Host "ui=$([bool]$ui) agent=$([bool]$agent) daemon=$([bool]$daemon)"
+            if ($ui -and $agent -and $daemon) { $ok = $true; break }
+            if (-not $ui) { break }
+          }
+          if ($ok) {
+            # 再观察 20 秒，三个进程都得还活着。
+            Start-Sleep -Seconds 20
+            $ok = [bool](Get-Process -Id $desktop.Id -ErrorAction SilentlyContinue) -and
+                  [bool](Get-Process "fluxdown-agent" -ErrorAction SilentlyContinue) -and
+                  [bool](Get-Process "fluxdownd" -ErrorAction SilentlyContinue)
+          }
+          $listen = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+            Where-Object { $_.OwningProcess -in (Get-Process "fluxdown-agent", "fluxdownd" -ErrorAction SilentlyContinue).Id }
+          Write-Host "listening sockets of agent / daemon:"
+          $listen | Format-Table LocalAddress, LocalPort, OwningProcess | Out-String | Write-Host
+          $nonLoopback = $listen | Where-Object { $_.LocalAddress -notin '127.0.0.1', '::1' }
+          Write-Host "portable_data present: $(Test-Path (Join-Path $app 'portable_data'))"
+          Get-Process "fluxdown-desktop", "fluxdown-agent", "fluxdownd", "fluxdown_nmh", "flux_down" -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+          if (-not $ok) { throw "smoke test failed: UI, agent and daemon were not all running" }
+          if ($nonLoopback) { throw "smoke test failed: a service listens on a non-loopback address" }
+          "### Smoke test`nUI, agent and daemon started from the zip and stayed up; services listen on loopback only." |
+            Add-Content $env:GITHUB_STEP_SUMMARY
+
+      # Windows 专用的更新器代码（Authenticode 比对等）只在这里被编译与测试。
+      - name: Test Windows-only updater code
+        shell: bash
+        run: |
+          cargo test --locked --target "$TARGET" -p fluxdown_agent --lib update::
