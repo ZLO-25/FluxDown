@@ -40,11 +40,24 @@ git diff --stat v0.6.8 HEAD    # 應只列出上表的檔案、Cargo.lock 與 FO
 
 ## 更新時要注意
 
-- 本 fork 沒有 Release，要自己編譯。
+- 本 fork 沒有 Release。Windows 版由 `.github/workflows/fork-windows-build.yml` 在 GitHub 的機器上編譯，見下方「下載 Windows 版」。
 - 建置時沒設 `FLUXDOWN_UPDATE_BASE_URLS`，App 內的更新會安裝**官方版**並覆蓋本 fork。要保留上表的改動，就不要在 App 內按更新，改成「同步官方 → 重新編譯」。
 - 「自動檢查更新」可以留著開：它只提示官方有新版，正好當作該同步的提醒。
 - 靜默自動更新（`general.silent_auto_update`）官方預設關閉，請維持關閉，否則閒置時會自動換成官方版。
 - 不要推送 `v*` tag：會觸發 `.github/workflows/release.yml` 的發版流程。`git push` 預設不推 tag，不要加 `--tags`。
+
+## 下載 Windows 版
+
+1. 到本 repo 的 Actions 頁，左側選「Fork Windows build」，按「Run workflow」（分支選 `main`）。約 35 分鐘。
+2. 只用**綠色勾勾**的那次執行。點進去，頁面最下方 Artifacts 下載 `FluxDown-fork-windows-x64-portable`。
+3. 解開後會有一個 zip 和 `SHA256SUMS.txt`。在 PowerShell 比對：`Get-FileHash .\FluxDown-fork-*.zip -Algorithm SHA256`，結果要和 `SHA256SUMS.txt` 第一行、以及該次執行摘要頁顯示的值相同。
+4. 把裡面的 zip 解到固定位置（例如 `D:\Apps\FluxDown`），執行 `fluxdown-desktop.exe`。
+
+這是免安裝版：資料夾裡有 `portable` 標記檔，設定與下載紀錄都寫在同資料夾的 `portable_data`，不寫登錄檔以外的系統位置。不用時刪掉整個資料夾即可。更新方式是重跑一次建置、下載新 zip、把舊的 `portable_data` 搬過去。
+
+每次建置會自動做三件事，任何一件失敗該次執行就會標紅：從 zip 解壓後啟動並確認介面、agent、daemon 都在執行；確認服務只監聽本機位址；編譯並測試 Windows 專用的更新器程式碼。
+
+Artifacts 保留 30 天，過期後重跑即可。執行檔沒有程式碼簽章，第一次執行 Windows 會跳 SmartScreen 警告。
 
 ## 同步官方新版
 
