@@ -53,7 +53,7 @@ git diff --stat v0.6.8 HEAD    # 應只列出上表的檔案、Cargo.lock 與 FO
 3. 解開後會有一個 zip 和 `SHA256SUMS.txt`。在 PowerShell 比對：`Get-FileHash .\FluxDown-fork-*.zip -Algorithm SHA256`，結果要和 `SHA256SUMS.txt` 第一行、以及該次執行摘要頁顯示的值相同。
 4. 把裡面的 zip 解到固定位置（例如 `D:\Apps\FluxDown`），執行 `fluxdown-desktop.exe`。
 
-這是免安裝版：資料夾裡有 `portable` 標記檔，設定與下載紀錄都寫在同資料夾的 `portable_data`，不寫登錄檔以外的系統位置。不用時刪掉整個資料夾即可。更新方式是重跑一次建置、下載新 zip、把舊的 `portable_data` 搬過去。
+這是免安裝版：資料夾裡有 `portable` 標記檔，設定與下載紀錄寫在同資料夾的 `portable_data`。瀏覽器橋接會在目前使用者的登錄檔登記一筆。不用時刪掉整個資料夾即可。更新方式是重跑一次建置、下載新 zip、把舊的 `portable_data` 搬過去。
 
 每次建置會自動做三件事，任何一件失敗該次執行就會標紅：從 zip 解壓後啟動並確認介面、agent、daemon 都在執行；確認服務只監聽本機位址；編譯並測試 Windows 專用的更新器程式碼。
 
