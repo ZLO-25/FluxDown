@@ -108,12 +108,27 @@ async fn apply_system(params: &mut DownloadParams, pac_url: &str) -> Option<Prox
     params.client = client;
     params.proxy_config = chosen.clone();
     route_through_proxy(params);
+    // 起跑时按静态系统代理（未检测到 → `global:direct`）落了标签；PAC 选中代理后改正。
+    if let Err(error) = params
+        .db
+        .set_task_auto_route(&params.task_id, route::GLOBAL_PAC)
+        .await
+    {
+        log_info!(
+            "[pac] task {} auto_route 落库失败: {error:#}",
+            params.task_id
+        );
+    }
+    params.sink.emit(EngineEvent::TaskRouteChanged {
+        task_id: params.task_id.clone(),
+        route: route::GLOBAL_PAC.to_owned(),
+    });
     Some(chosen)
 }
 
 /// 出口改走代理后，多 CDN 钉定节点（直连 IP）与多网卡聚合（绑定本机网卡直连）
 /// 都会旁路代理，必须关闭。
-fn route_through_proxy(params: &mut DownloadParams) {
+pub(crate) fn route_through_proxy(params: &mut DownloadParams) {
     params.cdn.enabled = false;
     if let Some(input) = params.multi_nic.as_ref().filter(|i| !i.blocked_by_proxy) {
         let mut blocked = (**input).clone();

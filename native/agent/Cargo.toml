@@ -16,6 +16,7 @@ arboard = { version = "3.6", default-features = false, features = ["wayland-data
 async-trait = "0.1.89"
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.22"
+blake3 = { version = "1.8.7", optional = true }
 directories = "6"
 ed25519-dalek = "3"
 flate2 = "1"
@@ -27,12 +28,13 @@ fluxdown_ui_i18n = { version = "0.1.0", path = "../../crates/i18n", optional = t
 fs2 = "0.4.3"
 futures-util = "0.3.32"
 hex = "0.4"
-image = { version = "0.25.10", default-features = false, features = ["png"], optional = true }
+image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "webp"], optional = true }
 mimalloc = "0.1.52"
 regex = "1"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+socket2 = "0.6.5"
 tao = { version = "0.37", default-features = false, optional = true }
 tar = "0.4"
 thiserror = "2"
@@ -55,6 +57,9 @@ keepawake = "0.6"
 # `socks`：统一出口（`egress.rs`）可能给出用户配置的 SOCKS 代理；tokio-socks 已随 engine 在依赖树中。
 [target.'cfg(not(windows))'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy", "macos-system-configuration", "rustls-tls-native-roots", "rustls-tls-webpki-roots", "socks"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-native-certs = "0.8"
+webpki-roots = "1"
 
 [target.'cfg(windows)'.dependencies]
 reqwest = { version = "0.12", features = ["json", "stream", "socks"] }
@@ -65,7 +70,13 @@ reqwest = { version = "0.12", features = ["json", "stream", "socks"] }
 # 固定 0.59：0.61 引入 windows-link(raw-dylib)，与 cdylib 构建在 CI 上不兼容
 winreg = "0.55"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Controls", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
-windows = { version = "0.61.3", features = ["Data_Xml_Dom", "Foundation", "Media_Core", "Media_Playback", "UI_Notifications", "Win32_Graphics_Gdi", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# 应用图标（platform/app_icon/windows.rs）：Win32_System_Com / Win32_Storage_FileSystem = 类型化 IShellLinkW / IPersistFile；
+# Win32_System_Threading = OpenProcess / QueryFullProcessImageNameW；Win32_UI_HiDpi = GetDpiForWindow。
+# 程序本体图标（platform/app_icon/exe_icon.rs）：Win32_System_LibraryLoader = Begin/Update/EndUpdateResourceW；
+# Win32_Storage_FileSystem = MoveFileExW。
+# 提权降级（platform/elevation.rs）：Win32_Security = GetTokenInformation(TokenElevationType)；
+# Win32_System_Ole / Win32_System_Variant = IShellWindows::FindWindowSW / IShellDispatch2::ShellExecute。
+windows = { version = "0.61.3", features = ["Data_Xml_Dom", "Foundation", "Media_Core", "Media_Playback", "UI_Notifications", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Ole", "Win32_System_Threading", "Win32_System_Variant", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 # notify-rust 仅用于 Linux D-Bus 通知（macOS / Windows 用原生通知；Android / iOS 不编译）。
 # x11rb（X11 XGrabKey + XInput2 原始键盘事件）与 ashpd（Wayland GlobalShortcuts portal）
@@ -94,6 +105,7 @@ desktop = [
     "dep:tao",
     "dep:tray-icon",
     "dep:image",
+    "dep:blake3",
     "dep:arboard",
     "dep:fluxdown_ui_i18n",
     "dep:gtk",

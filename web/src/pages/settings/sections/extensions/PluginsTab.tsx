@@ -1,10 +1,10 @@
-// 插件子页：已安装插件管理（启用 / 设置 / 登录 / 卸载）+ 安装区（zip 上传 / 服务端开发目录）+ 插件市场。
+// 插件子页：已安装插件管理（启用 / 设置 / 登录 / 卸载）+ 安装区（zip 上传 / 服务端开发目录，仅开发模式显示）+ 专属插件 + 插件市场。
 
 import { FolderOpen, Info, Package, RotateCw, ScrollText, Settings, Trash2 } from 'lucide-react'
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useT } from '../../../../i18n'
 import { METHOD, call, rpc, uploadBlob, useDaemon } from '../../../../lib/rpc'
-import type { DaemonSnapshot, InstalledPlugin, PluginDto } from '../../../../lib/rpc'
+import type { DaemonSnapshot, InstalledPlugin, PluginArchiveRulesDto, PluginDto } from '../../../../lib/rpc'
 import { Badge, Button, Card, ConfirmFooter, Dialog, EmptyState, FormField, Input, InputWithAction, Switch, confirmDialog, toast } from '../../../../ui'
 import { hasPluginSettings } from '../../../plugins/contributions'
 import { BlockTitle, ExtLink, IconButton, ListCard, ListRow } from './common'
@@ -12,13 +12,13 @@ import { detailFromPlugin } from './detail'
 import type { PluginDetail } from './detail'
 import { extensionErrorText } from './errors'
 import { MarketSection } from './MarketSection'
+import { PrivateSection } from './PrivateSection'
 import { PluginAuditDialog } from './PluginAuditDialog'
 import { PluginAuthDialog } from './PluginAuthDialog'
 import { GrantConsentDialog, RiskBadge } from './PluginConsentDialog'
 import { PluginDetailDialog } from './PluginDetailDialog'
 import { PluginSettingsDialog } from './PluginSettingsDialog'
-import { SiteDefaultsCard } from './SiteDefaultsCard'
-import { postInstallConsent } from './logic'
+import { liveDialogPlugins, postInstallConsent } from './logic'
 import type { ConsentSet } from './logic'
 
 const EMPTY_PLUGINS: PluginDto[] = []
@@ -35,28 +35,98 @@ const COMPONENT_TITLE_KEYS: Record<string, string> = {
 
 type ZipPhase = { kind: 'uploading'; fraction: number } | { kind: 'installing' } | null
 
-export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoToComponents: () => void }) {
+/** 详情对话框目标：已安装插件只存 identity（内容取最新快照），市场条目存条目详情。 */
+type DetailTarget = { kind: 'installed'; identity: string } | { kind: 'market'; detail: PluginDetail }
+
+export function PluginsTab({ stale, active, onGoToComponents }: { stale: boolean; active: boolean; onGoToComponents: () => void }) {
   const t = useT()
   const plugins = useDaemon(selectPlugins, EMPTY_PLUGINS)
-  const [devMode, setDevMode] = useState(true)
+  const [archiveStatus, setArchiveStatus] = useState<PluginArchiveRulesDto | null>(null)
+  const [archiveBusy, setArchiveBusy] = useState(false)
+  const [archiveMessage, setArchiveMessage] = useState<'success' | 'error' | null>(null)
+  const [devMode, setDevMode] = useState(false)
+  /** 「插件市场」刷新按钮点击计数；递增即让专属插件目录强制重拉。 */
+  const [privateRefresh, setPrivateRefresh] = useState(0)
   const [devDir, setDevDir] = useState('')
   const [installingDir, setInstallingDir] = useState(false)
   const [zipPhase, setZipPhase] = useState<ZipPhase>(null)
   const [busy, setBusy] = useState<ReadonlySet<string>>(new Set())
-  const [detail, setDetail] = useState<PluginDetail | null>(null)
-  const [settingsPlugin, setSettingsPlugin] = useState<PluginDto | null>(null)
-  const [authPlugin, setAuthPlugin] = useState<PluginDto | null>(null)
+  const [detail, setDetail] = useState<DetailTarget | null>(null)
+  const [settingsIdentity, setSettingsIdentity] = useState<string | null>(null)
+  const [authIdentity, setAuthIdentity] = useState<string | null>(null)
   const [missing, setMissing] = useState<string[] | null>(null)
-  const [consentPlugin, setConsentPlugin] = useState<PluginDto | null>(null)
+  const [consentIdentity, setConsentIdentity] = useState<string | null>(null)
   const [audit, setAudit] = useState<{ identity: string | null } | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
+  const pluginsRef = useRef(plugins)
+  pluginsRef.current = plugins
+
+  // 对话框只存插件 identity，内容永远取自最新快照（启停 / 更新 / 授权变化即时反映）；
+  // 插件被卸载则关闭，授权框在待授权集合清空（别处已授权）后关闭。
+  const live = liveDialogPlugins(plugins, { detail: detail?.kind === 'installed' ? detail.identity : null, settings: settingsIdentity, auth: authIdentity, consent: consentIdentity })
+  useEffect(() => {
+    if (detail?.kind === 'installed' && live.detail === null) setDetail(null)
+    if (settingsIdentity !== null && live.settings === null) setSettingsIdentity(null)
+    if (authIdentity !== null && live.auth === null) setAuthIdentity(null)
+    if (consentIdentity !== null && live.consent === null) setConsentIdentity(null)
+  }, [detail, settingsIdentity, authIdentity, consentIdentity, live.detail, live.settings, live.auth, live.consent])
+  const settingsPlugin = live.settings
+  const authPlugin = live.auth
+  const consentPlugin = live.consent
+  const shownDetail: PluginDetail | null = detail?.kind === 'market' ? detail.detail : live.detail ? detailFromPlugin(live.detail) : null
+  const archivePlugin = detail?.kind === 'installed' ? live.detail : null
+  const archiveRequest = useRef(0)
+  useEffect(() => {
+    const request = ++archiveRequest.current
+    let active = true
+    setArchiveStatus(null)
+    setArchiveMessage(null)
+    if (!archivePlugin?.contributions.archiveRules || stale) {
+      setArchiveBusy(false)
+      return () => { active = false }
+    }
+    setArchiveBusy(true)
+    void rpc.daemon.plugin.archiveRules({ identity: archivePlugin.identity }).then((status) => {
+      if (active && archiveRequest.current === request) {
+        setArchiveStatus(status)
+        setArchiveBusy(false)
+      }
+    }).catch(() => {
+      if (active && archiveRequest.current === request) {
+        setArchiveMessage('error')
+        setArchiveBusy(false)
+      }
+    })
+    return () => { active = false }
+  }, [archivePlugin?.identity, archivePlugin?.contributions.archiveRules, archivePlugin?.enabled, stale])
+  const refreshArchiveRules = async () => {
+    if (!archivePlugin || archiveBusy || !archivePlugin.enabled) return
+    const request = ++archiveRequest.current
+    const identity = archivePlugin.identity
+    setArchiveBusy(true)
+    setArchiveMessage(null)
+    try {
+      const status = await rpc.daemon.plugin.archiveRules({ identity, refresh: true })
+      if (archiveRequest.current === request) {
+        setArchiveStatus(status)
+        setArchiveMessage('success')
+      }
+    } catch {
+      if (archiveRequest.current === request) setArchiveMessage('error')
+    } finally {
+      if (archiveRequest.current === request) setArchiveBusy(false)
+    }
+  }
+
+  /** 操作发起时已安装的插件 identity（引擎在应答前就广播新插件表，应答后再看快照已分不出是安装还是更新）。 */
+  const installedIdentities = (): ReadonlySet<string> => new Set(pluginsRef.current.map((item) => item.identity))
 
   /**
    * 安装 / 更新成功后的统一授权流程：待授权集合与用户安装前确认的集合吻合 → 直接授权，否则弹授权对话框。
-   * `confirmed` 仅市场路径提供。
+   * `confirmed` 仅市场路径提供；`updating` = 操作发起时该插件已安装（提示文案用「已更新」）。
    */
-  const onInstalled = async (result: InstalledPlugin, confirmed: ConsentSet | null = null) => {
-    toast.success(t('pluginOpInstallSuccess'))
+  const onInstalled = async (result: InstalledPlugin, confirmed: ConsentSet | null = null, updating = false) => {
+    toast.success(t(updating ? 'pluginOpUpdateSuccess' : 'pluginOpInstallSuccess'))
     if (result.missingComponents?.length) setMissing(result.missingComponents)
     let plugin: PluginDto | undefined
     try {
@@ -68,13 +138,13 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
     if (plugin === undefined) return
     const action = postInstallConsent(plugin, confirmed)
     if (action === 'dialog') {
-      setConsentPlugin(plugin)
+      setConsentIdentity(plugin.identity)
     } else if (action === 'grant') {
       try {
         await rpc.daemon.plugin.consent({ identity: plugin.identity, permissions: plugin.permissions, networkHosts: plugin.networkHosts })
       } catch (error) {
         toast.error(t('pluginConsentFailed', { message: extensionErrorText(t, error) }))
-        setConsentPlugin(plugin)
+        setConsentIdentity(plugin.identity)
       }
     }
   }
@@ -138,12 +208,14 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
   const installZip = async (file: File) => {
     if (zipPhase) return
     setZipPhase({ kind: 'uploading', fraction: 0 })
+    const installedBefore = installedIdentities()
     try {
       const blobId = await uploadBlob('plugins', file, {
         onProgress: (fraction) => setZipPhase({ kind: 'uploading', fraction }),
       })
       setZipPhase({ kind: 'installing' })
-      await onInstalled(await call<InstalledPlugin>(METHOD.DAEMON_PLUGIN_INSTALL, { blobId }, { timeoutMs: INSTALL_TIMEOUT_MS }))
+      const result = await call<InstalledPlugin>(METHOD.DAEMON_PLUGIN_INSTALL, { blobId }, { timeoutMs: INSTALL_TIMEOUT_MS })
+      await onInstalled(result, null, installedBefore.has(result.identity))
     } catch (error) {
       onInstallFailed(error)
     } finally {
@@ -155,8 +227,10 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
     const dirPath = devDir.trim()
     if (dirPath === '' || installingDir) return
     setInstallingDir(true)
+    const installedBefore = installedIdentities()
     try {
-      await onInstalled(await rpc.daemon.plugin.installDev({ dirPath }))
+      const result = await rpc.daemon.plugin.installDev({ dirPath })
+      await onInstalled(result, null, installedBefore.has(result.identity))
       setDevDir('')
     } catch (error) {
       onInstallFailed(error)
@@ -189,24 +263,24 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
         }
       />
 
-      <Card className="flex flex-col gap-4 p-3">
-        <div>
-          <input
-            ref={fileInput}
-            type="file"
-            accept=".fxplug,.zip"
-            hidden
-            onChange={(event) => {
-              const file = event.target.files?.[0]
-              event.target.value = ''
-              if (file) void installZip(file)
-            }}
-          />
-          <Button variant="outline" icon={FolderOpen} loading={zipPhase !== null} disabled={stale} onClick={() => fileInput.current?.click()}>
-            {zipLabel}
-          </Button>
-        </div>
-        {devMode ? (
+      {devMode ? (
+        <Card className="flex flex-col gap-4 p-3">
+          <div>
+            <input
+              ref={fileInput}
+              type="file"
+              accept=".fxplug,.zip"
+              hidden
+              onChange={(event) => {
+                const file = event.target.files?.[0]
+                event.target.value = ''
+                if (file) void installZip(file)
+              }}
+            />
+            <Button variant="outline" icon={FolderOpen} loading={zipPhase !== null} disabled={stale} onClick={() => fileInput.current?.click()}>
+              {zipLabel}
+            </Button>
+          </div>
           <FormField label={t('pluginInstallDirLabel')} htmlFor="plugin-install-dir" hint={t('webPluginInstallDirHint')}>
             <InputWithAction
               input={
@@ -231,8 +305,8 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
               }
             />
           </FormField>
-        ) : null}
-      </Card>
+        </Card>
+      ) : null}
 
       {plugins.length === 0 ? (
         <EmptyState icon={Package} title={t('pluginsEmpty')} />
@@ -243,10 +317,10 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
               key={plugin.identity}
               plugin={plugin}
               disabled={stale || busy.has(plugin.identity)}
-              onDetail={() => setDetail(detailFromPlugin(plugin))}
-              onSettings={() => setSettingsPlugin(plugin)}
-              onAuth={() => setAuthPlugin(plugin)}
-              onConsent={() => setConsentPlugin(plugin)}
+              onDetail={() => setDetail({ kind: 'installed', identity: plugin.identity })}
+              onSettings={() => setSettingsIdentity(plugin.identity)}
+              onAuth={() => setAuthIdentity(plugin.identity)}
+              onConsent={() => setConsentIdentity(plugin.identity)}
               onUninstall={() => void uninstall(plugin)}
               onReload={() => void reload(plugin)}
               onToggle={(enabled) => void setEnabled(plugin, enabled)}
@@ -255,18 +329,39 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
         </ListCard>
       )}
 
-      <SiteDefaultsCard plugins={plugins} stale={stale} />
+      <PrivateSection
+        stale={stale}
+        active={active}
+        plugins={plugins}
+        onInstalled={onInstalled}
+        onInstallFailed={onInstallFailed}
+        onShowDetail={(shown) => setDetail({ kind: 'market', detail: shown })}
+        refreshNonce={privateRefresh}
+      />
 
-      <MarketSection stale={stale} plugins={plugins} onInstalled={onInstalled} onInstallFailed={onInstallFailed} onShowDetail={setDetail} />
+      <MarketSection
+        stale={stale}
+        active={active}
+        plugins={plugins}
+        onInstalled={onInstalled}
+        onInstallFailed={onInstallFailed}
+        onShowDetail={(shown) => setDetail({ kind: 'market', detail: shown })}
+        onRefresh={() => setPrivateRefresh((count) => count + 1)}
+      />
 
       <PluginDetailDialog
-        detail={detail}
+        detail={shownDetail}
         onClose={() => setDetail(null)}
-        onAudit={detail && plugins.some((item) => item.identity === detail.identity) ? (identity) => setAudit({ identity }) : undefined}
+        onAudit={shownDetail && plugins.some((item) => item.identity === shownDetail.identity) ? (identity) => setAudit({ identity }) : undefined}
+        archiveRules={archivePlugin?.contributions.archiveRules ? archiveStatus : null}
+        archiveDisabled={!archivePlugin?.enabled || archiveBusy || stale}
+        archiveBusy={archiveBusy}
+        archiveMessage={archiveMessage}
+        onArchiveRefresh={() => void refreshArchiveRules()}
       />
-      <PluginSettingsDialog plugin={settingsPlugin} onClose={() => setSettingsPlugin(null)} />
-      <PluginAuthDialog plugin={authPlugin} onClose={() => setAuthPlugin(null)} />
-      <GrantConsentDialog plugin={consentPlugin} onClose={() => setConsentPlugin(null)} />
+      <PluginSettingsDialog plugin={settingsPlugin} onClose={() => setSettingsIdentity(null)} />
+      <PluginAuthDialog plugin={authPlugin} onClose={() => setAuthIdentity(null)} />
+      <GrantConsentDialog plugin={consentPlugin} onClose={() => setConsentIdentity(null)} />
       <PluginAuditDialog open={audit !== null} initialIdentity={audit?.identity ?? null} onClose={() => setAudit(null)} />
       <Dialog
         open={missing !== null}

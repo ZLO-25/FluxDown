@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
+#[cfg(feature = "bt")]
+use fluxdown_engine::bt_guard::{BtGuardConfig, DownloadingMaxAction, RuleMode};
 use fluxdown_protocol::{
     DaemonConfigError, is_public_daemon_config_key, normalize_daemon_config_patch,
 };
@@ -212,13 +214,16 @@ pub fn public_config_values(all: &HashMap<String, String>) -> BTreeMap<String, S
 /// 启动时实时读库，落库即生效。
 #[must_use]
 pub fn bt_config_from_map(cfg: &HashMap<String, String>) -> fluxdown_engine::bt_config::BtConfig {
-    use fluxdown_engine::bt_config::BtMseMode;
+    use fluxdown_engine::bt_config::{BtMseMode, BtProxySource};
     use fluxdown_engine::bt_seeding::SeedingLimitOperator;
 
     let subscription_enabled = cfg
         .get("bt_tracker_sub_enabled")
         .map(|value| value == "true")
         .unwrap_or(true);
+    // 缺失 / 无法解析的值回落到契约默认值（`DAEMON_CONFIG_FIELDS`）。
+    let flag = |key: &str, default: bool| cfg.get(key).map_or(default, |value| value == "true");
+    let defaults = fluxdown_engine::bt_config::BtConfig::default();
     fluxdown_engine::bt_config::BtConfig {
         enabled: cfg
             .get("bt_enabled")
@@ -288,6 +293,180 @@ pub fn bt_config_from_map(cfg: &HashMap<String, String>) -> fluxdown_engine::bt_
             .get("bt_mse_mode")
             .map(String::as_str)
             .map(BtMseMode::from)
+            .unwrap_or_default(),
+        upload_slots: cfg
+            .get("bt_upload_slots")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0),
+        sequential: cfg
+            .get("bt_piece_order")
+            .is_some_and(|value| value == "sequential"),
+        first_last_pieces_first: cfg
+            .get("bt_first_last_pieces_first")
+            .is_some_and(|value| value == "true"),
+        enable_lsd: flag("bt_enable_lsd", true),
+        utp_ledbat: cfg
+            .get("bt_utp_congestion")
+            .is_none_or(|value| value != "cubic"),
+        max_connections: cfg
+            .get("bt_max_connections")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(defaults.max_connections),
+        max_connections_per_torrent: cfg
+            .get("bt_max_connections_per_torrent")
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|limit| *limit > 0)
+            .unwrap_or(defaults.max_connections_per_torrent),
+        enable_webseed: flag("bt_enable_webseed", true),
+        announce_all_tiers: flag("bt_announce_all_tiers", true),
+        announce_all_trackers: flag("bt_announce_all_trackers", true),
+        proxy_enabled: flag("bt_proxy_enabled", false),
+        proxy_source: cfg
+            .get("bt_proxy_source")
+            .map(String::as_str)
+            .map(BtProxySource::from)
+            .unwrap_or_default(),
+        proxy_peers: flag("bt_proxy_peers", true),
+        i2p_enabled: flag("bt_i2p_enabled", false),
+        i2p_sam_host: cfg
+            .get("bt_i2p_sam_host")
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(defaults.i2p_sam_host),
+        i2p_sam_port: cfg
+            .get("bt_i2p_sam_port")
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|port| *port > 0)
+            .unwrap_or(defaults.i2p_sam_port),
+        i2p_mixed: flag("bt_i2p_mixed", false),
+    }
+}
+
+/// 重建 BT 会话的会话级键（监听、传输、节点与数据来源、代理、I2P、上传槽数）。
+const BT_SESSION_KEYS: &[&str] = &[
+    "bt_enabled",
+    "bt_enable_dht",
+    "bt_enable_upnp",
+    "bt_enable_utp",
+    "bt_enable_lsd",
+    "bt_enable_webseed",
+    "bt_utp_congestion",
+    "bt_port_start",
+    "bt_port_end",
+    "bt_mse_mode",
+    "bt_upload_slots",
+    "bt_announce_all_tiers",
+    "bt_announce_all_trackers",
+    "bt_proxy_enabled",
+    "bt_proxy_source",
+    "bt_proxy_peers",
+    "bt_i2p_enabled",
+    "bt_i2p_sam_host",
+    "bt_i2p_sam_port",
+    "bt_i2p_mixed",
+];
+
+/// 本次写入的 `keys` 是否需要重建 BT 会话（`all` = 写入后的完整配置）。
+///
+/// 会话的代理出口在建会话时定死，所以除会话级 `bt_*` 键外，BT 走手动代理时手动代理
+/// 服务器本身（`proxy_*`，站点规则除外）变了也要重建；走系统代理时它与「代理」页无关。
+/// 重建由引擎接管在跑的任务：下载在新会话上继续，做种重新挂载。
+#[must_use]
+pub fn bt_session_rebuild_needed(keys: &[&str], all: &HashMap<String, String>) -> bool {
+    if keys.iter().any(|key| BT_SESSION_KEYS.contains(key)) {
+        return true;
+    }
+    let manual_bt_proxy = all.get("bt_proxy_enabled").is_some_and(|v| v == "true")
+        && all
+            .get("bt_proxy_source")
+            .map(String::as_str)
+            .map(fluxdown_engine::bt_config::BtProxySource::from)
+            .unwrap_or_default()
+            == fluxdown_engine::bt_config::BtProxySource::Manual;
+    let rules_key = fluxdown_engine::proxy_rules::PROXY_RULES_KEY;
+    manual_bt_proxy
+        && keys
+            .iter()
+            .any(|key| key.starts_with("proxy_") && *key != rules_key)
+}
+
+/// 从持久化配置构建 BT 防吸血配置（`bt_guard_*` 键，值域见 `fluxdown_protocol::DAEMON_CONFIG_FIELDS`）。
+///
+/// 缺失或无法解析的值回落到 [`BtGuardConfig::default`]（即契约默认值）；写入路径已由
+/// [`validate_config_patch`] 校验，这里只防御旧库 / 手改库里的脏值。全部键热生效：
+/// 不在 `invalidate_bt_session` 的监听类键之列，不会重建 BT 会话。
+#[cfg(feature = "bt")]
+#[must_use]
+pub fn bt_guard_config_from_map(cfg: &HashMap<String, String>) -> BtGuardConfig {
+    let defaults = BtGuardConfig::default();
+    let flag = |key: &str, default: bool| -> bool {
+        match cfg.get(key).map(|value| value.trim()) {
+            Some("true" | "1") => true,
+            Some("false" | "0") => false,
+            _ => default,
+        }
+    };
+    let number = |key: &str, min: u64, max: u64| -> Option<u64> {
+        cfg.get(key)
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| (min..=max).contains(value))
+    };
+    let rule = |key: &str, default: RuleMode| -> RuleMode {
+        cfg.get(key)
+            .and_then(|value| value.trim().parse::<RuleMode>().ok())
+            .unwrap_or(default)
+    };
+    // 数值范围与 `daemon_config.rs` 键目录一致；范围外视为脏值回落默认。
+    let as_u32 = |value: Option<u64>, default: u32| {
+        value
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(default)
+    };
+    BtGuardConfig {
+        enabled: flag("bt_guard_enabled", defaults.enabled),
+        rule_excessive: rule("bt_guard_rule_excessive", defaults.rule_excessive),
+        rule_rerequest: rule("bt_guard_rule_rerequest", defaults.rule_rerequest),
+        rule_rewind: rule("bt_guard_rule_rewind", defaults.rule_rewind),
+        rule_lag: rule("bt_guard_rule_lag", defaults.rule_lag),
+        rule_fingerprint: rule("bt_guard_rule_fingerprint", defaults.rule_fingerprint),
+        cloud_mode: rule("bt_guard_cloud_mode", defaults.cloud_mode),
+        excess_ratio_pct: as_u32(
+            number("bt_guard_excess_ratio_pct", 110, 2000),
+            defaults.excess_ratio_pct,
+        ),
+        min_torrent_mib: number("bt_guard_min_torrent_mib", 0, 1_048_576)
+            .unwrap_or(defaults.min_torrent_mib),
+        rewind_tolerance_pct: as_u32(
+            number("bt_guard_rewind_tolerance_pct", 0, 100),
+            defaults.rewind_tolerance_pct,
+        ),
+        throttle_kib: as_u32(
+            number("bt_guard_throttle_kib", 1, 1_048_576),
+            defaults.throttle_kib,
+        ),
+        ban_base_hours: as_u32(
+            number("bt_guard_ban_base_hours", 1, 720),
+            defaults.ban_base_hours,
+        ),
+        ban_max_days: as_u32(
+            number("bt_guard_ban_max_days", 1, 365),
+            defaults.ban_max_days,
+        ),
+        downloading_max_action: cfg
+            .get("bt_guard_downloading_max_action")
+            .and_then(|value| value.trim().parse::<DownloadingMaxAction>().ok())
+            .unwrap_or(defaults.downloading_max_action),
+        skip_private: flag("bt_guard_skip_private", defaults.skip_private),
+        skip_lan: flag("bt_guard_skip_lan", defaults.skip_lan),
+        ipv6_prefix: number("bt_guard_ipv6_prefix", 48, 128)
+            .and_then(|value| u8::try_from(value).ok())
+            .unwrap_or(defaults.ipv6_prefix),
+        filter_urls: cfg.get("bt_guard_filter_urls").cloned().unwrap_or_default(),
+        cloud_enabled: flag("bt_guard_cloud_enabled", defaults.cloud_enabled),
+        report_enabled: flag("bt_guard_report_enabled", defaults.report_enabled),
+        client_rules: cfg
+            .get("bt_guard_client_rules")
+            .map(|json| fluxdown_engine::bt_guard::parse_local_client_rules(json))
             .unwrap_or_default(),
     }
 }
@@ -478,6 +657,211 @@ mod tests {
 
         map.insert("bt_enabled".to_string(), "true".to_string());
         assert!(super::bt_config_from_map(&map).enabled, "explicit true");
+    }
+
+    fn patch(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn guard_patch_is_normalized_but_not_recoded_to_engine_numeric_booleans() {
+        let normalized = validate_config_patch(&patch(&[
+            ("bt_guard_enabled", "0"),
+            ("bt_guard_rule_lag", " enforce "),
+            ("bt_guard_ipv6_prefix", " 56 "),
+            ("bt_guard_report_enabled", "1"),
+            (
+                "bt_guard_filter_urls",
+                "  https://a.test/x\nhttps://b.test/y  ",
+            ),
+        ]))
+        .expect("valid guard patch");
+        assert_eq!(normalized["bt_guard_enabled"], "false");
+        assert_eq!(normalized["bt_guard_rule_lag"], "enforce");
+        assert_eq!(normalized["bt_guard_ipv6_prefix"], "56");
+        assert_eq!(normalized["bt_guard_report_enabled"], "true");
+        assert_eq!(
+            normalized["bt_guard_filter_urls"],
+            "https://a.test/x\nhttps://b.test/y"
+        );
+    }
+
+    #[test]
+    fn guard_patch_rejects_bad_values() {
+        for (key, value) in [
+            ("bt_guard_excess_ratio_pct", "109"),
+            ("bt_guard_ipv6_prefix", "47"),
+            ("bt_guard_ipv6_prefix", "129"),
+            ("bt_guard_throttle_kib", "0"),
+            ("bt_guard_rule_rewind", "ban"),
+            ("bt_guard_downloading_max_action", "enforce"),
+            ("bt_guard_enabled", "yes"),
+        ] {
+            assert!(
+                matches!(
+                    validate_config_patch(&patch(&[(key, value)])),
+                    Err(ConfigError::InvalidValue { .. })
+                ),
+                "{key}={value}"
+            );
+        }
+        // 任一键非法即整体失败，合法键不落库。
+        assert!(
+            validate_config_patch(&patch(&[
+                ("bt_guard_enabled", "true"),
+                ("bt_guard_ban_max_days", "366"),
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn guard_filter_urls_are_visible_in_the_public_config() {
+        let mut all = std::collections::HashMap::new();
+        all.insert(
+            "bt_guard_filter_urls".to_owned(),
+            "https://a.test".to_owned(),
+        );
+        let public = public_config_values(&all);
+        assert!(public.contains_key("bt_guard_filter_urls"));
+    }
+
+    #[cfg(feature = "bt")]
+    #[test]
+    fn guard_config_defaults_match_the_contract() {
+        let cfg = super::bt_guard_config_from_map(&std::collections::HashMap::new());
+        assert_eq!(cfg, fluxdown_engine::bt_guard::BtGuardConfig::default());
+        assert!(cfg.enabled);
+        assert_eq!(cfg.rule_excessive.as_str(), "observe");
+        assert_eq!(cfg.cloud_mode.as_str(), "observe");
+        assert_eq!(cfg.excess_ratio_pct, 200);
+        assert_eq!(cfg.min_torrent_mib, 64);
+        assert_eq!(cfg.rewind_tolerance_pct, 7);
+        assert_eq!(cfg.throttle_kib, 32);
+        assert_eq!(cfg.ban_base_hours, 24);
+        assert_eq!(cfg.ban_max_days, 30);
+        assert_eq!(cfg.downloading_max_action.as_str(), "throttle");
+        assert!(cfg.skip_private && cfg.skip_lan && cfg.cloud_enabled);
+        assert_eq!(cfg.ipv6_prefix, 64);
+        assert!(cfg.filter_urls.is_empty());
+        assert!(!cfg.report_enabled);
+    }
+
+    #[cfg(feature = "bt")]
+    #[test]
+    fn guard_config_maps_every_key_from_a_validated_patch() {
+        let normalized = validate_config_patch(&patch(&[
+            ("bt_guard_enabled", "false"),
+            ("bt_guard_rule_excessive", "enforce"),
+            ("bt_guard_rule_rerequest", "off"),
+            ("bt_guard_rule_rewind", "enforce"),
+            ("bt_guard_rule_lag", "off"),
+            ("bt_guard_rule_fingerprint", "enforce"),
+            ("bt_guard_cloud_mode", "enforce"),
+            ("bt_guard_excess_ratio_pct", "350"),
+            ("bt_guard_min_torrent_mib", "0"),
+            ("bt_guard_rewind_tolerance_pct", "15"),
+            ("bt_guard_throttle_kib", "128"),
+            ("bt_guard_ban_base_hours", "2"),
+            ("bt_guard_ban_max_days", "9"),
+            ("bt_guard_downloading_max_action", "ban"),
+            ("bt_guard_skip_private", "false"),
+            ("bt_guard_skip_lan", "false"),
+            ("bt_guard_ipv6_prefix", "48"),
+            ("bt_guard_filter_urls", "https://a.test/x"),
+            ("bt_guard_cloud_enabled", "false"),
+            ("bt_guard_report_enabled", "true"),
+        ]))
+        .expect("valid patch");
+        let all: std::collections::HashMap<String, String> = normalized.into_iter().collect();
+        let cfg = super::bt_guard_config_from_map(&all);
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.rule_excessive.as_str(), "enforce");
+        assert_eq!(cfg.rule_rerequest.as_str(), "off");
+        assert_eq!(cfg.rule_rewind.as_str(), "enforce");
+        assert_eq!(cfg.rule_lag.as_str(), "off");
+        assert_eq!(cfg.rule_fingerprint.as_str(), "enforce");
+        assert_eq!(cfg.cloud_mode.as_str(), "enforce");
+        assert_eq!(cfg.excess_ratio_pct, 350);
+        assert_eq!(cfg.min_torrent_mib, 0);
+        assert_eq!(cfg.rewind_tolerance_pct, 15);
+        assert_eq!(cfg.throttle_kib, 128);
+        assert_eq!(cfg.ban_base_hours, 2);
+        assert_eq!(cfg.ban_max_days, 9);
+        assert_eq!(cfg.downloading_max_action.as_str(), "ban");
+        assert!(!cfg.skip_private && !cfg.skip_lan && !cfg.cloud_enabled);
+        assert_eq!(cfg.ipv6_prefix, 48);
+        assert_eq!(cfg.filter_urls, "https://a.test/x");
+        assert!(cfg.report_enabled);
+    }
+
+    #[cfg(feature = "bt")]
+    #[test]
+    fn guard_config_falls_back_to_defaults_on_dirty_stored_values() {
+        let dirty: std::collections::HashMap<String, String> = [
+            ("bt_guard_enabled", "maybe"),
+            ("bt_guard_rule_lag", "ban"),
+            ("bt_guard_excess_ratio_pct", "5"),
+            ("bt_guard_min_torrent_mib", "-1"),
+            ("bt_guard_throttle_kib", "0"),
+            ("bt_guard_ban_max_days", "99999"),
+            ("bt_guard_ipv6_prefix", "300"),
+            ("bt_guard_downloading_max_action", "off"),
+            ("bt_guard_rewind_tolerance_pct", "abc"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        assert_eq!(
+            super::bt_guard_config_from_map(&dirty),
+            fluxdown_engine::bt_guard::BtGuardConfig::default()
+        );
+    }
+
+    fn stored(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn switching_bt_proxy_source_rebuilds_the_session() {
+        let all = stored(&[("bt_proxy_enabled", "true"), ("bt_proxy_source", "system")]);
+        assert!(super::bt_session_rebuild_needed(&["bt_proxy_source"], &all));
+        assert!(super::bt_session_rebuild_needed(
+            &["bt_proxy_enabled"],
+            &all
+        ));
+    }
+
+    #[test]
+    fn manual_server_edits_rebuild_only_for_the_manual_source() {
+        let manual = stored(&[("bt_proxy_enabled", "true")]);
+        assert!(super::bt_session_rebuild_needed(&["proxy_host"], &manual));
+        // 站点规则不进 BT 会话。
+        assert!(!super::bt_session_rebuild_needed(&["proxy_rules"], &manual));
+
+        let system = stored(&[("bt_proxy_enabled", "true"), ("bt_proxy_source", "system")]);
+        assert!(!super::bt_session_rebuild_needed(&["proxy_host"], &system));
+
+        let off = stored(&[("bt_proxy_enabled", "false")]);
+        assert!(!super::bt_session_rebuild_needed(&["proxy_host"], &off));
+    }
+
+    #[test]
+    fn bt_config_reads_the_proxy_source() {
+        use fluxdown_engine::bt_config::BtProxySource;
+        let read = |pairs: &[(&str, &str)]| super::bt_config_from_map(&stored(pairs)).proxy_source;
+        assert_eq!(read(&[]), BtProxySource::Manual);
+        assert_eq!(
+            read(&[("bt_proxy_source", "system")]),
+            BtProxySource::System
+        );
+        assert_eq!(read(&[("bt_proxy_source", "junk")]), BtProxySource::Manual);
     }
 }
 

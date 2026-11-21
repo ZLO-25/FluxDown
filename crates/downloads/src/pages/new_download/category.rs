@@ -2,12 +2,14 @@
 //! 同行左侧的下拉可切换「自动 / 不分类 / 指定分类」。纯规则见 [`crate::model::save_dir_category`]。
 //!
 //! 状态机（默认 `Auto`）：
-//! - `Auto`：预测输入（重命名框 / 第一条链接已识别名 / 第一条 URL）变化时，目录框仍是空、初始目录
-//!   或上次自动写入值才改写，用户手动改过的目录不再覆盖；提交沿用 `follows` 路由；
+//! - `Auto`：预测输入（重命名框 / 第一条链接已识别名 / 第一条 URL）变化时，目录框未被手改
+//!   （空、等于表单上次写入值，尚未写过时等于初始目录）才改写；用户手动改过的目录（包括改回
+//!   初始目录或改成另一个分类目录）既不再覆盖，提交也不路由，以用户选择为准；
 //! - `NoCategory`：目录框 = 初始目录，提交不路由；
 //! - `Category(id)`：目录框 = 该分类目录，提交不路由（用户显式选择优先）。
 //!
-//! 渲染只读 entity 里的状态（预测结果在输入变化时写入 `category_predicted`）。
+//! 表单当前对应的分类（显式所选 / 自动命中）下用户手动选过的目录记入分类目录记忆，
+//! 目录下拉优先列出。渲染只读 entity 里的状态（预测结果在输入变化时写入 `category_predicted`）。
 
 use fluxdown_ui_components::{ControlExt as _, FluxIcon, category_icon};
 use fluxdown_ui_theme::active_theme;
@@ -25,7 +27,9 @@ use gpui_component::{
 
 use super::NewDownloadView;
 use crate::model::save_dir_category::{
-    CategoryMode, auto_follow_target, category_options, matched_category, predict_save_dir,
+    CategoryMode, auto_follow_target, category_mode_save_dir, category_options,
+    category_route_eligible, matched_category, predict_save_dir, restore_category_mode,
+    save_dir_untouched,
 };
 
 /// 分类下拉触发器定宽（图标 + 名称 + chevron）。
@@ -47,11 +51,9 @@ struct MenuEntry {
 }
 
 impl NewDownloadView {
-    /// 分类选择器可见：有可路由的分类、有可选目录，且目标是本机。
+    /// 本机始终显示，空分类列表仍可切换「自动 / 不分类」。
     fn category_picker_visible(&self) -> bool {
-        self.context.category_route.is_some()
-            && !self.context.category_options.is_empty()
-            && !self.is_remote()
+        !self.is_remote()
     }
 
     /// 快捷添加的网址规则在本表单内生效：追加进分类列表并重算路由 / 候选，模式回「自动」
@@ -76,6 +78,7 @@ impl NewDownloadView {
             fluxdown_protocol::CategoryRouteDto::from_categories(&categories);
         self.context.category_options = category_options(&categories);
         self.category_mode = CategoryMode::Auto;
+        self.category_mode_touched = true;
         self.sync_category(window, cx);
         cx.notify();
     }
@@ -96,7 +99,17 @@ impl NewDownloadView {
             fluxdown_protocol::CategoryRouteDto::from_categories(&categories);
         self.context.category_options = category_options(&categories);
         self.context.custom_categories = categories;
-        if let CategoryMode::Category(id) = &self.category_mode
+        if !self.category_mode_touched
+            && !self.category_dir_manually_edited
+            && self.save_dir_untouched(cx)
+        {
+            let mode = restore_category_mode(
+                self.context.initial_category_mode.as_deref(),
+                &self.context.category_options,
+            );
+            self.set_category_mode(mode, window, cx);
+            self.category_mode_touched = false;
+        } else if let CategoryMode::Category(id) = &self.category_mode
             && !self
                 .context
                 .category_options
@@ -136,64 +149,90 @@ impl NewDownloadView {
         }
     }
 
-    /// 预测输入变化后调用：刷新预测结果，`Auto` 模式下让目录框跟随。没有分类路由时什么都不做
-    /// （表单行为与未配置分类目录时完全一致）。
-    pub(super) fn sync_category(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.context.category_route.is_none() {
-            return;
+    /// 目录框是否仍是表单写入的值（用户没手动改过），见 [`dir_untouched`]。
+    pub(super) fn save_dir_untouched(&self, cx: &App) -> bool {
+        save_dir_untouched(
+            &self.save_dir.read(cx).value(),
+            &self.context.save_dir,
+            self.category_written_dir.as_deref(),
+            self.category_dir_manually_edited,
+        )
+    }
+
+    /// 提交是否挂分类路由：自动模式且目录框未被手改。
+    pub(super) fn routes_by_category(&self, cx: &App) -> bool {
+        category_route_eligible(&self.category_mode, self.save_dir_untouched(cx))
+    }
+
+    /// 分类目录记忆的键：显式所选分类，或自动模式命中（触发器显示）的分类；不分类 / 无命中 /
+    /// 远端目标为 `None`。
+    pub(super) fn memory_category(&self) -> Option<&str> {
+        if !self.category_picker_visible() {
+            return None;
         }
+        match &self.category_mode {
+            CategoryMode::Auto => matched_category(
+                &self.context.category_options,
+                self.category_predicted.as_deref(),
+            )
+            .map(|option| option.id.as_str()),
+            CategoryMode::NoCategory => None,
+            CategoryMode::Category(id) => Some(id.as_str()),
+        }
+    }
+
+    /// 预测输入变化后更新预测结果；自动模式仅在目录未被用户手动指定时跟随。
+    pub(super) fn sync_category(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let predicted = self.predict_category_dir(cx);
         if self.category_predicted != predicted {
             self.category_predicted.clone_from(&predicted);
             cx.notify();
         }
-        if self.category_mode != CategoryMode::Auto {
+        if self.category_mode != CategoryMode::Auto || self.category_dir_manually_edited {
             return;
         }
         let current = self.save_dir.read(cx).value().to_string();
         let Some(target) = auto_follow_target(
             &current,
             &self.context.save_dir,
-            self.category_auto_dir.as_deref(),
+            self.category_written_dir.as_deref(),
             predicted.as_deref(),
+            self.category_dir_manually_edited,
         ) else {
             return;
         };
         self.set_save_dir_text(&target, window, cx);
-        self.category_auto_dir = Some(target);
+        self.category_written_dir = Some(target);
         cx.notify();
     }
 
-    /// 下拉选择：`Auto` 立即按当前输入重算并写入；其余模式直接写目录框。
-    fn set_category_mode(
+    /// 下拉选择：`Auto` 立即按当前输入重算并写入；其余模式直接写目录框。写入值都记为
+    /// 表单写入值并清除手动标记（任一模式都是显式选择），之后用户再改即视为手改。
+    pub(super) fn set_category_mode(
         &mut self,
         mode: CategoryMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let offered = self.context.save_dir.trim().to_owned();
-        match &mode {
-            CategoryMode::Auto => {
-                let predicted = self.predict_category_dir(cx);
-                let target = predicted.clone().unwrap_or(offered);
-                self.category_predicted = predicted;
-                self.set_save_dir_text(&target, window, cx);
-                self.category_auto_dir = Some(target);
-            }
-            CategoryMode::NoCategory => self.set_save_dir_text(&offered, window, cx),
-            CategoryMode::Category(id) => {
-                let Some(dir) = self
-                    .context
-                    .category_options
-                    .iter()
-                    .find(|option| option.id == *id)
-                    .map(|option| option.save_dir.clone())
-                else {
-                    return;
-                };
-                self.set_save_dir_text(&dir, window, cx);
-            }
+        let predicted = (mode == CategoryMode::Auto)
+            .then(|| self.predict_category_dir(cx))
+            .flatten();
+        let Some(target) = category_mode_save_dir(
+            &mode,
+            &self.context.category_options,
+            &offered,
+            predicted.as_deref(),
+        ) else {
+            return;
+        };
+        if mode == CategoryMode::Auto {
+            self.category_predicted = predicted;
         }
+        self.category_dir_manually_edited = false;
+        self.set_save_dir_text(&target, window, cx);
+        self.category_written_dir = Some(target);
+        self.category_mode_touched = true;
         self.category_mode = mode;
         cx.notify();
     }

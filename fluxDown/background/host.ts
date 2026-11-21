@@ -19,6 +19,7 @@ import { parsePageScriptSource, parsePageScriptsIndex } from "./page-scripts/mod
 import type { PageScriptSource, PageScriptsIndex } from "./page-scripts/model";
 import type { HostCapabilities, HostSyncStatus, ResolverInfo } from "./protocol";
 import { logWarn } from "@/utils/error-log";
+import { isAndroidPlatform } from "@/utils/platform";
 
 const CAPABILITIES_TTL_MS = 60_000;
 /** 未连接时的结果只缓存很短时间，App 一启动就能被感知。 */
@@ -89,6 +90,8 @@ async function probeCapabilities(): Promise<HostCapabilities> {
     const connected = await checkFluxDownAvailable().catch(() => false);
     return { ...PROTOCOL_ONE_OFFLINE, connected };
   }
+  // Android：本机通道是 Intent 唤起 App（单向投递，没有能力协议），视为可投递。
+  if (await isAndroidPlatform()) return { ...PROTOCOL_ONE_OFFLINE, connected: true };
 
   const reply = await nmhCall<CapabilitiesData>("capabilities", {});
   if (reply.success) {

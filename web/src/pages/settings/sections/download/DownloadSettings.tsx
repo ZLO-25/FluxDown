@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import { useT } from '../../../../i18n'
+import { HASH_ALGORITHM_LABELS } from '../../../../lib/fileHash'
 import { LATER_QUEUE_ID, MAIN_QUEUE_ID, rpc, useDaemon } from '../../../../lib/rpc'
 import type { QueueDto } from '../../../../lib/rpc'
 import { rpcErrorText } from '../../../../lib/rpcErrorText'
@@ -28,7 +29,7 @@ import {
   setPref,
   useSettingsReadOnly,
 } from '../../kit'
-import { SAVE_DIR_HISTORY_ENABLED_PREF, SAVE_DIR_HISTORY_PREF, readSaveDirHistory } from '../../../../lib/saveDirHistory'
+import { CATEGORY_SAVE_DIR_HISTORY_PREF, SAVE_DIR_HISTORY_ENABLED_PREF, SAVE_DIR_HISTORY_PREF, readCategorySaveDirHistory, readSaveDirHistory } from '../../../../lib/saveDirHistory'
 import { RateLimitRow } from './RateLimitField'
 import { DirPickerDialog } from './DirPickerDialog'
 import { UserAgentRow } from './UserAgentField'
@@ -36,6 +37,7 @@ import { AutoCountRow } from './AutoCountRow'
 import { RetentionRow } from './RetentionRow'
 import { CategoriesGroup } from './CategoriesGroup'
 
+import { Aria2OptionsEditor } from './Aria2OptionsEditor'
 const NO_QUEUES: readonly QueueDto[] = []
 const selectQueues = (daemon: { queues: readonly QueueDto[] }) => daemon.queues
 /** Radix Select 不允许空值项：用哨兵表示「默认队列」（`default_queue_id` = ''）。 */
@@ -52,6 +54,7 @@ export function DownloadSettings() {
       <RetrySection />
       <SettingsSection title={t('settingsGroupAdvanced')}>
         <UserAgentRow />
+        <Aria2OptionsEditor />
       </SettingsSection>
       <CategoriesGroup disabled={readOnly} />
     </SettingsPage>
@@ -81,14 +84,19 @@ function SaveLocationSection() {
   )
 }
 
-/** 清空新建下载的保存目录历史（设备本地偏好，写 null 移除）；没有记录时按钮置灰。 */
+/** 清空新建下载的保存目录历史与分类目录记忆（设备本地偏好，写 null 移除）；两者都没有记录时按钮置灰。 */
 function ClearSaveDirHistoryRow() {
   const t = useT()
   const readOnly = useSettingsReadOnly()
-  const empty = readSaveDirHistory(usePrefRaw(SAVE_DIR_HISTORY_PREF)).length === 0
+  const historyEmpty = readSaveDirHistory(usePrefRaw(SAVE_DIR_HISTORY_PREF)).length === 0
+  const categoryEmpty = Object.keys(readCategorySaveDirHistory(usePrefRaw(CATEGORY_SAVE_DIR_HISTORY_PREF))).length === 0
+  const clear = () => {
+    setPref(SAVE_DIR_HISTORY_PREF, null)
+    setPref(CATEGORY_SAVE_DIR_HISTORY_PREF, null)
+  }
   return (
     <SettingsRow title={t('clearSaveDirHistory')} description={optionalText(t, 'clearSaveDirHistoryDesc')}>
-      <Button variant="outline" className="shrink-0" disabled={readOnly || empty} onClick={() => setPref(SAVE_DIR_HISTORY_PREF, null)}>
+      <Button variant="outline" className="shrink-0" disabled={readOnly || (historyEmpty && categoryEmpty)} onClick={clear}>
         {t('clearSaveDirHistoryAction')}
       </Button>
     </SettingsRow>
@@ -128,12 +136,19 @@ function BehaviorSection() {
   return (
     <SettingsSection title={t('settingsGroupBehavior')}>
       <PrefSwitchRow prefKey="download.silent_download" fallback={false} titleKey="silentDownload" descKey="silentDownloadDesc" />
-      {silent ? <PrefSwitchRow prefKey="download.silent_skip_selection" fallback={false} titleKey="silentSkipSelection" descKey="silentSkipSelectionDesc" /> : null}
+      {silent ? (
+        <>
+          <PrefSwitchRow prefKey="download.silent_auto_category" fallback={true} titleKey="silentAutoCategory" descKey="silentAutoCategoryDesc" />
+          <PrefSwitchRow prefKey="download.silent_skip_selection" fallback={false} titleKey="silentSkipSelection" descKey="silentSkipSelectionDesc" />
+        </>
+      ) : null}
       <DaemonSwitchRow configKey="use_server_time" titleKey="useServerTime" descKey="useServerTimeDesc" />
       <DaemonEnumRow configKey="file_exists_behavior" titleKey="fileExistsBehavior" descKey="fileExistsBehaviorDesc" labelPrefix="fileExists" />
       <DaemonEnumRow configKey="file_missing_action" titleKey="fileMissingAction" descKey="fileMissingActionDesc" labelPrefix="fileMissing" />
       <RetentionRow />
       <DaemonSwitchRow configKey="idle_file_scan" titleKey="idleFileScan" descKey="idleFileScanDesc" />
+      <DaemonSwitchRow configKey="hash_after_download" titleKey="hashAfterDownload" descKey="hashAfterDownloadDesc" />
+      <DaemonEnumRow configKey="hash_algorithm" titleKey="hashAlgorithm" descKey="hashAlgorithmDesc" labels={HASH_ALGORITHM_LABELS} />
       <DefaultQueueRow />
     </SettingsSection>
   )

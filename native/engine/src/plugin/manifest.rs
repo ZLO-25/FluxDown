@@ -14,7 +14,7 @@
 //! （`packages/plugin-sdk/src/manifest.ts::validatePackage`）做准入，市场收录的包必须能在客户端
 //! 安装：改字段、权限、事件、设置矩阵或安装限制时同步 SDK 并发版，索引仓自动同步。
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +73,21 @@ pub struct SettingOption {
     pub label: String,
 }
 
+/// Optional display-text overrides for one client locale; setting values never change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SettingLocalization {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub helper_label: Option<String>,
+    /// Existing option value → translated label.
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
+}
+
 /// 声明式设置项。engine 侧唯一校验语义源。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -111,6 +126,9 @@ pub struct SettingField {
     /// 辅助脚本按钮文案（空则宿主用默认文案「复制获取脚本」）。
     #[serde(default)]
     pub helper_label: Option<String>,
+    /// Client-local display text; absent translations fall back to the original text.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub localizations: BTreeMap<String, SettingLocalization>,
 }
 
 impl SettingField {
@@ -230,6 +248,9 @@ pub struct MainDecl {
     /// 是否随 daemon 启动常驻（需 `background` 权限）。
     #[serde(default)]
     pub background: bool,
+    /// `flux.images.load` 可请求的来源主机；并入用户授权的网络主机集合。
+    #[serde(default)]
+    pub image_hosts: Vec<String>,
 }
 
 /// 视图放置位置。
@@ -240,6 +261,8 @@ pub enum ViewLocation {
     Settings,
     TaskDetail,
     Window,
+    /// 登录弹窗承载的视图（至多 1 个，要求声明 `auth`）。
+    Auth,
 }
 
 impl ViewLocation {
@@ -248,6 +271,7 @@ impl ViewLocation {
             ViewLocation::Activity => "activity",
             ViewLocation::Settings => "settings",
             ViewLocation::TaskDetail => "taskDetail",
+            ViewLocation::Auth => "auth",
             ViewLocation::Window => "window",
         }
     }
@@ -365,7 +389,17 @@ pub struct PageScriptDecl {
     pub all_frames: bool,
 }
 
-/// 贡献点。空数组等同未声明。
+/// Signed archive classification rules; requires the existing `archive` permission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArchiveRulesDecl {
+    pub entry: String,
+    pub public_key: String,
+    #[serde(default)]
+    pub update_url: Option<String>,
+}
+
+/// Contributions. Empty arrays are equivalent to absent declarations.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ContributesDecl {
@@ -379,6 +413,12 @@ pub struct ContributesDecl {
     /// 浏览器页面脚本（0..=16 条），需 `pageScripts` 权限。
     #[serde(default)]
     pub page_scripts: Vec<PageScriptDecl>,
+    /// 归档脚本（相对路径，`.js`），需 `archive` 权限。
+    #[serde(default)]
+    pub archive: Option<String>,
+    /// Independently updateable, publisher-signed archive classification rules.
+    #[serde(default)]
+    pub archive_rules: Option<ArchiveRulesDecl>,
 }
 
 /// 插件风险等级（由权限推导）。
@@ -487,8 +527,10 @@ pub const PERMISSION_BACKGROUND: &str = "background";
 pub const PERMISSION_INTERCEPT: &str = "intercept";
 /// 浏览器页面脚本权限名（风险 Full：脚本在用户任意匹配网页内运行）。
 pub const PERMISSION_PAGE_SCRIPTS: &str = "pageScripts";
+/// 归档脚本权限名。
+pub const PERMISSION_ARCHIVE: &str = "archive";
 /// 合法能力权限（manifest `permissions`）。
-pub const VALID_PERMISSIONS: [&str; 9] = [
+pub const VALID_PERMISSIONS: [&str; 10] = [
     PERMISSION_FFMPEG,
     PERMISSION_YTDLP,
     PERMISSION_AUTH,
@@ -498,6 +540,7 @@ pub const VALID_PERMISSIONS: [&str; 9] = [
     PERMISSION_BACKGROUND,
     PERMISSION_INTERCEPT,
     PERMISSION_PAGE_SCRIPTS,
+    PERMISSION_ARCHIVE,
 ];
 
 impl PluginManifest {
@@ -761,6 +804,7 @@ impl PluginManifest {
                     | PERMISSION_BROWSER_RULES
                     | PERMISSION_BACKGROUND
                     | PERMISSION_INTERCEPT
+                    | PERMISSION_ARCHIVE
             )
         }) {
             PluginRisk::Elevated
@@ -769,14 +813,27 @@ impl PluginManifest {
         }
     }
 
-    /// 所有 view `desktop.networkHosts` 的排序去重并集。
+    /// `main.imageHosts`、view `desktop.networkHosts` 与 archive update 主机的排序去重并集。
     pub fn network_hosts(&self) -> Vec<String> {
         let mut hosts: Vec<String> = self
-            .contributes
+            .main
             .iter()
-            .flat_map(|c| c.views.iter())
-            .filter_map(|v| v.desktop.as_ref())
-            .flat_map(|d| d.network_hosts.iter().cloned())
+            .flat_map(|main| main.image_hosts.iter().cloned())
+            .chain(
+                self.contributes
+                    .iter()
+                    .flat_map(|c| c.views.iter())
+                    .filter_map(|v| v.desktop.as_ref())
+                    .flat_map(|d| d.network_hosts.iter().cloned()),
+            )
+            .chain(
+                self.contributes
+                    .iter()
+                    .filter_map(|c| c.archive_rules.as_ref())
+                    .filter_map(|rules| rules.update_url.as_ref())
+                    .filter_map(|url| url::Url::parse(url).ok())
+                    .filter_map(|url| url.host_str().map(str::to_owned)),
+            )
             .collect();
         hosts.sort();
         hosts.dedup();
@@ -800,6 +857,8 @@ impl PluginManifest {
             files.extend(c.views.iter().filter_map(|v| v.icon.clone()));
             files.extend(c.sniff_rules.iter().cloned());
             files.extend(c.page_scripts.iter().flat_map(|s| s.js.iter().cloned()));
+            files.extend(c.archive.iter().cloned());
+            files.extend(c.archive_rules.iter().map(|rules| rules.entry.clone()));
         }
         files
     }
@@ -812,6 +871,24 @@ impl PluginManifest {
             }
         }
         Ok(())
+    }
+
+    /// Validate the signed archive rules seed package content.
+    pub fn validate_archive_rules_content(
+        &self,
+        read: impl Fn(&str) -> Option<Vec<u8>>,
+    ) -> Result<(), PluginError> {
+        let Some(rules) = self
+            .contributes
+            .as_ref()
+            .and_then(|c| c.archive_rules.as_ref())
+        else {
+            return Ok(());
+        };
+        let bytes = read(&rules.entry).ok_or_else(|| {
+            PluginError::ManifestInvalid(format!("包内缺少文件 '{}'", rules.entry))
+        })?;
+        super::archive_rules::VerifiedArchiveRules::verify(&bytes, &rules.public_key).map(|_| ())
     }
 }
 
@@ -854,7 +931,19 @@ fn validate_main(m: &PluginManifest) -> Result<(), PluginError> {
         }
     }
     if main.background && !m.has_permission(PERMISSION_BACKGROUND) {
-        return manifest_err("main.background 为 true 时 permissions 必须包含 background".into());
+        return manifest_err("main.background requires the background permission".to_owned());
+    }
+    if main.image_hosts.len() > NETWORK_HOSTS_MAX {
+        return manifest_err(format!("main.imageHosts 至多 {NETWORK_HOSTS_MAX} 项"));
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for host in &main.image_hosts {
+        if !is_valid_network_host(host) {
+            return manifest_err(format!("main.imageHosts '{host}' 非法"));
+        }
+        if !seen.insert(host.as_str()) {
+            return manifest_err(format!("main.imageHosts '{host}' 重复"));
+        }
     }
     Ok(())
 }
@@ -867,6 +956,7 @@ fn validate_contributes(m: &PluginManifest) -> Result<(), PluginError> {
     if c.views.len() > VIEWS_MAX {
         return manifest_err(format!("contributes.views 至多 {VIEWS_MAX} 项"));
     }
+    let mut auth_views = 0usize;
     let mut seen: HashSet<&str> = HashSet::new();
     let mut settings_views = 0usize;
     for v in &c.views {
@@ -890,6 +980,15 @@ fn validate_contributes(m: &PluginManifest) -> Result<(), PluginError> {
             settings_views += 1;
             if settings_views > 1 {
                 return manifest_err("location 为 settings 的 view 至多 1 个".into());
+            }
+        }
+        if v.location == ViewLocation::Auth {
+            auth_views += 1;
+            if auth_views > 1 {
+                return manifest_err("location 为 auth 的 view 至多 1 个".into());
+            }
+            if m.auth.is_none() {
+                return manifest_err("location 为 auth 的 view 要求声明 auth".into());
             }
         }
         match &v.desktop {
@@ -949,6 +1048,39 @@ fn validate_contributes(m: &PluginManifest) -> Result<(), PluginError> {
         }
         if !m.has_permission(PERMISSION_BROWSER_RULES) {
             return manifest_err("声明 sniffRules 时 permissions 必须包含 browserRules".into());
+        }
+    }
+    if let Some(entry) = &c.archive {
+        if !is_safe_relative_path(entry) {
+            return manifest_err(format!("archive 路径 '{entry}' 非法"));
+        }
+        if !has_extension(entry, &[".js"]) {
+            return manifest_err(format!("archive '{entry}' 扩展名须为 .js"));
+        }
+        if !m.has_permission(PERMISSION_ARCHIVE) {
+            return manifest_err("声明 archive 时 permissions 必须包含 archive".into());
+        }
+    }
+    if let Some(rules) = &c.archive_rules {
+        if !is_safe_relative_path(&rules.entry) {
+            return manifest_err(format!("archiveRules entry 路径 '{}' 非法", rules.entry));
+        }
+        if !has_extension(&rules.entry, &[".json"]) {
+            return manifest_err("archiveRules entry 扩展名须为 .json".into());
+        }
+        if rules.public_key.len() != 64 || !rules.public_key.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return manifest_err("archiveRules publicKey 须为 64 位十六进制 Ed25519 公钥".into());
+        }
+        if !m.has_permission(PERMISSION_ARCHIVE) {
+            return manifest_err("声明 archiveRules 时 permissions 必须包含 archive".into());
+        }
+        if let Some(update_url) = &rules.update_url
+            && !is_valid_archive_update_url(update_url)
+        {
+            return manifest_err(
+                "archiveRules updateUrl 须为无凭据、无片段的公开 HTTPS URL".into(),
+            );
         }
     }
     validate_page_scripts(m, c)?;
@@ -1226,6 +1358,30 @@ fn is_valid_network_host(host: &str) -> bool {
     })
 }
 
+fn is_valid_archive_update_url(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return super::bridge::is_globally_routable_unicast(ip);
+    }
+    let host = host.to_ascii_lowercase();
+    host != "localhost"
+        && !host.ends_with(".localhost")
+        && !host.ends_with(".local")
+        && is_valid_network_host(&host)
+}
+
 /// 逐字段校验 widget×type 矩阵与值域约束。
 pub fn validate_setting_field(f: &SettingField) -> Result<(), PluginError> {
     let w = f.effective_widget();
@@ -1309,6 +1465,7 @@ pub fn validate_setting_field(f: &SettingField) -> Result<(), PluginError> {
             f.key
         ));
     }
+    super::setting_localization::validate(f)?;
 
     // number default 必须能解析为数字，且落在 min/max 闭区间。
     if t == SettingType::Number
@@ -1395,10 +1552,7 @@ pub fn is_safe_relative_path(p: &str) -> bool {
         }
     }
     // 禁控制字符。
-    if p.chars().any(|c| c.is_control()) {
-        return false;
-    }
-    true
+    !p.chars().any(char::is_control)
 }
 
 /// URL glob 匹配：`*` 是唯一通配符，按 `*` 分段顺序子串匹配（首段前缀锚定、尾段后缀

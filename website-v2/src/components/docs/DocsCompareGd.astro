@@ -159,7 +159,7 @@ function sourceHref(src: Source): string | null {
                   const level = row[side];
                   const Icon = ICONS[level];
                   return (
-                    <td class={`cmp-cell cmp-${level}`}>
+                    <td class={`cmp-cell cmp-${level}`} data-side={side === "fd" ? "FluxDown" : "Ghost Downloader"}>
                       <span class="cmp-icon">
                         <Icon size={14} strokeWidth={2} aria-hidden="true" />
                         {level !== "info" && <span class="sr-only">{LEVEL_TEXT[level]}:</span>}
@@ -341,5 +341,52 @@ function sourceHref(src: Source): string | null {
     display: inline-flex;
     align-items: center;
     gap: 6px;
+  }
+  /* 窄屏:三列表格改为「功能名整行 + 两侧并排」的卡片行,列名由 data-side 标注,不再横向滚动 */
+  @media (max-width: 639px) {
+    .cmp-table {
+      display: block;
+      min-width: 0;
+      font-size: 13.5px;
+    }
+    .cmp-table thead {
+      display: none;
+    }
+    .cmp-table tbody,
+    .cmp-group,
+    .cmp-group th {
+      display: block;
+    }
+    .cmp-group th {
+      padding: 14px 16px 8px;
+    }
+    .cmp-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .cmp-row > th {
+      grid-column: 1 / -1;
+      padding: 12px 16px 4px;
+    }
+    .cmp-cell {
+      padding: 4px 16px 12px;
+      overflow-wrap: anywhere;
+    }
+    .cmp-cell::before {
+      content: attr(data-side);
+      display: block;
+      margin-bottom: 4px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--fg-subtle);
+    }
+    .cmp-cell[data-side="FluxDown"]::before {
+      color: var(--accent-ink);
+    }
+    .cmp-foot {
+      padding-inline: 16px;
+    }
   }
 </style>

@@ -27,6 +27,21 @@ Conventions:
 | [`authenticate(ctx)`](#authenticatectx) | The host drives a login (`begin` / `poll` / `cancel` / `logout` / `status`). | `auth.entry` + permission `auth` | `auth.entry` | [`AuthResult`](#authenticatectx) object |
 | [`subscribe(ctx)`](#subscribectx) | A subscription source of your provider is refreshed. | `subscriptions[0]` | `subscriptions[0].entry` | Normalized feed object |
 | [`main`](#the-main-script) | The daemon (or a view) activates your resident script. | `main` | `main.entry` | — (registers handlers) |
+| [`archive(ctx)`](#archivectx) | An authorized default-directory task reaches routing; no category match is required. | `contributes.archive` + permission `archive` | The `.js` file named by `contributes.archive` | `{ category }`, `{ directories }`, legacy `{ folderName }`, or `null` |
+
+This local-only callback classifies from the known filename, optional source metadata, and (at completion) bounded host-observed content facts; it does not resolve URLs or access files or the network. Its phase/content context requires host 0.6.5 or a matching development host; this is not a claim of publication. The host invokes it for tasks following the authorized default save directory, independently of ordinary category matches. An explicitly selected save directory bypasses it. eD2K tasks are never moved. BT tasks may be archived only after their first completion when exactly one non-padding file is actually selected; this includes a one-file selection from a multi-file torrent. No destination is predicted before completion. The callback uses the unchanged context contract, with the actual selected file name, `isGroup: false`, and content detected from that final file. Each call uses a fresh QuickJS runtime. It can read `flux.settings`, but has no `flux.fetch`, filesystem, task or process APIs.
+
+`ctx` is `{ fileName, metadata?, isGroup?, phase, createdDate, detectedType?, categoryRouting? }`. `categoryRouting: true` advertises category routing support; it is absent on older hosts. A plugin using category results must explicitly check this capability and decline (for example, return `null`) if it is absent. `fileName` is the known final filename; `metadata` is optional source metadata (`platform`, `mediaKind` (`""`, `"series"` or `"post"`), `creatorId`, `creatorName`, `seriesId`, `seriesTitle`, `collectionId`, `collectionTitle`). Each label is limited to 180 UTF-8 bytes and must not contain control characters. Source metadata is distinct from content facts. The host never exposes file bytes, local paths, URLs, request headers or credentials.
+
+`phase` is `"start"` before downloading or `"complete"` after post-processing. `createdDate` is the task's fixed creation date in UTC as `YYYY-MM-DD`; invalid legacy timestamps produce `""`, never today's date. `detectedType`, when present, contains only host-observed content: `{ kind, mime, extension }`. `kind` is one of `archive`, `audio`, `compressed`, `database`, `diagram`, `disk`, `document`, `ebook`, `executable`, `font`, `formula`, `geospatial`, `image`, `metadata`, `model`, `other`, `package`, `playlist`, `presentation`, `rom`, `spreadsheet`, `subtitle`, or `video`. Unknown types and unavailable recognition omit this field; server-provided MIME is not used as evidence.
+
+The host calls eligible file archivers at start and re-evaluates them at completion, even if a start call already selected a directory. Completion sees the final processed artifact and may replace the cached start choice; `null`, invalid output, or an error preserves the previous valid choice. Plugins can return `null` at start for ordinary files and make a content-based decision at completion. Groups are routed once at their root at start, with `isGroup: true`; they have no `detectedType` and are not content-read.
+
+For a group, routing is performed once at the group root; member paths and filenames remain unchanged. Return `null` / `undefined` to leave the task unchanged, or `{ category: "audio" }` to route into a configured built-in category save directory. Supported stable identifiers are `video`, `audio`, `document`, `image`, `program`, `archive`, and `other`. The host resolves the identifier against the submission's category configuration snapshot, using the configured visible category's save directory; renaming a category does not change its identifier (`builtinType`). If the category is missing, hidden, or has no save directory, the host declines the move. Custom category names are never inferred. Category results are mutually exclusive with `directories` and `folderName`; `{ directories: ["Video", "Bilibili", "Creator", "Collection"] }` remains available for safe path components relative to the authorized default directory (up to 8 levels). Existing plugins may continue returning `{ folderName: "The Expanse" }`, which keeps its category-child behavior. Explicit directories bypass automatic category resolution. Empty or unsafe output is ignored (fail-open) and does not fail the download. The first valid result in plugin-identity order wins within each phase. For eligible BT single-file selections, the host moves the entire torrent task root through BT storage migration and restores seeding, preserving torrent-relative paths, filename and boundary pieces. Multiple selected files, explicit save directories, unavailable detection, callback errors, or move conflicts leave the task in its current directory. The choice is consumed once at first completion; later selection changes, reseeding or restart do not reroute it. Because the move runs asynchronously after completion, a file may briefly remain at its original location before a location-change event updates it; no sidebar category is added.
+
+Category results are accepted only for completed, non-group files. The host rejects `{ category }` at start and for groups; group routing continues to support `{ directories }` and legacy `{ folderName }`.
+
+In a resident `main` script, `flux.archiveRules.status()` reads the current verified-pack status and `flux.archiveRules.update()` explicitly requests an update; both require `archive` permission and `contributes.archiveRules`. A pinned publisher key verifies bounded signed JSON. Automatic checks run daily when enabled. Fetch or verification failures retain the last verified pack, and new rules never reclassify historic files.
 
 How scripts are run:
 
@@ -35,7 +50,7 @@ How scripts are run:
 - Code at the top level of the file runs on **every** call, before the entry. An exception thrown at the top level fails the call with `脚本编译失败: …`.
 - If `resolve`, `authenticate` or `subscribe` is not defined the call fails with an error containing `入口 resolve 未定义` (respectively `authenticate` / `subscribe`). A **hook** that is not defined is silently skipped.
 - For `resolve`, `authenticate` and `subscribe` the return value is serialized with `JSON.stringify` and parsed by the host: return a plain object. Do not return an already-stringified JSON string (it would be encoded twice and fail validation). `undefined`, functions and symbols are dropped by `JSON.stringify`.
-- Typed `flux.settings` values, `flux.info` and the entry argument are injected before your script runs.
+- Typed `flux.settings` values, `flux.info` and the entry argument are injected before your script runs. The `archive` entry gets only `flux.settings`, `flux.logger`, `console` and its argument (see [`archive(ctx)`](#archivectx)).
 
 ### `resolve(ctx)`
 
@@ -74,7 +89,9 @@ Return `null` or `undefined` to pass through: FluxDown downloads `ctx.url` uncha
 | `rangeSupported` | boolean | `true` = you guarantee the resolved host honours HTTP Range requests (e.g. googlevideo). Combined with `ephemeral`, FluxDown still skips the probe but plans a full multi-segment download right away instead of the conservative single-stream start. Default `false`: without a probe, Range capability is learned from the first response. |
 | `variants` | array | Multiple quality/format choices — see [Variants](#variants). |
 | `defaultVariantIndex` | integer | Which variant is the default (used on the 60 s picker timeout, do-not-disturb and headless runs). Out-of-range values fall back to `0`. Default `0`. |
-| `manifest` | object | A multi-file result — see [Manifests](#manifest-results). Mutually exclusive with `url`, `variants` and `audioUrl`. |
+| `manifest` | object | A multi-file result — see [Manifests](#manifest-results), including its optional root `archiveMetadata`. Mutually exclusive with `url`, `variants` and `audioUrl`. |
+
+`archiveMetadata` may also be returned at the top level of a normal resolve result. If the result is a manifest and both the resolve result and manifest root provide metadata, the manifest's `archiveMetadata` takes precedence.
 
 After resolution, FluxDown re-examines the *resolved* URL to pick the protocol engine — a resolver may return an HLS playlist, a magnet link or an FTP URL and the right engine takes over.
 
@@ -117,6 +134,7 @@ A manifest describes several files in one result (a share link, a cloud-drive fo
 ```text
 { name?, items: [{ id, name, path?, size?, kind?, variants?: [{ id, label, size? }] }] }
 ```
+`manifest.archiveMetadata` is optional root-level source metadata. When both the resolve result and manifest root supply metadata, the manifest value takes precedence. It is source metadata only, not file-content extraction.
 
 | Field | Rule |
 |---|---|
@@ -270,22 +288,65 @@ The registration APIs (`flux.ui`, `flux.commands`, `flux.rpc`, `flux.events`, `f
 
 ## Which `flux` APIs exist where
 
-The injected `flux` object is the same for all entries except where this table says otherwise. "perm" means the manifest `permissions` entry must be declared; without it the property is `undefined` (guard with `if (flux.ytdlp)`).
+The injected `flux` object is the same for all entries except where this table says otherwise. The `archive` entry is the exception: it runs in a minimal sandbox that only has `flux.settings`, `flux.logger` and `console`; every other row below is absent there (`flux.info`, `flux.storage`, `flux.fetch`, `flux.fs`, `flux.task`, `flux.ffmpeg`, `flux.ffprobe`, `flux.ytdlp`, `flux.auth`, `flux.ui` / `rpc` and the rest, and any file, network, task or process API). "perm" means the manifest `permissions` entry must be declared; without it the property is `undefined` (guard with `if (flux.ytdlp)`).
 
-| API | `resolve` | Hooks (not `onDone`) | `onDone` | `authenticate` | `subscribe` | `main` |
-|---|---|---|---|---|---|---|
-| `flux.fetch` | yes | yes | yes | yes | yes | yes |
-| `flux.storage`, `flux.fs` | yes | yes | yes | yes | yes | yes |
-| `flux.settings`, `flux.info`, `flux.logger`, `console` | yes | yes | yes | yes | yes | yes |
-| `flux.auth` | perm `auth` | perm `auth` | perm `auth` | always (the entry requires `auth`) | perm `auth` | perm `auth` |
-| `flux.task.requestRetry` | no effect (warning) | `onError` only | no effect | no effect | no effect | no effect |
-| `flux.task.recordArtifact` | rejects | rejects | yes | rejects | rejects | rejects |
-| `flux.ffmpeg`, `flux.ffprobe` | `undefined` | perm `ffmpeg`: object exists, `run` rejects, `ffmpeg.available()` works | perm `ffmpeg`, `run` works | `undefined` | `undefined` | perm `ffmpeg`: object exists, `run` rejects |
-| `flux.ytdlp` | perm `ytdlp` | perm `ytdlp` | perm `ytdlp` | **`undefined`** | perm `ytdlp` | perm `ytdlp` |
-| `flux.ui`, `commands`, `rpc`, `events`, `timers`, `settings.update` | — | — | — | — | — | yes |
-| `flux.tasks` | — | — | — | — | — | perm `tasks` |
+| API | `resolve` | Hooks (not `onDone`) | `onDone` | `authenticate` | `subscribe` | `main` | `archive` |
+|---|---|---|---|---|---|---|---|
+| `flux.fetch` | yes | yes | yes | yes | yes | yes | **`undefined`** |
+| `flux.storage`, `flux.fs` | yes | yes | yes | yes | yes | yes | **`undefined`** |
+| `flux.settings`, `flux.logger`, `console` | yes | yes | yes | yes | yes | yes | yes |
+| `flux.info` | yes | yes | yes | yes | yes | yes | **`undefined`** |
+| `flux.auth` | perm `auth` | perm `auth` | perm `auth` | always (the entry requires `auth`) | perm `auth` | perm `auth` | **`undefined`** |
+| `flux.task.requestRetry` | no effect (warning) | `onError` only | no effect | no effect | no effect | no effect | **`undefined`** |
+| `flux.task.recordArtifact` | rejects | rejects | yes | rejects | rejects | rejects | **`undefined`** |
+| `flux.ffmpeg`, `flux.ffprobe` | `undefined` | perm `ffmpeg`: object exists, `run` rejects, `ffmpeg.available()` works | perm `ffmpeg`, `run` works | `undefined` | `undefined` | perm `ffmpeg`: object exists, `run` rejects | `undefined` |
+| `flux.ytdlp` | perm `ytdlp` | perm `ytdlp` | perm `ytdlp` | **`undefined`** | perm `ytdlp` | perm `ytdlp` | **`undefined`** |
+| `flux.ui`, `commands`, `rpc`, `events`, `timers`, `settings.update` | — | — | — | — | — | yes | **`undefined`** |
+| `flux.tasks` | — | — | — | — | — | perm `tasks` | **`undefined`** |
+| `ctx.images` / `flux.images` | — | — | — | — | — | `flux.images` only | **`undefined`** |
 
 `flux.auth.*` and the `authRef` option of `flux.fetch` need `auth` in `permissions`; passing an explicit `authRef` without it makes `flux.fetch` reject (see [Errors](#errors-you-will-see)).
+
+### Image loading (view sessions only)
+
+`ctx.images.load(opts)` is available in a portable view callback and binds the request to that view's session. The resident main script can instead call `flux.images.load({ session: ctx.session, ...opts })`; pass the session ID from the view context. Both return a `Promise<string>` containing a lowercase `flux-image:<uuid>` resource reference. Use that reference as an image node's `src`, just like an existing PNG/JPEG/WebP data URI; the view protocol still carries only a small string, never image bytes. Existing data-URI images continue to work unchanged.
+
+The host deduplicates identical sanitized PNG content within a session, even with `cache: false` or after source-cache expiry. Authentication is still checked and the source is fetched again when caching is disabled. Different sessions never share references.
+
+For long-lived galleries, call `await ctx.images.release(src)` (or `await flux.images.release({ session: ctx.session, src })`) once the image is no longer used. Remove **every** use first, including prefetched state and duplicate nodes: identical content shares one reference, and release invalidates that reference for the whole session. Releasing an already removed reference is harmless; references from another session cannot be released. The host does not automatically evict images based on visibility or recent HTTP reads.
+
+`flux-image:` is an additive `image.src` string value, not a new RPC event or envelope. Older renderers cannot display it; keep using data URIs when targeting those clients.
+
+```js
+flux.ui.view("profile", {
+  async init(ctx) {
+    const src = await ctx.images.load({
+      url: "https://images.example.com/avatar.jpg",
+      maxWidth: 256,
+      maxHeight: 256,
+    });
+    return { src };
+  },
+  render(state) {
+    return flux.ui.h("image", { src: state.src, alt: "Profile" });
+  },
+});
+```
+
+The host applies FluxDown's outbound proxy/TUN routing and SSRF protections (including the existing development-mode private-network allowance); configured trusted proxies are used the same way as for `flux.fetch`. Redirects must remain on an approved host and cannot downgrade HTTPS. Credentials are not inferred: pass `authRef` only when the plugin has `auth` permission. Supplying request headers or `authRef` restricts redirects to the same origin. Plugins with `auth` permission do not memoize image fetches, avoiding stale authenticated responses after credential rotation.
+
+`opts` accepts:
+
+| Field | Default | Rules |
+|---|---|---|
+| `url` | — | Required HTTP(S) URL fetched with `GET`. Host must be approved; userinfo and HTTPS-to-HTTP redirects are forbidden. |
+| `headers` | none | Optional string headers. |
+| `authRef` | none | Optional saved credential reference; requires `auth` permission. |
+| `maxWidth`, `maxHeight` | `512` each | Integers from 1 to 2048. The host preserves aspect ratio and does not upscale. |
+| `cache` | `true` | `false` skips source/options memoization; images are never written to disk. HTTP responses remain `no-store`. Identical output still shares one reference, valid until explicit release or session close. |
+
+Input is accepted only when sniffed as PNG, JPEG or WebP; declared content type alone is not trusted. Input dimensions are capped at 8192 per side and 16 megapixels, decoding at 64 MiB, network body at 8 MiB, and fetch time at 10 seconds. The host emits a sanitized static PNG thumbnail of at most 4 MiB and serves it as `image/png`. Per-session quotas are 128 resources / 16 MiB; the global image-resource byte quota is 64 MiB. Quota exhaustion is an explicit error; references are never implicitly evicted. Cached source/options results live for five minutes, but their returned resource remains valid until explicit release or session close. Closing the view session or unloading the plugin frees its image resources. These limits are host-enforced.
+At most four uncached image loads run at once across all plugins; additional requests wait for up to three seconds for capacity before failing as overloaded. At most two decode/thumbnail workers run simultaneously. This also bounds source images waiting for decoding. The global resource-count cap is 4096.
 
 ## The `flux` object
 
@@ -315,13 +376,13 @@ Guard rails, all enforced host-side:
 | Rule | Value |
 |---|---|
 | Schemes | `http` / `https` only |
-| Destinations | Publicly routable addresses only. Loopback, LAN, link-local, CGNAT, documentation/benchmark ranges and cloud-metadata IPs are blocked — checked against the literal URL, at DNS resolution (so DNS rebinding is covered), and again on every redirect hop. When the user has configured a proxy in the app, DNS is resolved by the proxy and only the literal-IP and redirect checks apply. |
-| Dev-mode exception | Plugins loaded through "Install from directory (developer mode)" are not subject to the public-address restriction: they can reach `localhost`, LAN hosts, etc. (direct connection, bypassing the global proxy) so they can talk to local services during development. Normally installed plugins are unchanged. |
+| Destinations | Publicly routable addresses only. Loopback, LAN, link-local, CGNAT, documentation/benchmark ranges and cloud-metadata IPs are blocked — checked against the literal URL, at DNS resolution (so DNS rebinding is covered), and again on every redirect hop. When the user has configured a proxy in the app, DNS is resolved by the proxy and only the literal-IP and redirect checks apply. Exception: when the DNS answer falls entirely within 198.18.0.0/15 (fake-IP from TUN proxies such as Clash / sing-box), the request is let through into the TUN tunnel and the proxy software resolves the real target; as with a configured proxy, only the literal-IP and redirect checks apply. |
+| Dev-mode exception | Plugins loaded through "Install from directory (developer mode)" are not subject to the public-address restriction: they can reach `localhost`, LAN hosts, etc. so they can talk to local services during development. They follow the same proxy settings and site rules as other plugins, except that loopback, private LAN ranges and local domains (`.local`, `.lan`, `.home.arpa`, `.internal`) are always reached directly. Normally installed plugins are unchanged. |
 | Response body cap | 8 MB, then truncated |
 | Per-request timeout | 10 s |
 | Concurrent requests | 8, shared across all plugins |
 | Max redirects | 30 |
-| Proxy | The app's proxy configuration is used, as captured when the engine started (changing the proxy later takes effect after a restart). |
+| Proxy | Follows the app's current proxy settings (changes apply to the next request). A request whose URL matches a site proxy rule uses that rule; any other request uses the egress of the call: the task's own proxy (site rules are then ignored), else the rule matching the task's link, else the global mode. In **Auto** mode a call starts direct (or on the proxy that recently worked for that site); if it fails because its requests could not get through the network, the host re-runs the whole call once through each candidate proxy, and the download then uses the same exit as the successful resolve. |
 
 Credentials and redirects: a request that actually received stored credentials (explicit or implicit `authRef`) is sent through a stricter client that **does not follow a redirect to another origin** (different scheme, host or port). You get the `3xx` response back (`status`, `headers.location`) and must decide yourself whether to follow it, so credentials never leak cross-origin. Requests without credentials follow redirects normally.
 
@@ -523,7 +584,7 @@ What FluxDown adds for you:
 - `--ignore-config` is always prepended, so none of yt-dlp's own config files get read.
 - `--ffmpeg-location` pointing at the resolved managed/system ffmpeg is injected when ffmpeg is installed, so merges (bestvideo+bestaudio), `-x` audio extraction, remuxing and recoding work. A plugin-supplied `--ffmpeg-location` is still rejected; only the host's own path is trusted.
 - `--cache-dir <workspace>/.cache` keeps yt-dlp's cache inside the workspace; your own `--cache-dir` (a relative path) overrides it.
-- `--proxy`: when the user configured a proxy in the app, the host appends its `--proxy` **after** your arguments, so the user's proxy wins. Without a configured proxy, your own `--proxy` is honoured. The proxy is read when the engine starts.
+- `--proxy`: when the app decides an exit for the call (a configured proxy, a site rule, the task's own proxy, or Auto switching to a proxy), the host appends its `--proxy` **after** your arguments, so the app's choice wins; a direct exit chosen by a rule or by the task is passed as `--proxy ""`. Without a configured proxy (or while Auto tries the direct route), your own `--proxy` is honoured. Rules are matched against the first URL argument.
 - The child process gets a complete `PATH` (on Windows including user-level entries) so yt-dlp can find JavaScript runtimes such as Node or Deno.
 
 At most 2 yt-dlp processes run at once across all plugins; time spent waiting for a free slot is not charged to your script's time budget. Each child is killed on timeout or cancellation.
@@ -589,6 +650,7 @@ Budgets are per call. "CPU budget" is the time your JavaScript may execute; time
 | `subscribe` | 10 s default; `subscriptions[0].timeoutMs` replaces it, 30 s ceiling | same | 64 MB |
 | `authenticate` | 30 s default; `auth.timeoutMs` replaces it, 30 s ceiling | same | 64 MB |
 | Hooks | 5 s | 5 s | 32 MB |
+| `archive` | 5 s | 5 s | Same as the `resolve` default (64 MB) |
 | Hooks of a plugin with `ytdlp` permission (any hook), or `ffmpeg` permission in `onDone` | ~30 min (1830 s) | 30 s | 32 MB |
 | `main` (per call: render, command, event, timer, rpc) | 30 s | 2 s | 64 MB for the whole runtime |
 
@@ -613,13 +675,14 @@ Other fixed limits:
 
 - `resolve` and `subscribe` share one pool. Its size follows the app's concurrent-download limit (never below the runtime's worker count, at most 4 workers). A call waits up to **3 s** for a free slot; after that it fails with `插件运行时过载（并发已满）` (fail-closed, the task enters the error state).
 - `authenticate` has its own pool of **2** with the same 3 s wait, so login polling can never starve resolves.
+- `archive` has its own pool of **2** for the whole app. A call waits up to **3 s** for a slot; after that it is skipped as overloaded (no subfolder, the download is not affected).
 - Hooks use a pool the size of the worker count (at most 4). When it is full, further hook notifications are **dropped** (logged as `钩子并发已满，本次钩子被丢弃`), never queued.
 - Hooks of plugins with `ffmpeg` or `ytdlp` permission use a separate pool of the same size. When it is busy, up to **64** notifications wait in a queue; beyond that the notification is dropped (`外部工具钩子排队已满，本次钩子被丢弃`).
 - `main` handles one call at a time per plugin; calls are queued in order.
 
 ### Circuit breaker
 
-Three **consecutive** timeouts (`脚本执行超时`) or memory-limit hits (`脚本超出内存上限`) in `resolve`, `subscribe` or `main` calls auto-disable the plugin. The app shows a notice and the plugin stays off until it is re-enabled manually. Any other outcome — a success, or a different error such as an invalid return value or a network failure — resets the count to zero.
+Three **consecutive** timeouts (`脚本执行超时`) or memory-limit hits (`脚本超出内存上限`) in `resolve`, `subscribe`, `archive` or `main` calls auto-disable the plugin. The app shows a notice and the plugin stays off until it is re-enabled manually. Any other outcome — a success, or a different error such as an invalid return value or a network failure — resets the count to zero.
 
 Not counted: hooks (their timeouts and memory errors are only logged), `authenticate` and overload rejections. A timeout or out-of-memory error in `main` also destroys the runtime; the next call starts a fresh one and **all in-memory state is lost**.
 
@@ -635,7 +698,7 @@ For `resolve` the task shows `[插件] <identity>: <message>`.
 |---|---|
 | `脚本编译失败: …` | Syntax error, or an exception thrown at the top level of the script. |
 | `插件运行时错误: …` | Your code threw, or a rejected `await` was not caught. The text after the colon is your error. Includes `入口 resolve 未定义` when the function does not exist. |
-| `脚本执行超时` | Wall-clock or CPU budget exceeded. Counts toward the circuit breaker (for `resolve` / `subscribe` / `main`). |
+| `脚本执行超时` | Wall-clock or CPU budget exceeded. Counts toward the circuit breaker (for `resolve` / `subscribe` / `archive` / `main`). |
 | `脚本超出内存上限` | Memory limit exceeded. Counts toward the circuit breaker. |
 | `插件运行时过载（并发已满）` | No free slot within 3 s. See [Concurrency](#concurrency-and-overload). |
 | `缺少必填设置项: 插件 <id> 需先配置「<title>」` | A `required` setting has no value. Ask the user to fill it in. |

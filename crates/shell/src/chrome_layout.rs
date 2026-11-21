@@ -3,7 +3,7 @@
 //! 纯数据，不依赖渲染；Web `web/src/shell/chromeLayout.ts` 逐条镜像，两端共用
 //! `crates/shell/tests/fixtures/chrome_layout_cases.json` 的用例。持久化值是
 //! `{ 区域键: [条目 id…], "hidden"?: [条目 id…] }` 对象；读取时按目录归一化，未知 / 重复 / 放错区域的条目被丢弃，
-//! 未摆放的条目回到默认区域末尾，因此新增条目与旧偏好天然兼容。隐藏是摆放之外的独立标记：
+//! 未摆放的条目按目录顺序插回默认区域，因此新增条目与旧偏好天然兼容。隐藏是摆放之外的独立标记：
 //! 被隐藏的条目保留所在区域与位置（取消隐藏即回原位），固定条目（[`ChromeItemSpec::fixed`]）不可隐藏。
 
 use gpui::SharedString;
@@ -167,6 +167,8 @@ pub struct ChromeItemSpec {
     pub families: ChromeFamilies,
     /// 能否被用户隐藏；固定入口（下载页、设置）为 `false`，保证始终有路回到它们。
     pub hideable: bool,
+    /// 默认隐藏：存储布局里还没有摆放它（新用户、新增条目）时以隐藏状态加入，可在自定义布局里显示。
+    pub default_hidden: bool,
 }
 
 impl ChromeItemSpec {
@@ -181,6 +183,7 @@ impl ChromeItemSpec {
             default_zone,
             families,
             hideable: true,
+            default_hidden: false,
         }
     }
 
@@ -188,6 +191,13 @@ impl ChromeItemSpec {
     #[must_use]
     pub fn fixed(mut self) -> Self {
         self.hideable = false;
+        self
+    }
+
+    /// 标记为默认隐藏（仍可隐藏 / 显示）。
+    #[must_use]
+    pub fn hidden_by_default(mut self) -> Self {
+        self.default_hidden = true;
         self
     }
 
@@ -213,8 +223,9 @@ impl ChromeLayout {
     }
 
     /// 由持久化值归一化：非对象视为未设置；按规范区域顺序保留「字符串、在目录内、未摆放、
-    /// 放得下」的条目，其余跳过；最后把未摆放的条目按目录顺序追加到默认区域末尾。
-    /// `hidden` 只保留目录内可隐藏的条目，按目录顺序去重。
+    /// 放得下」的条目，其余跳过；最后把未摆放的条目按目录顺序插回默认区域——排在该区域第一个
+    /// 目录位置靠后的条目之前（没有则追加末尾），因此新增的内置入口不会落到插件入口之后。
+    /// `hidden` 只保留目录内可隐藏的条目，按目录顺序去重；存储值里没摆放的默认隐藏条目也加入。
     #[must_use]
     pub fn from_value(stored: Option<&Value>, catalog: &[ChromeItemSpec]) -> Self {
         let mut layout = Self::default();
@@ -245,11 +256,27 @@ impl ChromeLayout {
                     .collect();
             }
         }
-        for spec in catalog {
-            if layout.zone_of(&spec.id).is_none() {
-                layout.zones[spec.default_zone.index()].push(spec.id.clone());
+        let stored_placed: Vec<SharedString> = layout.zones.iter().flatten().cloned().collect();
+        for (index, spec) in catalog.iter().enumerate() {
+            if layout.zone_of(&spec.id).is_some() {
+                continue;
             }
+            let zone = &mut layout.zones[spec.default_zone.index()];
+            let at = zone
+                .iter()
+                .position(|id| catalog.iter().position(|s| s.id == *id) > Some(index))
+                .unwrap_or(zone.len());
+            zone.insert(at, spec.id.clone());
         }
+        layout.hidden = catalog
+            .iter()
+            .filter(|spec| {
+                spec.hideable
+                    && (layout.hidden.contains(&spec.id)
+                        || (spec.default_hidden && !stored_placed.contains(&spec.id)))
+            })
+            .map(|spec| spec.id.clone())
+            .collect();
         layout
     }
 

@@ -229,7 +229,7 @@ impl ServerFetchOutcome {
 }
 
 /// 拉取每个订阅 URL（换行分隔，允许 `#` 注释）并返回合并去重后的服务器列表。
-/// 请求经宿主统一出口（[`crate::egress::client_builder`]），与下载任务同一套全局代理。
+/// 请求经宿主统一出口（[`crate::egress::RoutedClients`]），与下载任务同一套全局代理与站点规则。
 ///
 /// 单源失败可容忍：只要至少一源响应即为成功。所有网络错误都记日志。
 pub async fn fetch_server_subscriptions(
@@ -252,14 +252,7 @@ pub async fn fetch_server_subscriptions(
         };
     }
 
-    let client = match crate::egress::client_builder(proxy, "")
-        .map_err(|e| e.to_string())
-        .and_then(|builder| {
-            builder
-                .timeout(FETCH_TIMEOUT)
-                .build()
-                .map_err(|e| e.to_string())
-        }) {
+    let client = match crate::egress::RoutedClients::new(proxy, "", |b| b.timeout(FETCH_TIMEOUT)) {
         Ok(c) => c,
         Err(e) => {
             return ServerFetchOutcome {
@@ -334,9 +327,16 @@ pub async fn fetch_server_subscriptions(
 /// ```
 #[must_use]
 pub fn normalize_subscription_url(src: &str) -> String {
+    unwrap_list_link(src, "serverlist")
+}
+
+/// 解开 eD2K 列表链接壳 `ed2k://|<kind>|<url>|/`（`kind` 为小写 ASCII，如 `serverlist` /
+/// `nodeslist`），取出内层 URL；不是该形态的输入去掉首尾空白后原样返回。
+pub(crate) fn unwrap_list_link(src: &str, kind: &str) -> String {
     let s = src.trim();
     let lower = s.to_ascii_lowercase();
-    if let Some(rest) = lower.strip_prefix("ed2k://|serverlist|") {
+    let prefix = format!("ed2k://|{kind}|");
+    if let Some(rest) = lower.strip_prefix(&prefix) {
         // 用小写前缀长度切原串（ASCII 前缀，字节偏移安全），保留内层大小写。
         let inner = &s[s.len() - rest.len()..];
         // 去掉尾部 `|/` 或 `|`。
@@ -350,7 +350,11 @@ pub fn normalize_subscription_url(src: &str) -> String {
 }
 
 /// 拉取单个订阅源并解析为 `ip:port` 列表。
-async fn fetch_one(client: &reqwest::Client, url: &str) -> Result<Vec<String>, String> {
+async fn fetch_one(
+    clients: &crate::egress::RoutedClients,
+    url: &str,
+) -> Result<Vec<String>, String> {
+    let client = clients.client(url).await.map_err(|e| e.to_string())?;
     let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
     let status = resp.status();
     if !status.is_success() {

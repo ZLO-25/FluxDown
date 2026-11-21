@@ -1,23 +1,27 @@
 //! 插件详情对话框：已安装插件与市场条目共用（manifest 级信息 + 权限 + 页面脚本 + 使用须知）。
 
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 
-use fluxdown_protocol::{MarketEntryDto, PluginDto, PluginPageScriptDeclDto};
-use fluxdown_ui_components::{ControlExt as _, dialog_scroll_body, tabular_numbers};
+use fluxdown_protocol::{
+    MarketEntryDto, PluginArchiveRulesDto, PluginDto, PluginPageScriptDeclDto,
+};
+use fluxdown_ui_components::{BusyExt as _, ControlExt as _, dialog_scroll_body, tabular_numbers};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    App, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, div,
-    prelude::FluentBuilder as _,
+    App, AppContext as _, ClipboardItem, Context, Entity, FontWeight, IntoElement, ParentElement,
+    Render, SharedString, Styled, Subscription, Window, div, prelude::FluentBuilder as _,
 };
 use gpui_component::{
-    WindowExt as _, button::Button, dialog::DialogFooter, h_flex, link::Link, v_flex,
+    Disableable as _, WindowExt as _, button::Button, dialog::DialogFooter, h_flex, link::Link,
+    v_flex,
 };
 
+use super::plugin_live::LivePlugins;
 use crate::{pages::Frame, ui};
 
 /// 详情对话框的数据；调用侧从各自 DTO 拆字段。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PluginDetail {
     pub name: String,
     pub version: String,
@@ -36,6 +40,9 @@ pub struct PluginDetail {
     pub network_hosts: Vec<String>,
     /// 插件声明的页面脚本（标题 + 匹配站点）；市场条目不携带。
     pub page_scripts: Vec<PluginPageScriptDeclDto>,
+    pub archive_rules: bool,
+    pub enabled: bool,
+    pub stale: bool,
 }
 
 impl PluginDetail {
@@ -46,6 +53,8 @@ impl PluginDetail {
             identity: plugin.identity.clone(),
             description: plugin.description.clone(),
             homepage: plugin.homepage.clone(),
+            archive_rules: plugin.contributions.archive_rules,
+            enabled: plugin.enabled,
             settings_count: plugin.settings.len(),
             permissions: plugin.permissions.clone(),
             risk: plugin.risk.clone(),
@@ -76,6 +85,7 @@ impl PluginDetail {
             risk: crate::market::risk_of(&entry.permissions).to_owned(),
             network_hosts: entry.network_hosts.clone(),
             page_scripts: Vec::new(),
+            ..Self::default()
         }
     }
 }
@@ -130,6 +140,10 @@ pub fn permission_label(translator: &Translator, permission: &str) -> (String, S
             translator.text("pluginPermPageScriptsName").to_owned(),
             translator.text("pluginPermPageScriptsDesc").to_owned(),
         ),
+        "archive" => (
+            translator.text("pluginPermArchiveName").to_owned(),
+            translator.text("pluginPermArchiveDesc").to_owned(),
+        ),
         other => (
             other.to_owned(),
             translator.text("pluginPermUnknownDesc").to_owned(),
@@ -140,33 +154,154 @@ pub fn permission_label(translator: &Translator, permission: &str) -> (String, S
 /// 详情对话框「审计记录」入口回调；仅已安装插件提供。
 pub type OpenAudit = Rc<dyn Fn(&mut Window, &mut App)>;
 
-/// 打开详情对话框；对话框构造器每帧重建，内容从共享的只读快照按需渲染。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArchiveRulesNotice {
+    Success,
+    Error,
+}
+
+struct DetailBody {
+    detail: PluginDetail,
+    translator: Translator,
+    port: Option<Arc<dyn crate::ExtensionsPort>>,
+    archive_rules_status: Option<PluginArchiveRulesDto>,
+    archive_rules_error: Option<String>,
+    archive_rules_notice: Option<ArchiveRulesNotice>,
+    archive_rules_loading: bool,
+    copied: bool,
+    closed: bool,
+    _live: Option<Subscription>,
+}
+
+impl DetailBody {
+    fn load_archive_rules(&mut self, refresh: bool, cx: &mut Context<Self>) {
+        if self.archive_rules_loading
+            || !self.detail.archive_rules
+            || !self.detail.enabled
+            || self.detail.stale
+        {
+            return;
+        }
+        let Some(port) = self.port.clone() else {
+            return;
+        };
+        self.archive_rules_loading = true;
+        self.archive_rules_error = None;
+        self.archive_rules_notice = None;
+        cx.notify();
+        let identity = self.detail.identity.clone();
+        let future = port.call(
+            fluxdown_protocol::method::DAEMON_PLUGIN_ARCHIVE_RULES,
+            serde_json::json!({ "identity": identity, "refresh": refresh }),
+        );
+        cx.spawn(async move |this, cx| {
+            let result = future.await.and_then(|value| {
+                serde_json::from_value::<PluginArchiveRulesDto>(value).map_err(|_| {
+                    fluxdown_protocol::RpcErrorData::new(
+                        fluxdown_protocol::ApplicationErrorCode::Internal,
+                        false,
+                    )
+                })
+            });
+            let Ok(()) = this.update(cx, |this, cx| {
+                this.archive_rules_loading = false;
+                match result {
+                    Ok(status) => {
+                        this.archive_rules_status = Some(status);
+                        this.archive_rules_notice = refresh.then_some(ArchiveRulesNotice::Success);
+                    }
+                    Err(error) => {
+                        this.archive_rules_error =
+                            Some(crate::error_text(&this.translator, &error).to_string());
+                        if refresh {
+                            this.archive_rules_notice = Some(ArchiveRulesNotice::Error);
+                        }
+                    }
+                }
+                cx.notify();
+            }) else {
+                return;
+            };
+        })
+        .detach();
+    }
+}
+
+impl Render for DetailBody {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        render_detail(self, cx)
+    }
+}
+
+/// 打开详情对话框。`live` 仅已安装插件提供：详情随最新列表刷新，插件被卸载时关闭对话框。
 pub fn open_plugin_detail(
     detail: PluginDetail,
     translator: Translator,
     open_audit: Option<OpenAudit>,
+    live: Option<Entity<LivePlugins>>,
+    port: Option<Arc<dyn crate::ExtensionsPort>>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let detail = Rc::new(detail);
-    let translator = Rc::new(translator);
+    let audit_label = SharedString::from(translator.text("pluginAuditOpenForPlugin").to_owned());
+    let has_archive_rules =
+        detail.archive_rules && detail.enabled && !detail.stale && port.is_some();
+    let body = cx.new(|_| DetailBody {
+        detail,
+        translator,
+        port,
+        archive_rules_status: None,
+        archive_rules_error: None,
+        archive_rules_notice: None,
+        archive_rules_loading: false,
+        copied: false,
+        closed: false,
+        _live: None,
+    });
+    if has_archive_rules {
+        body.update(cx, |this, cx| this.load_archive_rules(false, cx));
+    }
+    if let Some(live) = live {
+        body.update(cx, |this, cx| {
+            this._live = Some(cx.observe_in(&live, window, |this, live, window, cx| {
+                let Some(plugin) = live.read(cx).plugin(&this.detail.identity) else {
+                    if !this.closed {
+                        this.closed = true;
+                        window.close_dialog(cx);
+                    }
+                    return;
+                };
+                let mut next = PluginDetail::from_plugin(plugin);
+                next.stale = live.read(cx).is_stale();
+                let should_load_archive_rules =
+                    next.enabled && !next.stale && (!this.detail.enabled || this.detail.stale);
+                if next == this.detail {
+                    return;
+                }
+                // 标题在对话框构造器里每帧重建：改名时整窗重绘才能带上新标题。
+                if next.name != this.detail.name {
+                    window.refresh();
+                }
+                this.detail = next;
+                if should_load_archive_rules {
+                    this.load_archive_rules(false, cx);
+                }
+                cx.notify();
+            }));
+        });
+    }
     window.open_dialog(cx, move |dialog, _, cx| {
-        let detail = detail.clone();
-        let translator = translator.clone();
-        let audit_label =
-            SharedString::from(translator.text("pluginAuditOpenForPlugin").to_owned());
+        let name = body.read(cx).detail.name.clone();
+        let content = body.clone();
         let open_audit = open_audit.clone();
         dialog
-            .title(fluxdown_ui_components::dialog_title(
-                detail.name.clone(),
-                cx,
-            ))
+            .title(fluxdown_ui_components::dialog_title(name, cx))
             .w(active_theme(cx).text_extent(480.))
             .content(move |root, _, cx| {
                 root.min_h_0().child(dialog_scroll_body(
                     "plugin-detail-body",
                     None,
-                    render_detail(&detail, &translator, cx),
+                    content.clone(),
                     cx,
                 ))
             })
@@ -187,7 +322,9 @@ pub fn open_plugin_detail(
 /// 信息行标签列宽：容纳「最低应用版本」等最长标签。
 const LABEL_WIDTH: f32 = 96.;
 
-fn render_detail(detail: &PluginDetail, translator: &Translator, cx: &App) -> impl IntoElement {
+fn render_detail(body: &DetailBody, cx: &mut Context<DetailBody>) -> impl IntoElement {
+    let detail = &body.detail;
+    let translator = &body.translator;
     let theme = active_theme(cx);
     let frame = Frame {
         translator,
@@ -330,9 +467,133 @@ fn render_detail(detail: &PluginDetail, translator: &Translator, cx: &App) -> im
                     .map(|host| ui::body_text(host.clone(), frame)),
             );
     }
+    if detail.archive_rules {
+        content = content.child(section_title(text("pluginArchiveRulesTitle")));
+        if body.archive_rules_loading && body.archive_rules_status.is_none() {
+            content = content.child(ui::meta_text(text("pluginArchiveRulesRefreshing"), frame));
+        }
+        if let Some(status) = &body.archive_rules_status {
+            content = content
+                .child(info_row(
+                    text("pluginArchiveRulesSequence"),
+                    status.sequence.to_string(),
+                ))
+                .child(info_row(
+                    text("pluginArchiveRulesCount"),
+                    status.rule_count.to_string(),
+                ))
+                .child(info_row(
+                    text("pluginArchiveRulesLastChecked"),
+                    format_archive_timestamp(status.last_checked_at, translator),
+                ))
+                .child(info_row(
+                    text("pluginArchiveRulesLastUpdated"),
+                    format_archive_timestamp(status.last_updated_at, translator),
+                ))
+                .child(info_row(
+                    text("pluginArchiveRulesUpdateUrl"),
+                    status
+                        .update_url
+                        .clone()
+                        .unwrap_or_else(|| translator.text("pluginArchiveRulesNone").to_owned()),
+                ))
+                .child(info_row(
+                    text("pluginArchiveRulesAutomatic"),
+                    translator
+                        .text(if status.automatic_updates {
+                            "pluginArchiveRulesEnabled"
+                        } else {
+                            "pluginArchiveRulesDisabled"
+                        })
+                        .to_owned(),
+                ));
+            if let Some(error) = &status.last_error {
+                content = content.child(info_row(text("pluginArchiveRulesError"), error.clone()));
+            }
+            let key = status.public_key.clone();
+            content = content.child(
+                h_flex()
+                    .w_full()
+                    .gap(tokens.spacing.md)
+                    .items_center()
+                    .child(label_cell(text("pluginArchiveRulesPublicKey")))
+                    .child(ui::body_text(key, frame).flex_1().min_w_0())
+                    .child(
+                        Button::new("plugin-archive-rules-copy")
+                            .outline()
+                            .control(cx)
+                            .label(text(if body.copied {
+                                "pluginArchiveRulesCopied"
+                            } else {
+                                "pluginArchiveRulesCopy"
+                            }))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let Some(status) = &this.archive_rules_status else {
+                                    return;
+                                };
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    status.public_key.clone(),
+                                ));
+                                this.copied = true;
+                                cx.notify();
+                                cx.spawn(async move |this, cx| {
+                                    cx.background_executor()
+                                        .timer(std::time::Duration::from_millis(1500))
+                                        .await;
+                                    let Ok(()) = this.update(cx, |this, cx| {
+                                        this.copied = false;
+                                        cx.notify();
+                                    }) else {
+                                        return;
+                                    };
+                                })
+                                .detach();
+                            })),
+                    ),
+            );
+        }
+        if let Some(error) = &body.archive_rules_error {
+            content = content.child(ui::body_text(error.clone(), frame));
+        }
+        if let Some(notice) = body.archive_rules_notice {
+            let key = match notice {
+                ArchiveRulesNotice::Success => "pluginArchiveRulesRefreshSuccess",
+                ArchiveRulesNotice::Error => "pluginArchiveRulesRefreshError",
+            };
+            content = content.child(ui::meta_text(text(key), frame));
+        }
+        content = content.child(
+            Button::new("plugin-archive-rules-refresh")
+                .outline()
+                .control(cx)
+                .busy(body.archive_rules_loading)
+                .disabled(!detail.enabled || detail.stale || body.archive_rules_loading)
+                .label(text(if body.archive_rules_loading {
+                    "pluginArchiveRulesRefreshing"
+                } else {
+                    "pluginArchiveRulesRefresh"
+                }))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.load_archive_rules(true, cx);
+                })),
+        );
+    }
     content
         .child(section_title(text("pluginDetailUsage")))
         .child(ui::meta_text(text("pluginDetailUsageBody"), frame))
+}
+
+fn format_archive_timestamp(timestamp: Option<u64>, translator: &Translator) -> String {
+    timestamp
+        .and_then(|value| i64::try_from(value).ok())
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|value| {
+            value
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| translator.text("pluginArchiveRulesNone").to_owned())
 }
 
 /// 页面脚本行：标题 + 匹配站点（逗号分隔）；详情与授权对话框共用。

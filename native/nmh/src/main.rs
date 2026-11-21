@@ -11,7 +11,9 @@
 //!   - Synchronous, single-threaded, no async runtime.
 //!   - Pipe connection is lazy: established on first message, reconnected on error.
 //!   - When the FluxDown App is not running, NMH automatically launches it and
-//!     polls for the IPC endpoint at a fixed 50ms interval (up to 10s).
+//!     polls for the IPC endpoint at a fixed 50ms interval (up to 10s). On macOS
+//!     the agent is launched through Launch Services (see [`launch_app`]) so it
+//!     never inherits the browser's process-level quarantine.
 //!   - The "no-launch" action set (see `NO_LAUNCH_ACTIONS`) — "ping" plus the
 //!     task-panel query/control actions — only checks connectivity and never
 //!     launches the App.
@@ -341,13 +343,11 @@ mod pipe {
     }
 
     impl PipeHandle {
-        pub fn connect(pipe_name: &str) -> Option<Self> {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(pipe_name)
-                .ok()?;
-            Some(PipeHandle { file })
+        /// Open the App's Named Pipe. `NotFound` means the App is not running; any other error
+        /// (notably `PermissionDenied` for a pipe created by an elevated App) is worth logging.
+        pub fn connect(pipe_name: &str) -> io::Result<Self> {
+            let file = OpenOptions::new().read(true).write(true).open(pipe_name)?;
+            Ok(PipeHandle { file })
         }
 
         pub fn write_message(&mut self, data: &[u8]) -> io::Result<()> {
@@ -397,11 +397,14 @@ mod pipe {
     }
 
     impl PipeHandle {
-        /// Connect to the FluxDown Unix socket. Returns None if the app is not running.
-        pub fn connect(_ignored: &str) -> Option<Self> {
-            let path = socket_path()?;
-            let stream = UnixStream::connect(&path).ok()?;
-            Some(PipeHandle { stream })
+        /// Connect to the FluxDown Unix socket. `NotFound` / `ConnectionRefused` mean the app
+        /// is not running.
+        pub fn connect(_ignored: &str) -> io::Result<Self> {
+            let path = socket_path().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "home directory is unavailable")
+            })?;
+            let stream = UnixStream::connect(&path)?;
+            Ok(PipeHandle { stream })
         }
 
         pub fn write_message(&mut self, data: &[u8]) -> io::Result<()> {
@@ -493,14 +496,201 @@ fn launch_app(app_exe: &Path) -> bool {
     }
 }
 
-#[cfg(not(windows))]
+/// macOS: launch the agent's helper bundle through Launch Services (`open -g`, as the
+/// desktop's service bootstrap does) so the agent is a child of launchd, not of the browser.
+///
+/// A direct spawn inherits the browser's process-level quarantine (browsers set
+/// `LSFileQuarantineEnabled`): every file the agent and its children write gets
+/// `com.apple.quarantine` — the update package and the bundle its updater installs included —
+/// and a quarantined bundle is App-Translocated on every Launch Services open (lost Launchpad
+/// entry, self-update refused). Development layouts and a failing `open` fall back to a direct
+/// spawn.
+#[cfg(target_os = "macos")]
 fn launch_app(app_exe: &Path) -> bool {
+    if let Some(helper_app) = bundled_helper_app(app_exe) {
+        if let Some(bundle) = outer_app_bundle(&helper_app) {
+            release_installed_bundle(&bundle);
+        }
+        if open_with_launch_services(&helper_app) {
+            return true;
+        }
+    }
+    spawn_detached(app_exe)
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn launch_app(app_exe: &Path) -> bool {
+    spawn_detached(app_exe)
+}
+
+#[cfg(not(windows))]
+fn spawn_detached(app_exe: &Path) -> bool {
     std::process::Command::new(app_exe)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .is_ok()
+}
+
+/// How long to wait for `open` to hand the launch over to Launch Services.
+#[cfg(target_os = "macos")]
+const OPEN_TIMEOUT_MS: u64 = 5_000;
+
+/// Run `open -g <helper>`; `false` only when `open` could not run or reported failure.
+#[cfg(target_os = "macos")]
+fn open_with_launch_services(helper_app: &Path) -> bool {
+    let mut child = match std::process::Command::new("/usr/bin/open")
+        .arg("-g")
+        .arg(helper_app)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            log(&format!(
+                "launch: cannot run open ({e}); spawning the agent directly"
+            ));
+            return false;
+        }
+    };
+    let deadline = Instant::now() + std::time::Duration::from_millis(OPEN_TIMEOUT_MS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return true,
+            Ok(Some(status)) => {
+                log(&format!(
+                    "launch: open exited with {status}; spawning the agent directly"
+                ));
+                return false;
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(PIPE_POLL_INTERVAL_MS));
+            }
+            Ok(None) => {
+                // Launch Services is slow but may still start the agent: let the endpoint poll
+                // decide, and reap `open` off this thread.
+                log("launch: open is still running; waiting for the App endpoint");
+                std::thread::spawn(move || {
+                    if let Err(e) = child.wait() {
+                        log(&format!("launch: waiting for open failed ({e})"));
+                    }
+                });
+                return true;
+            }
+            Err(e) => {
+                log(&format!(
+                    "launch: cannot poll open ({e}); waiting for the App endpoint"
+                ));
+                return true;
+            }
+        }
+    }
+}
+
+/// `<Helper>.app/Contents/MacOS/fluxdown-agent` → `<Helper>.app`; development layouts → `None`.
+#[cfg(any(target_os = "macos", test))]
+fn bundled_helper_app(agent_exe: &Path) -> Option<PathBuf> {
+    let macos_dir = agent_exe.parent()?;
+    if !macos_dir.ends_with("Contents/MacOS") {
+        return None;
+    }
+    let helper_app = macos_dir.parent()?.parent()?;
+    helper_app
+        .extension()
+        .is_some_and(|ext| ext == "app")
+        .then(|| helper_app.to_path_buf())
+}
+
+/// Outermost `.app` containing `path` (the agent helper is nested inside `FluxDown.app`).
+#[cfg(any(target_os = "macos", test))]
+fn outer_app_bundle(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .filter(|ancestor| ancestor.extension().is_some_and(|ext| ext == "app"))
+        .last()
+        .map(Path::to_path_buf)
+}
+
+#[cfg(target_os = "macos")]
+const XATTR: &str = "/usr/bin/xattr";
+#[cfg(target_os = "macos")]
+const QUARANTINE_XATTR: &str = "com.apple.quarantine";
+#[cfg(target_os = "macos")]
+const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+
+/// Self-heal an installed bundle that still carries `com.apple.quarantine` before launching
+/// from it: older updaters running in the browser's process tree installed such bundles, and
+/// Launch Services would App-Translocate them (the `open` that follows included). The relay
+/// always runs from the real install path, unlike an agent already running translocated.
+/// Same rule as the agent's `update/install/macos.rs::heal_installed_quarantine`; keep both in
+/// lockstep.
+#[cfg(target_os = "macos")]
+fn release_installed_bundle(bundle: &Path) {
+    if !is_healable_install(bundle) {
+        return;
+    }
+    let quiet = |command: &mut std::process::Command| {
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+    };
+    let quarantined = quiet(
+        std::process::Command::new(XATTR)
+            .args(["-p", QUARANTINE_XATTR])
+            .arg(bundle),
+    )
+    .is_ok_and(|status| status.success());
+    if !quarantined {
+        return;
+    }
+    // `-s` acts on symlinks themselves (dangling links do not fail the run).
+    match quiet(
+        std::process::Command::new(XATTR)
+            .args(["-s", "-d", "-r", QUARANTINE_XATTR])
+            .arg(bundle),
+    ) {
+        Ok(status) if status.success() => {
+            log(&format!("released {} from quarantine", bundle.display()));
+        }
+        Ok(status) => {
+            log(&format!(
+                "could not release {} from quarantine: xattr exited with {status}",
+                bundle.display()
+            ));
+            return;
+        }
+        Err(e) => {
+            log(&format!(
+                "could not release {} from quarantine: {e}",
+                bundle.display()
+            ));
+            return;
+        }
+    }
+    match quiet(std::process::Command::new(LSREGISTER).arg("-f").arg(bundle)) {
+        Ok(status) if status.success() => {}
+        Ok(status) => log(&format!("lsregister exited with {status}")),
+        Err(e) => log(&format!("could not run lsregister ({e})")),
+    }
+}
+
+/// Only writable bundles inside an `Applications` folder (any depth, `~/Applications` too):
+/// translocated copies and disk images are read-only, and an App run from Downloads keeps the
+/// system's quarantine / translocation policy.
+#[cfg(any(target_os = "macos", test))]
+fn is_healable_install(bundle: &Path) -> bool {
+    let text = bundle.to_string_lossy();
+    !text.contains("/AppTranslocation/")
+        && !text.starts_with("/Volumes/")
+        && bundle.parent().is_some_and(|parent| {
+            parent
+                .ancestors()
+                .any(|dir| dir.file_name().is_some_and(|name| name == "Applications"))
+        })
 }
 
 /// Returns the IPC address string for `pipe::PipeHandle::connect()`.
@@ -521,16 +711,76 @@ fn ipc_address() -> String {
     }
 }
 
+/// Connect errors that only mean "the App is not running" (no endpoint, or a stale Unix socket).
+fn app_not_running(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// Log text for a failed connect. `PermissionDenied` means the endpoint exists but this relay may
+/// not open it: on Windows the App was started elevated (its pipe then belongs to Administrators).
+fn describe_connect_error(error: &io::Error) -> String {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        format!(
+            "{error}; the App is probably running as administrator, quit it from the tray and start it normally"
+        )
+    } else {
+        error.to_string()
+    }
+}
+
+thread_local! {
+    /// Last connect failure written to the log, so a polling popup does not repeat it.
+    static LOGGED_CONNECT_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn log_connect_error(error: &io::Error) {
+    let message = format!("ipc connect failed ({})", describe_connect_error(error));
+    LOGGED_CONNECT_ERROR.with(|logged| {
+        let mut logged = logged.borrow_mut();
+        if logged.as_deref() != Some(message.as_str()) {
+            log(&message);
+            *logged = Some(message);
+        }
+    });
+}
+
+/// One direct connect attempt (never launches the App). Unexpected failures are logged once.
+fn connect_direct(addr: &str) -> Result<pipe::PipeHandle, io::Error> {
+    let result = pipe::PipeHandle::connect(addr);
+    match &result {
+        Ok(_) => LOGGED_CONNECT_ERROR.with(|logged| *logged.borrow_mut() = None),
+        Err(error) if !app_not_running(error) => log_connect_error(error),
+        Err(_) => {}
+    }
+    result
+}
+
 /// Try to connect to the IPC endpoint. If unavailable, launch the App
 /// (subject to cooldown) and poll at a fixed 50ms interval until the
 /// endpoint appears or the timeout is reached.
+///
+/// On Windows an endpoint that exists but refuses this relay (`PermissionDenied`) is
+/// not "App not running": a named pipe vanishes with its server, so the refusing
+/// server is alive (elevated) and launching another App instance cannot help (it
+/// finds the running one and exits); fail fast instead of waiting out the launch
+/// timeout. On Unix the same error can be a stale root-owned socket that a freshly
+/// launched agent replaces, so the launch path stays.
 fn connect_with_auto_launch(last_launch: &mut Option<Instant>) -> Option<pipe::PipeHandle> {
     let addr = ipc_address();
 
     // Fast path: App is already running.
-    if let Some(p) = pipe::PipeHandle::connect(&addr) {
-        log("ipc connected (fast path)");
-        return Some(p);
+    match connect_direct(&addr) {
+        Ok(p) => {
+            log("ipc connected (fast path)");
+            return Some(p);
+        }
+        Err(error) if cfg!(windows) && error.kind() == io::ErrorKind::PermissionDenied => {
+            return None;
+        }
+        Err(_) => {}
     }
 
     // Cooldown: don't re-launch too quickly (prevents crash-loop).
@@ -562,21 +812,24 @@ fn connect_with_auto_launch(last_launch: &mut Option<Instant>) -> Option<pipe::P
     // sleep-first back-off adds its full interval to every cold start.
     let deadline = Instant::now() + std::time::Duration::from_millis(APP_LAUNCH_TIMEOUT_MS);
 
-    loop {
-        if let Some(p) = pipe::PipeHandle::connect(&addr) {
-            let elapsed = last_launch.map_or(0, |t| t.elapsed().as_millis() as u64);
-            log(&format!("ipc connected after {}ms", elapsed));
-            return Some(p);
-        }
-
-        if Instant::now() >= deadline {
-            break;
+    let last_error = loop {
+        match pipe::PipeHandle::connect(&addr) {
+            Ok(p) => {
+                let elapsed = last_launch.map_or(0, |t| t.elapsed().as_millis() as u64);
+                log(&format!("ipc connected after {}ms", elapsed));
+                return Some(p);
+            }
+            Err(error) if Instant::now() >= deadline => break error,
+            Err(_) => {}
         }
 
         std::thread::sleep(std::time::Duration::from_millis(PIPE_POLL_INTERVAL_MS));
-    }
+    };
 
-    log("ipc connect timed out after launch");
+    log(&format!(
+        "ipc connect timed out after launch (last error: {})",
+        describe_connect_error(&last_error)
+    ));
     None
 }
 
@@ -597,7 +850,7 @@ fn reconnect_and_resend(
     last_launch: &mut Option<Instant>,
 ) -> Option<pipe::PipeHandle> {
     let mut p = if is_no_launch {
-        pipe::PipeHandle::connect(&ipc_address())?
+        connect_direct(&ipc_address()).ok()?
     } else {
         connect_with_auto_launch(last_launch)?
     };
@@ -693,7 +946,7 @@ fn relay() -> io::Result<()> {
         // status/query checks).
         if pipe.is_none() {
             pipe = if is_no_launch {
-                pipe::PipeHandle::connect(&ipc_address())
+                connect_direct(&ipc_address()).ok()
             } else {
                 connect_with_auto_launch(&mut last_launch)
             };
@@ -865,6 +1118,54 @@ mod tests {
             classify_cli_invocation(&["/path/to/com.fluxdown.nmh.json", "fluxdown@zerx.dev"]),
             None
         );
+    }
+
+    #[test]
+    fn macos_launch_targets_the_helper_bundle_of_a_packaged_agent() {
+        let agent = Path::new(
+            "/Applications/FluxDown.app/Contents/Helpers/FluxDownAgent.app/Contents/MacOS/fluxdown-agent",
+        );
+        let helper = bundled_helper_app(agent);
+        assert_eq!(
+            helper.as_deref(),
+            Some(Path::new(
+                "/Applications/FluxDown.app/Contents/Helpers/FluxDownAgent.app"
+            ))
+        );
+        assert_eq!(
+            helper.as_deref().and_then(outer_app_bundle).as_deref(),
+            Some(Path::new("/Applications/FluxDown.app"))
+        );
+        // Development layouts have no helper bundle: the relay spawns the agent directly.
+        assert_eq!(
+            bundled_helper_app(Path::new("/src/FluxDown/target/debug/fluxdown-agent")),
+            None
+        );
+        assert_eq!(
+            bundled_helper_app(Path::new("/opt/Contents/MacOS/fluxdown-agent")),
+            None
+        );
+    }
+
+    /// Mirrors the agent's `healable_install_location` rule.
+    #[test]
+    fn quarantine_heal_only_touches_writable_applications_installs() {
+        for healable in [
+            "/Applications/FluxDown.app",
+            "/Applications/Utilities/FluxDown.app",
+            "/Users/me/Applications/FluxDown.app",
+        ] {
+            assert!(is_healable_install(Path::new(healable)), "{healable}");
+        }
+        for kept in [
+            "/Users/me/Downloads/FluxDown.app",
+            "/Users/me/Applications.backup/FluxDown.app",
+            "/private/var/folders/xx/T/AppTranslocation/ABC/d/FluxDown.app",
+            "/Volumes/FluxDown 1.0.0/FluxDown.app",
+            "/Volumes/External/Applications/FluxDown.app",
+        ] {
+            assert!(!is_healable_install(Path::new(kept)), "{kept}");
+        }
     }
     #[cfg(test)]
     mod frame_failure_tests {

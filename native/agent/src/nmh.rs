@@ -95,6 +95,9 @@ struct TaskBrief {
     speed: i64,
     error_message: String,
     created_at: String,
+    /// 已完成任务的落盘文件已被删除 / 移走（引擎 `scan_missing_files` 维护）；false 时省略。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    file_missing: bool,
 }
 
 #[derive(Serialize)]
@@ -647,6 +650,7 @@ fn select_task_briefs(
             total_bytes: task.total_bytes,
             error_message: task.error_message,
             created_at: task.created_at,
+            file_missing: task.file_missing,
         })
         .collect()
 }
@@ -2817,6 +2821,28 @@ mod tests {
         assert_eq!(selected[1].speed, 0);
     }
 
+    #[test]
+    fn task_panel_reports_missing_file_only_when_flagged() {
+        let task = |id: &str, file_missing: bool| -> fluxdown_protocol::TaskDto {
+            serde_json::from_value(json!({
+                "taskId": id, "url": "https://example.com/a", "fileName": "a",
+                "saveDir": "/tmp", "status": 3, "downloadedBytes": 1, "totalBytes": 1,
+                "errorMessage": "", "createdAt": "1", "proxyUrl": "", "queueId": "main",
+                "checksum": "", "fileMissing": file_missing
+            }))
+            .expect("task")
+        };
+        let selected = select_task_briefs(
+            vec![task("gone", true), task("present", false)],
+            &std::collections::HashMap::new(),
+        );
+        let gone = serde_json::to_value(&selected[0]).expect("serialize");
+        let present = serde_json::to_value(&selected[1]).expect("serialize");
+        assert_eq!(gone["fileMissing"], json!(true));
+        // false 时省略该键，旧扩展看到的载荷与此前一致。
+        assert!(present.get("fileMissing").is_none());
+    }
+
     #[tokio::test]
     async fn ipc_ping_round_trips_through_frame_protocol() {
         let daemon = Arc::new(crate::daemon_client::DaemonClient::disconnected());
@@ -2952,7 +2978,10 @@ mod tests {
         assert_eq!(status["data"]["statuses"][&id], "pending");
         assert_eq!(status["data"]["statuses"]["missing"], "unknown");
 
-        capture.resolve(&id, false, None).await.expect("reject");
+        capture
+            .resolve(&id, false, false, None)
+            .await
+            .expect("reject");
         let status = exchange(
             &mut client,
             json!({"action": "capture_status", "msg_id": 4, "transactionIds": [id]}),

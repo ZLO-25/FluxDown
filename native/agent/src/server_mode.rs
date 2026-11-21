@@ -47,8 +47,9 @@ pub const TOKEN_SUBPROTOCOL_PREFIX: &str = "fluxdown.token.";
 pub const ACCESS_KEY_MIN_LEN: usize = 8;
 /// 访问密钥最长长度：既防误粘整段文本，也保证能原样塞进 HTTP 头。
 pub const ACCESS_KEY_MAX_LEN: usize = 128;
-/// 默认监听地址。
-pub const DEFAULT_BIND: &str = "0.0.0.0:17800";
+/// 默认监听地址：IPv4 + IPv6 双栈（飞牛 DDNS / FN Connect 等走 IPv6 访问）；本机不支持 IPv6
+/// 时网关退回 `0.0.0.0`（`runtime::bind_gateway_socket`）。
+pub const DEFAULT_BIND: &str = "[::]:17800";
 /// daemon `/blobs/*` 请求体上限（与 `fluxdown_daemon::http::REQUEST_BODY_LIMIT` 一致）。
 const BLOB_UPLOAD_LIMIT: usize = 4 * 1024 * 1024;
 /// 初始化请求体上限：只含一个密钥。
@@ -101,7 +102,7 @@ impl ServerConfig {
     ///
     /// | 变量 | 语义 |
     /// |---|---|
-    /// | `FLUXDOWN_BIND` | 监听地址，缺省 `0.0.0.0:17800`，允许非回环 |
+    /// | `FLUXDOWN_BIND` | 监听地址，缺省 `[::]:17800`（双栈，无 IPv6 时退回 `0.0.0.0`），允许非回环 |
     /// | `FLUXDOWN_TOKEN` / `FLUXDOWN_TOKEN_FORCE` | 预置访问密钥 / 是否每次启动覆盖；不合规则忽略并告警 |
     /// | `FLUXDOWN_WEBROOT` | 磁盘托管 SPA |
     /// | `FLUXDOWN_LANG` | `/ping` 语言回退，`zh-CN` → `zh` |
@@ -289,21 +290,21 @@ pub struct ServerRuntime {
 
 /// 阻塞运行 server 模式直到退出。
 pub fn run_blocking(host: crate::shell::ShellHost) -> AgentResult {
-    if let Err(error) = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init()
-    {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    let fmt_layer = tracing_subscriber::fmt::layer().with_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    );
+    let subscriber = tracing_subscriber::registry().with(fmt_layer);
+    if let Err(error) = subscriber.try_init() {
         // 嵌入式宿主可能已经设置订阅者；保留它，同时让 stderr 可观察未安装的原因。
         tracing::warn!(error = %error, "server tracing subscriber was not installed");
         eprintln!("server tracing subscriber was not installed: {error}");
     }
     let config = ServerConfig::from_env()?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let runtime = crate::runtime::build_runtime()?;
     runtime.block_on(async move {
         let cancel = CancellationToken::new();
         let quit = CancellationToken::new();
@@ -537,8 +538,9 @@ fn loopback_authority(value: &str) -> bool {
 
 /// 按来源地址的访问密钥失败节流：窗口内失败达到上限即锁定到窗口结束。
 /// 回环来源不受限（本机反代会让所有外部请求都呈现为回环，限速只会变成全站锁定）。
+/// server 模式由 [`ServerHandle`] 持有；桌面形态的 `/rpc` 由网关自己持有一份。
 #[derive(Default)]
-struct AuthThrottle {
+pub(crate) struct AuthThrottle {
     entries: std::sync::Mutex<HashMap<IpAddr, ThrottleEntry>>,
 }
 
@@ -547,7 +549,7 @@ struct ThrottleEntry {
     window_start: std::time::Instant,
 }
 
-const THROTTLE_MAX_FAILURES: u32 = 10;
+pub(crate) const THROTTLE_MAX_FAILURES: u32 = 10;
 const THROTTLE_WINDOW: Duration = Duration::from_secs(60);
 const THROTTLE_MAX_TRACKED: usize = 4096;
 
@@ -570,7 +572,7 @@ impl AuthThrottle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn is_locked(&self, peer: IpAddr, now: std::time::Instant) -> bool {
+    pub(crate) fn is_locked(&self, peer: IpAddr, now: std::time::Instant) -> bool {
         if peer.is_loopback() {
             return false;
         }
@@ -586,7 +588,7 @@ impl AuthThrottle {
         }
     }
 
-    fn record_failure(&self, peer: IpAddr, now: std::time::Instant) {
+    pub(crate) fn record_failure(&self, peer: IpAddr, now: std::time::Instant) {
         if peer.is_loopback() {
             return;
         }
@@ -608,7 +610,7 @@ impl AuthThrottle {
         entry.failures = entry.failures.saturating_add(1);
     }
 
-    fn record_success(&self, peer: IpAddr) {
+    pub(crate) fn record_success(&self, peer: IpAddr) {
         self.entries().remove(&Self::bucket(peer));
     }
 }
@@ -1262,7 +1264,7 @@ mod tests {
 
     #[test]
     fn bind_defaults_to_all_interfaces_and_accepts_non_loopback() {
-        assert_eq!(config_from(&[]).unwrap().bind.to_string(), "0.0.0.0:17800");
+        assert_eq!(config_from(&[]).unwrap().bind.to_string(), "[::]:17800");
         assert_eq!(
             config_from(&[("FLUXDOWN_BIND", " 192.168.1.10:9000 ")])
                 .unwrap()

@@ -188,6 +188,7 @@ pub async fn start_embedded(
         remote_task,
         device_meta_task,
         cdn_task,
+        bt_guard_task,
         notify_task,
     } = match start_cloud_services(
         // 宿主进程的环境不属于 agent：地址只取构建期注入值，缺省为本地默认。
@@ -210,6 +211,7 @@ pub async fn start_embedded(
 
     let mut tasks: Vec<(&'static str, JoinHandle<()>)> = vec![
         ("CDN", cdn_task),
+        ("BT guard", bt_guard_task),
         ("cloud notify", notify_task),
         ("cloud sync", sync_task),
         ("remote tasks", remote_task),
@@ -217,11 +219,12 @@ pub async fn start_embedded(
         ("power", tokio::spawn(power.clone().run(cancel.clone()))),
         (
             "daemon event projection",
-            // 嵌入式宿主（移动端）由平台自己处理提示音：不接入 agent 提示音。
+            // 嵌入式宿主（移动端）由平台自己处理提示音与失败通知：不接入 agent 侧。
             spawn_daemon_projection(
                 daemon_events,
                 events.clone(),
                 notice_tx,
+                None,
                 None,
                 cancel.clone(),
             ),
@@ -315,6 +318,7 @@ pub async fn start_embedded(
                 daemon: daemon.clone(),
                 events: events.clone(),
                 gateway: service.clone(),
+                agent_data_dir: store.data_dir().to_path_buf(),
             },
             ShellHost::without_tray(TrayUnavailableReason::NotBuilt, false),
             cancel.clone(),

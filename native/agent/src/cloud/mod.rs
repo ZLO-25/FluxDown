@@ -5,7 +5,8 @@ mod auth;
 mod client;
 mod models;
 
+pub(crate) use api::PrivateCatalogBody;
 pub use api::{CloudApi, NotifyReportResponse, NotifyReportResult};
 pub use auth::CloudAuthService;
-pub(crate) use client::RequestEpoch;
 pub use client::{CloudClient, CloudError};
+pub(crate) use client::{CloudSocket, RequestEpoch};

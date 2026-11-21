@@ -5,13 +5,15 @@
 //! 正交的信任模型，本模块不与插件系统的脚本执行交互——但已安装的组件会被
 //! 授权插件经 `flux.ffmpeg` / `flux.ytdlp` 门面调用（见 [`crate::plugin`]）。
 //!
-//! - [`ffmpeg`]：音视频处理，服务 DASH/轨对任务的 mux（BtbN 归档，解压取单文件）。
+//! - [`ffmpeg`]：音视频处理，服务 DASH/轨对任务的 mux（FFmpeg-Builds 归档，解压取单文件）。
 //! - [`ytdlp`]：站点媒体提取器，服务插件 resolve 平面的直链提取（单文件二进制）。
 //!
 //! 两者共用同一套路径来源模型（[`ComponentSource`]，manual→managed→system）、
 //! 错误类型（[`ComponentError`]）与安装底座（[`download_to_file`]/[`fetch_github_json`]）。
 
 mod ffmpeg;
+#[cfg(feature = "components")]
+mod segmented;
 mod ytdlp;
 
 pub use ffmpeg::*;
@@ -25,12 +27,13 @@ use std::path::PathBuf;
 /// `ghproxy`/`gh-proxy` 类反代的基址），非空时替换掉请求 URL 里的
 /// `https://api.github.com` 或 `https://github.com` 前缀（含 Release JSON
 /// 查询与资产直链下载两条路径）。空值（默认）= 不改写，直连 GitHub。
+/// 插件市场（索引与插件包下载，#847）复用同一配置。
 pub const CONFIG_COMPONENT_MIRROR_BASE: &str = "component_mirror_base";
 
 /// 把 `url` 的 `https://api.github.com` / `https://github.com` 前缀替换为
 /// `mirror_base`（trim 首尾空白与末尾 `/`）。`mirror_base` 为空则原样返回。
 /// 纯函数，不做网络/IO，便于测试。
-#[cfg(any(feature = "components", test))]
+#[cfg(any(feature = "components", feature = "plugins", test))]
 pub(crate) fn apply_component_mirror(url: &str, mirror_base: &str) -> String {
     let mirror_base = mirror_base.trim().trim_end_matches('/');
     if mirror_base.is_empty() {
@@ -47,7 +50,7 @@ pub(crate) fn apply_component_mirror(url: &str, mirror_base: &str) -> String {
 /// 读取用户配置的组件镜像基址（[`CONFIG_COMPONENT_MIRROR_BASE`]）；未设置
 /// 或读取失败均返回空串（= 不改写，直连 GitHub），不让配置读取失败阻断
 /// 安装流程。
-#[cfg(feature = "components")]
+#[cfg(any(feature = "components", feature = "plugins"))]
 pub(crate) async fn component_mirror_base(db: &crate::db::Db) -> String {
     db.get_config(CONFIG_COMPONENT_MIRROR_BASE)
         .await
@@ -212,9 +215,10 @@ pub async fn exec_probe(
 /// 安装流程共用。
 #[cfg(feature = "components")]
 pub(crate) async fn fetch_github_json(
-    client: &reqwest::Client,
+    clients: &crate::egress::RoutedClients,
     url: &str,
 ) -> Result<serde_json::Value, ComponentError> {
+    let client = client_for(clients, url).await?;
     let resp = client
         .get(url)
         .header("User-Agent", "FluxDown")
@@ -238,21 +242,21 @@ pub(crate) async fn fetch_github_json(
 /// 不是 https）都回退直连原始 `url`，不让一次镜像故障拖垮整个安装流程。
 #[cfg(feature = "components")]
 pub(crate) async fn fetch_github_json_with_mirror(
-    client: &reqwest::Client,
+    clients: &crate::egress::RoutedClients,
     url: &str,
     mirror_base: &str,
 ) -> Result<serde_json::Value, ComponentError> {
     if let Some(mirrored) = https_mirror_url(url, mirror_base)
-        && let Ok(v) = fetch_github_json(client, &mirrored).await
+        && let Ok(v) = fetch_github_json(clients, &mirrored).await
     {
         return Ok(v);
     }
-    fetch_github_json(client, url).await
+    fetch_github_json(clients, url).await
 }
 
 /// 镜像改写后的 URL：仅当确实改写且镜像为 https 才返回；http 镜像一律忽略
 /// （退回直连），避免明文链路上的篡改/降级。
-#[cfg(any(feature = "components", test))]
+#[cfg(any(feature = "components", feature = "plugins", test))]
 pub(crate) fn https_mirror_url(url: &str, mirror_base: &str) -> Option<String> {
     let mirrored = apply_component_mirror(url, mirror_base);
     (mirrored != url && mirrored.to_ascii_lowercase().starts_with("https://")).then_some(mirrored)
@@ -300,7 +304,7 @@ const MAX_CHECKSUM_FILE_BYTES: usize = 1024 * 1024;
 /// 不参与——它只转发版本 JSON，不在校验文件的信任路径上。
 #[cfg(feature = "components")]
 pub(crate) async fn fetch_expected_sha256(
-    client: &reqwest::Client,
+    clients: &crate::egress::RoutedClients,
     checksum_url: &str,
     mirror_base: &str,
     asset_name: &str,
@@ -309,7 +313,7 @@ pub(crate) async fn fetch_expected_sha256(
     urls.extend(https_mirror_url(checksum_url, mirror_base));
     let mut last = ComponentError::NotFound(format!("checksum for {asset_name}"));
     for url in urls {
-        match fetch_text(client, &url).await {
+        match fetch_text(clients, &url).await {
             Ok(text) => match parse_checksum_file(&text, asset_name) {
                 Some(hash) => return Ok(hash),
                 None => {
@@ -323,7 +327,11 @@ pub(crate) async fn fetch_expected_sha256(
 }
 
 #[cfg(feature = "components")]
-async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String, ComponentError> {
+async fn fetch_text(
+    clients: &crate::egress::RoutedClients,
+    url: &str,
+) -> Result<String, ComponentError> {
+    let client = client_for(clients, url).await?;
     let resp = client
         .get(url)
         .header("User-Agent", "FluxDown")
@@ -357,21 +365,22 @@ const MIRROR_BASE: &str = "https://fluxdown.com/api/components";
 /// 配置的镜像与直连 `github_url`。二进制下载不走此路径。
 #[cfg(feature = "components")]
 pub(crate) async fn fetch_versions_json(
-    client: &reqwest::Client,
+    clients: &crate::egress::RoutedClients,
     component: &str,
     github_url: &str,
     mirror_base: &str,
 ) -> Result<serde_json::Value, ComponentError> {
     let official_mirror = format!("{MIRROR_BASE}/{component}");
-    if let Ok(v) = fetch_github_json(client, &official_mirror).await {
+    if let Ok(v) = fetch_github_json(clients, &official_mirror).await {
         return Ok(v);
     }
-    fetch_github_json_with_mirror(client, github_url, mirror_base).await
+    fetch_github_json_with_mirror(clients, github_url, mirror_base).await
 }
 
-/// 流式下载载荷到 `dest` 并校验 SHA-256（`expected_sha256`，小写 hex），
+/// 下载载荷到 `dest` 并校验 SHA-256（`expected_sha256`，小写 hex），
 /// `progress(downloaded, total)` 上报进度（total=0 未知）。ffmpeg 归档 / yt-dlp
-/// 单二进制安装共用；每 256KB 上报一次避免信号风暴。
+/// 单二进制安装共用；每 256KB 上报一次避免信号风暴。服务器支持 Range 时多段并发、
+/// 单段断点重试，否则单流（见 [`segmented`]，#453）。
 ///
 /// 依次尝试：用户配置的 [`CONFIG_COMPONENT_MIRROR_BASE`] 镜像（675#1，仅 https）→
 /// 统一出口的插件改写地址（[`crate::egress::Egress::route_verified`]，如 GitHub 加速）→
@@ -379,7 +388,7 @@ pub(crate) async fn fetch_versions_json(
 /// 并报错——调用方在校验通过前不得执行或落位该文件。
 #[cfg(feature = "components")]
 pub(crate) async fn download_to_file(
-    client: &reqwest::Client,
+    clients: &crate::egress::RoutedClients,
     route: &crate::egress::EgressRoute,
     mirror_base: &str,
     dest: &std::path::Path,
@@ -397,7 +406,7 @@ pub(crate) async fn download_to_file(
     attempts.extend(route.attempts());
     let mut last_error = ComponentError::NotFound("download source".to_string());
     for attempt in &attempts {
-        match download_to_file_from(client, attempt, dest, progress).await {
+        match download_to_file_from(clients, attempt, dest, progress).await {
             Ok(actual) if actual.eq_ignore_ascii_case(expected_sha256) => return Ok(()),
             Ok(actual) => {
                 crate::log_info!(
@@ -428,67 +437,36 @@ pub(crate) async fn download_to_file(
 /// 下载到 `dest`，返回内容的 SHA-256（小写 hex）。
 #[cfg(feature = "components")]
 async fn download_to_file_from(
-    client: &reqwest::Client,
+    clients: &crate::egress::RoutedClients,
     attempt: &crate::egress::EgressAttempt,
     dest: &std::path::Path,
     progress: &(dyn Fn(u64, u64) + Send + Sync),
 ) -> Result<String, ComponentError> {
-    use futures_util::StreamExt;
-    use sha2::{Digest, Sha256};
-    use tokio::io::AsyncWriteExt;
-
-    let mut request = client.get(&attempt.url).header("User-Agent", "FluxDown");
-    for (name, value) in &attempt.headers {
-        request = request.header(name.as_str(), value.as_str());
-    }
-    let resp = request
-        .send()
-        .await
-        .map_err(|e| ComponentError::Http(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(ComponentError::Http(format!(
-            "download returned {}",
-            resp.status()
-        )));
-    }
-    let total = resp.content_length().unwrap_or(0);
-    let mut file = tokio::fs::File::create(dest)
-        .await
-        .map_err(|e| ComponentError::Io(e.to_string()))?;
-    let mut hasher = Sha256::new();
-    let mut stream = resp.bytes_stream();
-    let mut downloaded: u64 = 0;
-    let mut last_report: u64 = 0;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| ComponentError::Http(e.to_string()))?;
-        hasher.update(&chunk);
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| ComponentError::Io(e.to_string()))?;
-        downloaded += chunk.len() as u64;
-        if downloaded - last_report >= 256 * 1024 || downloaded == total {
-            progress(downloaded, total);
-            last_report = downloaded;
-        }
-    }
-    file.flush()
-        .await
-        .map_err(|e| ComponentError::Io(e.to_string()))?;
-    progress(downloaded, total);
-    Ok(hex::encode(hasher.finalize()))
+    let client = client_for(clients, &attempt.url).await?;
+    segmented::fetch_to_file(&client, attempt, dest, progress, &segmented::SEGMENT_POLICY).await
 }
 
-/// 组件安装的 HTTP 客户端：统一出口按当前全局代理装配。
+/// 组件安装的 HTTP 客户端集合：统一出口按当前全局代理与站点规则装配。
 #[cfg(feature = "components")]
-pub(crate) async fn egress_client(
+pub(crate) async fn egress_clients(
     egress: &crate::egress::Egress,
-) -> Result<reqwest::Client, ComponentError> {
+) -> Result<crate::egress::RoutedClients, ComponentError> {
     egress
-        .client_builder()
+        .routed(|builder| builder)
         .await
-        .map_err(|e| ComponentError::Http(format!("{e:#}")))?
-        .build()
-        .map_err(|e| ComponentError::Http(e.to_string()))
+        .map_err(|e| ComponentError::Http(format!("{e:#}")))
+}
+
+/// `url` 命中站点规则时用规则出口的客户端，否则用全局出口的客户端。
+#[cfg(feature = "components")]
+async fn client_for(
+    clients: &crate::egress::RoutedClients,
+    url: &str,
+) -> Result<reqwest::Client, ComponentError> {
+    clients
+        .client(url)
+        .await
+        .map_err(|e| ComponentError::Http(format!("{e:#}")))
 }
 
 #[cfg(test)]
@@ -562,10 +540,11 @@ mod tests {
     // 配置后改写 github.com 前缀（资产直链下载）；末尾 `/` 与首尾空白容错。
     #[test]
     fn apply_component_mirror_rewrites_asset_download_host() {
-        let url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg.zip";
+        let url =
+            "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/latest/ffmpeg.zip";
         assert_eq!(
             apply_component_mirror(url, "  https://ghproxy.example.com/gh/  "),
-            "https://ghproxy.example.com/gh/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg.zip"
+            "https://ghproxy.example.com/gh/FFmpeg-Builds/FFmpeg-Builds/releases/download/latest/ffmpeg.zip"
         );
     }
 

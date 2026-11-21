@@ -2,6 +2,7 @@
 //!
 //! 两端 crate 保持彼此独立；宿主只在边界调用本 crate 的命名函数。
 
+mod task_edit;
 use fluxdown_engine::downloader::CapturedRequestBody;
 use fluxdown_engine::model::{
     BtFileEntry, CdnNodeInfo, GroupInfo, HlsQualityOption, QueueInfo, QueueOrderEntry,
@@ -17,6 +18,7 @@ use fluxdown_protocol::daemon::{
 };
 #[cfg(feature = "components")]
 use fluxdown_protocol::daemon::{ComponentFfmpegStatus, ComponentVersions, ComponentYtdlpStatus};
+pub use task_edit::{task_edit_snapshot_to_dto, task_edit_to_engine, task_properties_to_dto};
 
 /// 将捕获请求体转换为引擎请求体。
 #[must_use]
@@ -53,6 +55,43 @@ pub fn category_route_to_engine(
             })
             .collect(),
         other_dir: route.other_dir,
+        archive: None,
+        archive_metadata: None,
+        archive_categories: route.archive_categories,
+    }
+}
+
+/// Convert root archive metadata across the engine/wire boundary.
+#[must_use]
+pub fn archive_metadata_to_dto(
+    value: fluxdown_engine::model::ArchiveMetadata,
+) -> fluxdown_protocol::daemon::ArchiveMetadataDto {
+    fluxdown_protocol::daemon::ArchiveMetadataDto {
+        platform: value.platform,
+        media_kind: value.media_kind,
+        creator_id: value.creator_id,
+        creator_name: value.creator_name,
+        series_id: value.series_id,
+        series_title: value.series_title,
+        collection_id: value.collection_id,
+        collection_title: value.collection_title,
+    }
+}
+
+/// Convert root archive metadata from the wire into the engine model.
+#[must_use]
+pub fn archive_metadata_to_engine(
+    value: fluxdown_protocol::daemon::ArchiveMetadataDto,
+) -> fluxdown_engine::model::ArchiveMetadata {
+    fluxdown_engine::model::ArchiveMetadata {
+        platform: value.platform,
+        media_kind: value.media_kind,
+        creator_id: value.creator_id,
+        creator_name: value.creator_name,
+        series_id: value.series_id,
+        series_title: value.series_title,
+        collection_id: value.collection_id,
+        collection_title: value.collection_title,
     }
 }
 
@@ -87,6 +126,44 @@ pub fn egress_plan_to_dto(
             headers: std::collections::BTreeMap::new(),
             plugin: None,
             proxy,
+        },
+    }
+}
+
+/// 将站点规则的校验结果与（可选的）路由解释转换为 wire DTO；`index` 从 0 起。
+#[must_use]
+pub fn proxy_route_to_dto(
+    issues: Vec<fluxdown_engine::proxy_rules::RuleIssue>,
+    explanation: Option<fluxdown_engine::proxy_rules::RouteExplanation>,
+) -> fluxdown_protocol::ProxyRouteResponse {
+    let to_index = |index: usize| u32::try_from(index).unwrap_or(u32::MAX);
+    let issues = issues
+        .into_iter()
+        .map(|issue| fluxdown_protocol::ProxyRuleIssueDto {
+            index: to_index(issue.index),
+            field: issue.field.to_owned(),
+            code: issue.code.to_owned(),
+            detail: issue.detail,
+        })
+        .collect();
+    match explanation {
+        Some(explanation) => fluxdown_protocol::ProxyRouteResponse {
+            issues,
+            matched: explanation
+                .matched
+                .map(|matched| fluxdown_protocol::ProxyRouteMatchDto {
+                    index: to_index(matched.index),
+                    id: matched.id,
+                    name: matched.name,
+                }),
+            reason: explanation.reason.as_str().to_owned(),
+            endpoint: explanation.endpoint,
+        },
+        None => fluxdown_protocol::ProxyRouteResponse {
+            issues,
+            matched: None,
+            reason: String::new(),
+            endpoint: String::new(),
         },
     }
 }
@@ -169,6 +246,7 @@ pub fn task_info_to_dto(task: TaskInfo) -> TaskDto {
         ignore_tls_errors: task.ignore_tls_errors,
         file_missing: task.file_missing,
         completed_at: task.completed_at,
+        file_hash: task.file_hash,
         referrer: task.referrer,
         group_id: task.group_id,
         rss_source_id: task.rss_source_id,
@@ -186,6 +264,11 @@ pub fn task_info_to_dto(task: TaskInfo) -> TaskDto {
         seed_time_limit_minutes: task.seed_time_limit_minutes,
         seed_inactive_time_limit_minutes: task.seed_inactive_time_limit_minutes,
         seed_upload_limit_bps: task.seed_upload_limit_bps,
+        bt_sequential: task.bt_sequential,
+        bt_first_last_pieces_first: task.bt_first_last_pieces_first,
+        bt_download_limit_bps: task.bt_download_limit_bps,
+        bt_super_seeding: task.bt_super_seeding,
+        properties: task_properties_to_dto(task.properties),
     }
 }
 
@@ -511,6 +594,21 @@ pub fn setting_field_to_dto(
         helper_script: field.helper_script,
         helper_label: field.helper_label,
         pattern: field.pattern,
+        localizations: field
+            .localizations
+            .into_iter()
+            .map(|(locale, text)| {
+                (
+                    locale,
+                    fluxdown_protocol::plugin_i18n::SettingLocalizationDto {
+                        title: text.title,
+                        description: text.description,
+                        helper_label: text.helper_label,
+                        options: text.options,
+                    },
+                )
+            })
+            .collect(),
     }
 }
 
@@ -548,6 +646,7 @@ pub fn plugin_info_to_dto(
         network_hosts: plugin.network_hosts,
         package_dir: plugin.package_dir,
         package_revision: plugin.package_revision,
+        source: plugin.source,
     }
 }
 
@@ -592,6 +691,7 @@ fn plugin_contributions_to_dto(
             })
             .collect(),
         sniff_rules: contributes.sniff_rules.is_some(),
+        archive_rules: contributes.archive_rules.is_some(),
         page_scripts: contributes
             .page_scripts
             .iter()
@@ -627,6 +727,36 @@ pub fn market_entry_to_dto(
         tags: entry.tags,
         permissions: entry.permissions,
         network_hosts: entry.network_hosts,
+        channel: None,
+        expires_at: None,
+    }
+}
+
+/// 将私有商店条目声明（`daemon.plugin.installPrivate`）还原为引擎条目：`mirrors` 恒空，
+/// `channel` / `expires_at` 是客户端展示字段，引擎不使用。
+#[cfg(feature = "plugins")]
+#[must_use]
+pub fn market_entry_from_dto(
+    dto: fluxdown_protocol::daemon::MarketEntryDto,
+) -> fluxdown_engine::plugin::MarketEntry {
+    fluxdown_engine::plugin::MarketEntry {
+        plugin_id: dto.plugin_id,
+        version: dto.version,
+        sequence: dto.sequence,
+        content_hash: dto.content_hash,
+        min_app_version: dto.min_app_version,
+        name: dto.name,
+        description: dto.description,
+        author: dto.author,
+        homepage: dto.homepage,
+        mirrors: Vec::new(),
+        publish_time: dto.publish_time,
+        yanked: dto.yanked,
+        tags: dto.tags,
+        permissions: dto.permissions,
+        network_hosts: dto.network_hosts,
+        sig_scheme: "none".to_owned(),
+        sigstore_bundle_ref: String::new(),
     }
 }
 

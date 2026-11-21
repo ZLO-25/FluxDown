@@ -45,6 +45,8 @@ pub enum PluginEntryKind {
     Main,
     /// 拦截入口：`globalThis.intercept`。
     Intercept,
+    /// Pure archive callback: `globalThis.archive({fileName})`.
+    Archive,
 }
 
 // ---------------------------------------------------------------------------
@@ -72,6 +74,20 @@ pub struct ResolveRequest {
     /// 变体收敛静默取默认（不为 N 个子任务弹 N 个选择框）。引擎不解释具体格式，
     /// 由发起方（前端固定选择/引擎自动裂变）与插件约定（D5 契约）。
     pub resolver_item: String,
+}
+
+pub type ArchiveRequest = crate::model::ArchiveContext;
+
+/// Archive callback output; directory components are validated by the host.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ArchiveResult {
+    /// Relative path components below the task's authorized default directory.
+    pub directories: Vec<String>,
+    /// Legacy single-component output from existing plugins.
+    pub folder_name: String,
+    /// Stable builtin category identifier; mutually exclusive with directory outputs.
+    pub category: String,
 }
 
 /// 一次平台登录动作。`action` 为 `begin`、`poll`、`cancel`、`logout` 或 `status`。
@@ -150,6 +166,9 @@ pub struct ResolveResult {
     /// fail-closed 强制）。仅初段解析（[`ResolveRequest::resolver_item`] 为空）
     /// 可返回；二段返回会被拒绝（防递归裂变）。`None` = 单直链旧语义。
     pub manifest: Option<ResolveManifest>,
+    /// Validated descriptive source metadata for classification.
+    pub archive_metadata: Option<crate::model::ArchiveMetadata>,
+
     /// 请求改写补丁（与拦截器 `prepare` 返回值同形），每次运行都重新应用，
     /// 失败即任务失败。`extraHeaders` 作为整表替换并入同一补丁。
     pub request: Option<crate::intercept::RequestPatch>,
@@ -166,6 +185,9 @@ pub struct ResolveManifest {
     /// 文件夹名/组名（gopeed `Res.Name` 同义）。空 = 由宿主用母任务文件名/
     /// 首个条目名兜底（引擎自动裂变路径的语义，见 `on_resolve_ready`）。
     pub name: String,
+    /// Root-level source classification hints shared by all manifest items.
+    pub archive_metadata: Option<crate::model::ArchiveMetadata>,
+
     /// 清单条目，1..=1000。
     pub items: Vec<ManifestItem>,
 }
@@ -355,6 +377,9 @@ pub enum PluginError {
     /// 错误归因到具体字段，`message` 是面向用户的原因。
     #[error("{message}")]
     InvalidSetting { key: String, message: String },
+    /// 公开渠道的安装撞上了私有商店来源的同标识插件。
+    #[error("插件 {0} 由 FluxCloud 私有商店安装，公开渠道不能覆盖它")]
+    PrivateSource(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +405,10 @@ pub struct BridgeHttpRequest {
     /// 允许访问环回 / 私网等非公网地址，便于连接本机服务联调。
     #[serde(skip)]
     pub private_network_allowed: bool,
+    /// 由运行时注入：本次插件调用的出口（见 [`super::call_egress`]）。`None` = 无调用级
+    /// 出口（常驻宿主、通知钩子等），bridge 按全局规则 + 全局模式选出口。
+    #[serde(skip)]
+    pub egress: Option<Arc<super::call_egress::CallEgress>>,
 }
 
 impl Default for BridgeHttpRequest {
@@ -392,6 +421,7 @@ impl Default for BridgeHttpRequest {
             auth_ref: None,
             auth_allowed: false,
             private_network_allowed: false,
+            egress: None,
         }
     }
 }
@@ -474,6 +504,9 @@ pub struct YtdlpSpec {
     /// 从脚本墙钟里扣除，避免排队被误判为插件自身超时。
     #[serde(skip)]
     pub wall_pause: Option<Arc<WallPause>>,
+    /// 宿主在 JS 边界注入：本次插件调用的出口（见 [`BridgeHttpRequest::egress`]）。
+    #[serde(skip)]
+    pub egress: Option<Arc<super::call_egress::CallEgress>>,
 }
 
 /// 累计「不应计入脚本墙钟」的排队等待时长（含进行中的等待）。
@@ -565,6 +598,8 @@ pub struct HostContext {
     /// 插件是否为开发模式（「从目录安装」）。仅此类插件的 `flux.fetch` 可访问
     /// 非公网地址（环回 / 私网）；正式安装的插件恒为 false。
     pub private_network_allowed: bool,
+    /// 本次调用的出口（见 [`super::call_egress`]）；`None` = 全局出口。
+    pub egress: Option<Arc<super::call_egress::CallEgress>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -610,6 +645,10 @@ pub enum HostCall {
     },
     ViewRefresh {
         session: String,
+    },
+    ViewLocale {
+        session: String,
+        locale: String,
     },
     ViewClose {
         session: String,
@@ -668,16 +707,63 @@ pub trait HostEvents: Send + Sync {
     fn request_render(&self, session: &str);
     /// `flux.ui.toast`。
     fn toast(&self, identity: &str, level: &str, text: &str);
+    /// `ctx.close()`：以 `requested` 原因结束调用方自己的会话。
+    fn close_view(&self, identity: &str, session: &str) -> Result<(), PluginError>;
+    /// `ctx.navigate(target)`：校验目标后向客户端发出跳转请求。
+    async fn navigate(
+        &self,
+        identity: &str,
+        session: &str,
+        target: serde_json::Value,
+    ) -> Result<(), PluginError>;
     /// 安排一个一次性定时器：`delay` 后向宿主投递 [`HostCall::Timer`]。
     fn timer(&self, identity: &str, id: u32, delay: Duration);
     /// 取消尚未触发的定时器。
     fn timer_clear(&self, identity: &str, id: u32);
-    /// `flux.settings.update`。
+    /// `flux.settings.update()`，默认实现明确拒绝未配置的宿主。
     async fn settings_update(
         &self,
-        identity: &str,
-        entries: Vec<(String, String)>,
-    ) -> Result<(), PluginError>;
+        _identity: &str,
+        _entries: Vec<(String, String)>,
+    ) -> Result<(), PluginError> {
+        Err(PluginError::Runtime(
+            "plugin settings update is unsupported".to_string(),
+        ))
+    }
+    /// Retrieve or refresh this plugin's signed archive rule pack.
+    async fn archive_rules(
+        &self,
+        _identity: &str,
+        _refresh: bool,
+    ) -> Result<serde_json::Value, PluginError> {
+        Err(PluginError::Runtime(
+            "archive rule management is unsupported".to_string(),
+        ))
+    }
+
+    /// Load a bounded image resource owned by an active view session.
+    async fn image_load(
+        &self,
+        _identity: &str,
+        _session: &str,
+        _options: super::images::ImageLoadOptions,
+    ) -> Result<String, PluginError> {
+        Err(PluginError::Runtime(
+            "plugin images are unsupported".to_string(),
+        ))
+    }
+
+    /// Release a session-owned image after removing every use of its reference.
+    async fn image_release(
+        &self,
+        _identity: &str,
+        _session: &str,
+        _src: &str,
+    ) -> Result<(), PluginError> {
+        Err(PluginError::Runtime(
+            "plugin images are unsupported".to_string(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -714,6 +800,17 @@ pub trait ScriptRuntime: Send + Sync {
         budget: ExecutionBudget,
         host: HostContext,
     ) -> Result<Option<ResolveResult>, PluginError>;
+
+    /// 调用隔离的 `globalThis.archive(ctx)`：只注入 `bridge` 的日志能力
+    /// （`flux.logger` / `console`），不提供任何网络、存储、文件、任务或进程接口。
+    async fn invoke_archive(
+        &self,
+        plugin: &PluginScript,
+        req: ArchiveRequest,
+        settings_json: String,
+        bridge: Arc<dyn PluginBridge>,
+        budget: ExecutionBudget,
+    ) -> Result<Option<ArchiveResult>, PluginError>;
 
     /// 调用 `globalThis.intercept(ctx)`（下载拦截平面）。`Ok(None)` = 不改动；
     /// `Ok(Some(raw))` 为插件返回值的 JSON 文本。`long_running` 走外部工具信号量
@@ -797,6 +894,18 @@ pub trait PluginBridge: Send + Sync {
         plugin_id: &str,
         req: BridgeHttpRequest,
     ) -> Result<BridgeHttpResponse, PluginError>;
+
+    /// Fetch bounded binary image bytes through the plugin's guarded network egress.
+    async fn image_request(
+        &self,
+        _plugin_id: &str,
+        _req: BridgeHttpRequest,
+        _hosts: Vec<String>,
+    ) -> Result<Vec<u8>, PluginError> {
+        Err(PluginError::Runtime(
+            "plugin image fetch is unsupported".to_string(),
+        ))
+    }
 
     /// 读取插件自己的认证档案。默认 bridge 不提供认证能力。
     async fn auth_get(

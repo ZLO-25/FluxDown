@@ -11,6 +11,36 @@ import type { ViewChild, ViewNode } from "./view";
 // flux.fetch / auth / storage / fs / task
 // ---------------------------------------------------------------------------
 
+/** Options for loading a sanitized, host-fetched image into a view session. */
+export interface ImageLoadOptions {
+  url: string;
+  headers?: Record<string, string>;
+  authRef?: string;
+  /** Maximum output width, 1–2048; defaults to 512. */
+  maxWidth?: number;
+  /** Maximum output height, 1–2048; defaults to 512. */
+  maxHeight?: number;
+  /** Cache by source/options for five minutes; defaults to true. */
+  cache?: boolean;
+}
+
+/** A per-session image resource reference (`flux-image:<uuid>`). */
+export interface FluxImages {
+  load(options: ImageLoadOptions): Promise<string>;
+  /** Invalidate a reference after removing ALL uses, including prefetched state; identical images share it. */
+  release(src: string): Promise<void>;
+}
+
+export interface MainImageLoadOptions extends ImageLoadOptions {
+  session: string;
+}
+
+export interface MainFluxImages {
+  load(options: MainImageLoadOptions): Promise<string>;
+  /** Invalidate a reference owned by this session after removing every use. */
+  release(options: { session: string; src: string }): Promise<void>;
+}
+
 export interface FluxFetchOptions {
   /** Default `GET`. */
   method?: string;
@@ -112,6 +142,19 @@ export interface FluxYtdlp {
   run(spec: ToolSpec): Promise<ToolOutcome>;
 }
 
+/** Status of a publisher-signed archive classification rules pack. */
+export interface ArchiveRulesStatus {
+  sequence: number;
+  ruleCount: number;
+  lastCheckedAt: number | null;
+  lastUpdatedAt: number | null;
+  lastError: string | null;
+  updateUrl: string | null;
+  automaticUpdates: boolean;
+  /** Publisher key pinned by the manifest. */
+  publicKey: string;
+}
+
 // ---------------------------------------------------------------------------
 // HOST_PRELUDE (resident `main` script)
 // ---------------------------------------------------------------------------
@@ -131,6 +174,9 @@ export interface ViewEvent {
   action?: string;
 }
 
+/** Navigation target: a built-in page, or an `activity` view of this plugin. */
+export type NavigateTarget = "downloads" | "rss" | "webhooks" | { view: string };
+
 export interface ViewContext {
   /** Unique id of this open view session. */
   session: string;
@@ -138,9 +184,27 @@ export interface ViewContext {
   props: Record<string, unknown>;
   /** Task the view is attached to (taskDetail views); `null` otherwise. */
   taskId: string | null;
+  /** Current client UI locale; re-read in render because it hot-updates on language changes. Do not cache localized UI strings in init. */
   locale: string;
+  images: FluxImages;
   /** Requests a re-render (throttled to one render per 100 ms per session). */
   refresh(): void;
+  /**
+   * Closes the container hosting this view (login dialog, settings dialog, standalone
+   * window) and ends the session. For views embedded in a page (activity page, task
+   * detail tab) there is no container: the view just shows as "ended" with a reopen button.
+   * Idempotent. May be called inside `init` (for example when already logged in): the client
+   * shows the view and closes it right away.
+   */
+  close(): void;
+  /**
+   * Brings the main window to the front and switches to the target page. Rejects on an
+   * unknown target or a `{ view }` that is not an `activity` view of this plugin. Ignored by
+   * the client if the target page does not exist. Only the client that opened this view is
+   * affected. Rejects when called after `close()` (navigate first, then close). May be called
+   * inside `init`.
+   */
+  navigate(target: NavigateTarget): Promise<void>;
 }
 
 type Awaitable<T> = T | Promise<T>;
@@ -321,12 +385,19 @@ export interface Flux {
   ffmpeg?: FluxFfmpeg;
   ffprobe?: FluxFfprobe;
   ytdlp?: FluxYtdlp;
+  /** Available only to archive-capable plugins with `contributes.archiveRules`. */
+  archiveRules?: {
+    status(): Promise<ArchiveRulesStatus>;
+    update(): Promise<ArchiveRulesStatus>;
+  };
 }
 
 /** The `flux` facade of the resident `main` script (received by `defineMain`). */
 export interface MainFlux extends Omit<Flux, "settings"> {
   /** Values as in `Flux.settings`, plus the non-enumerable `update` method. */
   settings: FluxSettingsValues & FluxSettingsHost;
+  /** Session-bound image loading, available only in the resident `main` script. */
+  images: MainFluxImages;
   ui: FluxUi;
   commands: FluxCommands;
   rpc: FluxRpc;
@@ -354,6 +425,54 @@ export interface ResolveContext {
   /** Non-empty on the second stage of a manifest resolve (`<itemId>` or `<itemId>@<variantId>`). */
   resolverItem: string;
 }
+
+/** Root-level source hints; these are not facts read from the file itself. */
+export interface ArchiveMetadata {
+  platform?: string;
+  mediaKind?: string;
+  creatorId?: string;
+  creatorName?: string;
+  seriesId?: string;
+  seriesTitle?: string;
+  collectionId?: string;
+  collectionTitle?: string;
+}
+
+/** Content kinds reported by the host's bounded file-format recognizer. */
+export type ArchiveDetectedKind =
+  | "archive" | "audio" | "compressed" | "database" | "diagram" | "disk"
+  | "document" | "ebook" | "executable" | "font" | "formula" | "geospatial"
+  | "image" | "metadata" | "model" | "other" | "package" | "playlist"
+  | "presentation" | "rom" | "spreadsheet" | "subtitle" | "video";
+
+/** `archive(ctx)` argument; source metadata and host-observed content facts are distinct. */
+export interface ArchiveContext {
+  /** Actual final file name; BT single-file selection uses the selected torrent file's name. */
+  fileName: string;
+  /** Optional root-level source-provided labels; never credentials, URLs, or paths. */
+  metadata?: ArchiveMetadata;
+  /** True for a group root. Groups are routed only at start and are not content-read. */
+  isGroup?: boolean;
+  /** `start` before downloading, or `complete` for the processed final artifact. */
+  phase: "start" | "complete";
+  /** Fixed UTC task/group creation date (`YYYY-MM-DD`); empty for invalid legacy dates. */
+  createdDate: string;
+  /** Host-observed content facts only; omitted when unknown or recognition is unavailable. */
+  detectedType?: {
+    kind: ArchiveDetectedKind;
+    mime: string;
+    extension: string;
+  };
+  /** Host capability; absent on older hosts that do not support category routing. */
+  categoryRouting?: boolean;
+}
+/** Stable built-in category identifiers supported by category routing. */
+export type ArchiveCategory =
+  | "video" | "audio" | "document" | "image" | "program" | "archive" | "other";
+/** Archive destination; category routing is valid only for completed, non-group artifacts. */
+export type ArchiveResult =
+  | { category: ArchiveCategory; directories?: never; folderName?: never }
+  | { category?: never; directories?: string[]; folderName?: string };
 
 export interface ResolveVariant {
   label: string;
@@ -395,7 +514,9 @@ export interface ResolveResult {
   /** Request overlay applied to this task's every run (same shape as the `prepare` result). */
   request?: RequestPatch;
   /** Multi-file listing; mutually exclusive with `url` / `variants` / `audioUrl`. */
-  manifest?: { name?: string; items: ManifestItem[] };
+  manifest?: { name?: string; items: ManifestItem[]; archiveMetadata?: ArchiveMetadata };
+  /** Root metadata shared by this resolver result and its manifest items. */
+  archiveMetadata?: ArchiveMetadata;
 }
 
 /** `authenticate(ctx)` argument. */
@@ -455,6 +576,8 @@ export type ResolveFn = (ctx: ResolveContext) => Awaitable<ResolveResult | null 
 export type AuthFn = (ctx: AuthContext) => Awaitable<AuthResult>;
 /** Returns the normalized subscription payload (at most 1000 items). */
 export type SubscribeFn = (ctx: SubscribeContext) => Awaitable<SubscribeResult>;
+/** Returns a subfolder name, or `null` / `undefined` for none (sync or async). */
+export type ArchiveFn = (ctx: ArchiveContext) => Awaitable<ArchiveResult | null | undefined>;
 
 // ---- Interceptor plane (manifest `interceptors`; entry `globalThis.intercept(ctx)`) ----
 
@@ -720,6 +843,8 @@ export interface HookHandlers {
 declare global {
   /** The plugin runtime facade. */
   const flux: Flux;
+  /** Archive entry (`contributes.archive`, `archive` permission); the sandbox has only `flux.settings`, `flux.logger` and `console`. */
+  function archive(ctx: ArchiveContext): Awaitable<ArchiveResult | null | undefined>;
   /**
    * Console routed to the plugin log. Declared as a plain variable: do not enable the DOM
    * lib in plugin projects (the QuickJS host has no DOM).

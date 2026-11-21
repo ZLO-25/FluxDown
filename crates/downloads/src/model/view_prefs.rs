@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use super::{DownloadTaskView, TaskState};
 
 pub(crate) const VIEW_PREFS_KEY: &str = "desktop.downloads.view";
+/// 设备本地偏好（缺省关）：任务列表 / 详情副标题不展示来源站点；设置「通用 › 任务列表」写入，
+/// `crates/settings/src/sections/general.rs` 重复声明同名键（设置能力不依赖下载能力）。
+pub(crate) const HIDE_TASK_SOURCE_PREF: &str = "ui.hide_task_source";
 /// 宽松密度行高 = 旧 Flutter 默认列表的 64px（Web `rowHeightClass` 同值）。字号放大到舒适行
 /// 本身超过它时取舒适行高，保证两行文字不被裁切。
 const RELAXED_ROW_HEIGHT: f32 = 64.;
@@ -59,16 +62,18 @@ pub(crate) enum ViewGroupBy {
     Type,
     Queue,
     Site,
+    Directory,
 }
 
 impl ViewGroupBy {
-    const CYCLE: [Self; 6] = [
+    const CYCLE: [Self; 7] = [
         Self::None,
         Self::Status,
         Self::Date,
         Self::Type,
         Self::Queue,
         Self::Site,
+        Self::Directory,
     ];
 
     pub(crate) fn next(self) -> Self {
@@ -187,6 +192,16 @@ impl DetailPlacement {
     }
 }
 
+/// 任务表表头文字对齐（视图菜单 › 显示）；默认左对齐，单元格内容对齐不受影响。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HeaderAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ColumnPref {
     /// 列键（`DownloadColumnKind::key`）。
@@ -199,6 +214,7 @@ pub(crate) struct ColumnPref {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ViewPrefs {
     pub(crate) density: ViewDensity,
+    pub(crate) header_align: HeaderAlign,
     pub(crate) group_by: ViewGroupBy,
     pub(crate) sort_key: ViewSortKey,
     pub(crate) sort_dir: SortDir,
@@ -218,6 +234,7 @@ impl Default for ViewPrefs {
     fn default() -> Self {
         Self {
             density: ViewDensity::default(),
+            header_align: HeaderAlign::default(),
             group_by: ViewGroupBy::default(),
             sort_key: ViewSortKey::default(),
             sort_dir: SortDir::default(),
@@ -242,6 +259,7 @@ impl ViewPrefs {
             return prefs;
         };
         read_field(map, "density", &mut prefs.density);
+        read_field(map, "header_align", &mut prefs.header_align);
         read_field(map, "group_by", &mut prefs.group_by);
         read_field(map, "sort_key", &mut prefs.sort_key);
         read_field(map, "sort_dir", &mut prefs.sort_dir);

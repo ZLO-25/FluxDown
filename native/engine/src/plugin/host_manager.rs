@@ -24,7 +24,7 @@ use crate::logger::log_info;
 use crate::plugin::audit::{AuditLog, PluginAuditRow};
 use crate::plugin::manifest::{
     PERMISSION_AUTH, PERMISSION_FFMPEG, PERMISSION_PAGE_SCRIPTS, PERMISSION_TASKS,
-    PERMISSION_YTDLP, PluginManifest,
+    PERMISSION_YTDLP, PluginManifest, ViewLocation,
 };
 use crate::plugin::runtime::{
     HostCall, HostContext, HostEvents, HostFuture, HostReply, PluginEntryKind, PluginError,
@@ -42,6 +42,19 @@ const RENDER_MIN_INTERVAL: Duration = Duration::from_millis(100);
 /// `flux.tasks.create` 的限流窗口与额度（每插件）。
 const CREATE_WINDOW: Duration = Duration::from_secs(60);
 const CREATE_LIMIT: usize = 20;
+
+// Bound downloaded source buffers waiting for the decoder, across all plugin hosts.
+static IMAGE_LOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+const IMAGE_QUEUE_TIMEOUT: Duration = Duration::from_secs(3);
+
+async fn acquire_image_load(
+    semaphore: &tokio::sync::Semaphore,
+) -> Result<tokio::sync::SemaphorePermit<'_>, PluginError> {
+    tokio::time::timeout(IMAGE_QUEUE_TIMEOUT, semaphore.acquire())
+        .await
+        .map_err(|_| PluginError::Overloaded)?
+        .map_err(|_| PluginError::Overloaded)
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -126,6 +139,7 @@ impl CreateLimiter {
 /// manager 持有的全部宿主状态。
 pub(super) struct HostState {
     hosts: Mutex<HashMap<String, HostEntry>>,
+    images: super::super::images::ImageResources,
     sessions: Mutex<HashMap<String, SessionEntry>>,
     timers: Mutex<HashMap<(String, u32), AbortHandle>>,
     limiters: Mutex<HashMap<String, Arc<CreateLimiter>>>,
@@ -143,6 +157,7 @@ impl HostState {
         Self {
             hosts: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
+            images: super::super::images::ImageResources::default(),
             timers: Mutex::new(HashMap::new()),
             limiters: Mutex::new(HashMap::new()),
             activation: Mutex::new(HashMap::new()),
@@ -214,6 +229,65 @@ impl HostEvents for HostEventsImpl {
             return Err(PluginError::Runtime("plugin manager stopped".to_string()));
         };
         manager.host_settings_update(identity, entries).await
+    }
+    async fn archive_rules(
+        &self,
+        identity: &str,
+        refresh: bool,
+    ) -> Result<serde_json::Value, PluginError> {
+        let Some(manager) = self.manager.upgrade() else {
+            return Err(PluginError::Runtime("plugin manager stopped".to_string()));
+        };
+        manager.archive_rules_status(identity, refresh).await
+    }
+
+    fn close_view(&self, identity: &str, session: &str) -> Result<(), PluginError> {
+        let Some(manager) = self.manager.upgrade() else {
+            return Err(PluginError::Runtime("plugin manager stopped".to_string()));
+        };
+        manager.host_view_close(identity, session)
+    }
+
+    async fn navigate(
+        &self,
+        identity: &str,
+        session: &str,
+        target: serde_json::Value,
+    ) -> Result<(), PluginError> {
+        let Some(manager) = self.manager.upgrade() else {
+            return Err(PluginError::Runtime("plugin manager stopped".to_string()));
+        };
+        manager.host_view_navigate(identity, session, target).await
+    }
+
+    async fn image_load(
+        &self,
+        identity: &str,
+        session: &str,
+        options: super::super::images::ImageLoadOptions,
+    ) -> Result<String, PluginError> {
+        let manager = self
+            .manager
+            .upgrade()
+            .ok_or_else(|| PluginError::Runtime("plugin manager stopped".to_string()))?;
+        manager.host_image_load(identity, session, options).await
+    }
+
+    async fn image_release(
+        &self,
+        identity: &str,
+        session: &str,
+        src: &str,
+    ) -> Result<(), PluginError> {
+        let manager = self
+            .manager
+            .upgrade()
+            .ok_or_else(|| PluginError::Runtime("plugin manager stopped".to_string()))?;
+        let sessions = lock(&manager.host.sessions);
+        if sessions.get(session).map(|entry| entry.identity.as_str()) != Some(identity) {
+            return Err(PluginError::Runtime("unknown view session".to_string()));
+        }
+        manager.host.images.release(identity, session, src)
     }
 }
 
@@ -387,7 +461,10 @@ impl PluginManager {
                 .find(|p| p.manifest.identity == identity)
                 .ok_or_else(|| PluginError::Runtime(format!("plugin not found: {identity}")))?;
             if !plugin.enabled {
-                return Err(PluginError::Runtime(format!("plugin disabled: {identity}")));
+                return Err(PluginError::Runtime(format!(
+                    "plugin disabled: {identity} ({})",
+                    plugin.disabled_reason.describe()
+                )));
             }
             plugin.manifest.clone()
         };
@@ -455,7 +532,10 @@ impl PluginManager {
                 .find(|p| p.manifest.identity == identity)
                 .ok_or_else(|| PluginError::Runtime(format!("plugin not found: {identity}")))?;
             if !plugin.enabled {
-                return Err(PluginError::Runtime(format!("plugin disabled: {identity}")));
+                return Err(PluginError::Runtime(format!(
+                    "plugin disabled: {identity} ({})",
+                    plugin.disabled_reason.describe()
+                )));
             }
             if plugin.manifest.main.is_none() {
                 return Err(PluginError::Runtime(format!(
@@ -481,20 +561,24 @@ impl PluginManager {
         self.ensure_host(identity).await?;
 
         let session = uuid::Uuid::new_v4().to_string();
-        lock(&self.host.sessions).insert(
-            session.clone(),
-            SessionEntry {
-                identity: identity.to_string(),
-                last_keepalive: Instant::now(),
-                opened: false,
-                last_render: None,
-                pending: None,
-                flush_scheduled: false,
-                refresh_pending: false,
-                next_ticket: 0,
-                last_ticket: 0,
-            },
-        );
+        {
+            let mut sessions = lock(&self.host.sessions);
+            sessions.insert(
+                session.clone(),
+                SessionEntry {
+                    identity: identity.to_string(),
+                    last_keepalive: Instant::now(),
+                    opened: false,
+                    last_render: None,
+                    pending: None,
+                    flush_scheduled: false,
+                    refresh_pending: false,
+                    next_ticket: 0,
+                    last_ticket: 0,
+                },
+            );
+            self.host.images.open_session(identity, &session);
+        }
         let call = HostCall::ViewOpen {
             session: session.clone(),
             view: view.to_string(),
@@ -513,12 +597,14 @@ impl PluginManager {
             }
             Ok(_) => {
                 lock(&self.host.sessions).remove(&session);
+                self.host.images.close_session(&session);
                 Err(PluginError::InvalidOutput(
                     "view open returned no tree".to_string(),
                 ))
             }
             Err(e) => {
                 lock(&self.host.sessions).remove(&session);
+                self.host.images.close_session(&session);
                 Err(e)
             }
         }
@@ -546,15 +632,44 @@ impl PluginManager {
         Ok(())
     }
 
+    /// Update only this session's locale and render with its existing plugin state.
+    ///
+    /// Completion is published through the same tree-event pipeline as input events.
+    pub fn set_view_locale(
+        self: &Arc<Self>,
+        session: &str,
+        locale: String,
+    ) -> Result<(), PluginError> {
+        let (identity, ticket, enqueued) = self.enqueue_session_call(
+            session,
+            HostCall::ViewLocale {
+                session: session.to_owned(),
+                locale,
+            },
+        )?;
+        let me = self.clone();
+        let session = session.to_owned();
+        self.runtime.spawn_handle().spawn(async move {
+            me.finish_tree(identity, session, ticket, enqueued).await;
+        });
+        Ok(())
+    }
+
     /// 关闭会话（客户端主动）。未知会话静默忽略。
     pub fn close_view(self: &Arc<Self>, session: &str) {
+        self.close_view_with_reason(session, "closed");
+    }
+
+    /// 以给定 `reason` 结束会话并广播 `PluginViewClosed`。未知会话静默忽略。
+    fn close_view_with_reason(self: &Arc<Self>, session: &str, reason: &str) {
         let removed = lock(&self.host.sessions).remove(session);
         let Some(entry) = removed else {
             return;
         };
+        self.host.images.close_session(session);
         self.sink.emit(EngineEvent::PluginViewClosed {
             session: session.to_string(),
-            reason: "closed".to_string(),
+            reason: reason.to_string(),
         });
         self.notify_host_closed(&entry.identity, session);
     }
@@ -607,7 +722,10 @@ impl PluginManager {
             .find(|p| p.manifest.identity == identity)
             .ok_or_else(|| PluginError::Runtime(format!("plugin not found: {identity}")))?;
         if !plugin.enabled {
-            return Err(PluginError::Runtime(format!("plugin disabled: {identity}")));
+            return Err(PluginError::Runtime(format!(
+                "plugin disabled: {identity} ({})",
+                plugin.disabled_reason.describe()
+            )));
         }
         let Some(main) = &plugin.manifest.main else {
             return Err(PluginError::Runtime(format!(
@@ -627,6 +745,8 @@ impl PluginManager {
             ytdlp_permitted: plugin.manifest.has_permission(PERMISSION_YTDLP),
             auth_permitted: plugin.manifest.has_permission(PERMISSION_AUTH),
             private_network_allowed: plugin.dev,
+            // 常驻宿主不绑定某次调用：按全局规则 + 全局模式选出口。
+            egress: None,
         };
         let task_port: Option<Arc<dyn PluginTaskPort>> =
             if plugin.manifest.has_permission(PERMISSION_TASKS) {
@@ -701,6 +821,7 @@ impl PluginManager {
             keep
         });
         self.close_sessions_of(identity, "pluginUnloaded");
+        self.host.images.close_plugin(identity);
     }
 
     /// 结束某插件的全部会话并广播 `PluginViewClosed`。
@@ -1047,8 +1168,146 @@ impl PluginManager {
     // 设置
     // ---------------------------------------------------------------------
 
+    /// 校验 `session` 属于 `identity`（`ctx.close/navigate` 共用）。`init` 期间（首帧返回前）也
+    /// 放行：动作经事件送达客户端，客户端在 open 应答前收到的动作会先缓存、登记会话后再执行。
+    fn check_view_session(&self, identity: &str, session: &str) -> Result<(), PluginError> {
+        match lock(&self.host.sessions).get(session) {
+            Some(entry) if entry.identity == identity => Ok(()),
+            _ => Err(PluginError::Runtime(format!("unknown session: {session}"))),
+        }
+    }
+
+    /// 会话是否仍存在（daemon 在 open 应答前据此清理插件已在 `init` 中关闭的会话）。
+    #[must_use]
+    pub fn has_view_session(&self, session: &str) -> bool {
+        lock(&self.host.sessions).contains_key(session)
+    }
+
+    /// Read a sanitized PNG resource only within its owning live view session.
+    #[must_use]
+    pub fn view_image(&self, session: &str, id: &str) -> Option<Arc<[u8]>> {
+        let sessions = lock(&self.host.sessions);
+        sessions.get(session)?;
+        self.host.images.read(session, id)
+    }
+
+    async fn host_image_load(
+        &self,
+        identity: &str,
+        session: &str,
+        mut options: super::super::images::ImageLoadOptions,
+    ) -> Result<String, PluginError> {
+        self.check_view_session(identity, session)?;
+        options.validate()?;
+        let snapshot = self.plugins.read().await.clone();
+        let plugin = snapshot
+            .iter()
+            .find(|plugin| plugin.enabled && plugin.manifest.identity == identity)
+            .ok_or_else(|| PluginError::Runtime("plugin is not enabled".to_string()))?;
+        let hosts = plugin
+            .manifest
+            .main
+            .as_ref()
+            .map(|main| main.image_hosts.clone())
+            .unwrap_or_default();
+        let auth_allowed = plugin.manifest.has_permission(PERMISSION_AUTH);
+        // Authentication may rotate without changing authRef; never reuse a previous fetch.
+        if auth_allowed {
+            options.cache = false;
+        }
+        let url = url::Url::parse(&options.url)
+            .map_err(|error| PluginError::InvalidOutput(format!("invalid image URL: {error}")))?;
+        if !url.host_str().is_some_and(|host| {
+            let host = host.trim_matches(['[', ']']);
+            hosts.iter().any(|allowed| allowed == host)
+        }) {
+            return Err(PluginError::Runtime(
+                "image host is not declared in main.imageHosts".to_string(),
+            ));
+        }
+        if let Some(src) = self.host.images.cached(identity, session, &options)? {
+            return Ok(src);
+        }
+        let _permit = acquire_image_load(&IMAGE_LOADS).await?;
+        self.check_view_session(identity, session)?;
+        if let Some(src) = self.host.images.cached(identity, session, &options)? {
+            return Ok(src);
+        }
+        let request = super::super::runtime::BridgeHttpRequest {
+            url: options.url.clone(),
+            headers: options.headers.clone(),
+            auth_ref: options.auth_ref.clone(),
+            auth_allowed,
+            private_network_allowed: plugin.dev,
+            ..Default::default()
+        };
+        let bytes = self.bridge.image_request(identity, request, hosts).await?;
+        let bytes = super::super::images::thumbnail(bytes, &options).await?;
+        self.check_view_session(identity, session)?;
+        self.host.images.insert(identity, session, &options, bytes)
+    }
+
+    /// `ctx.close()`：原因固定为 `requested`（对应 `fluxdown_protocol::VIEW_CLOSE_REASON_REQUESTED`；
+    /// 引擎不依赖 protocol crate，故在此保持同值）。
+    fn host_view_close(self: &Arc<Self>, identity: &str, session: &str) -> Result<(), PluginError> {
+        self.check_view_session(identity, session)?;
+        self.close_view_with_reason(session, "requested");
+        Ok(())
+    }
+
+    /// `ctx.navigate(target)`：把 target 解析为路由 id（对应 `fluxdown_protocol::plugin_route_id`
+    /// 与 `NAV_BUILTIN_TARGETS`）并发出 `PluginViewNavigate`。
+    async fn host_view_navigate(
+        &self,
+        identity: &str,
+        session: &str,
+        target: serde_json::Value,
+    ) -> Result<(), PluginError> {
+        self.check_view_session(identity, session)?;
+        let route = match &target {
+            serde_json::Value::String(s)
+                if ["downloads", "rss", "webhooks"].contains(&s.as_str()) =>
+            {
+                s.clone()
+            }
+            serde_json::Value::Object(map) if map.len() == 1 => {
+                let Some(view) = map.get("view").and_then(serde_json::Value::as_str) else {
+                    return Err(PluginError::Runtime(format!(
+                        "navigate: unknown target {target}"
+                    )));
+                };
+                let snapshot = self.plugins.read().await.clone();
+                let is_activity = snapshot
+                    .iter()
+                    .find(|p| p.manifest.identity == identity)
+                    .and_then(|p| p.manifest.contributes.as_ref())
+                    .is_some_and(|c| {
+                        c.views
+                            .iter()
+                            .any(|v| v.id == view && v.location == ViewLocation::Activity)
+                    });
+                if !is_activity {
+                    return Err(PluginError::Runtime(format!(
+                        "navigate: view '{view}' is not an activity view of this plugin"
+                    )));
+                }
+                format!("plugin:{identity}:{view}")
+            }
+            _ => {
+                return Err(PluginError::Runtime(format!(
+                    "navigate: unknown target {target}"
+                )));
+            }
+        };
+        self.sink.emit(EngineEvent::PluginViewNavigate {
+            session: session.to_string(),
+            target: route,
+        });
+        Ok(())
+    }
+
     /// `flux.settings.update`：与 UI 路径同一校验，额外写审计。
-    async fn host_settings_update(
+    pub(super) async fn host_settings_update(
         &self,
         identity: &str,
         entries: Vec<(String, String)>,
@@ -1143,6 +1402,7 @@ impl PluginManager {
                 .collect()
         };
         for (session, identity) in expired {
+            self.host.images.close_session(&session);
             self.sink.emit(EngineEvent::PluginViewClosed {
                 session: session.clone(),
                 reason: "expired".to_string(),
@@ -1191,6 +1451,37 @@ impl PluginManager {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn image_load_waits_for_capacity_instead_of_rejecting() {
+        let semaphore = tokio::sync::Semaphore::new(1);
+        let held = semaphore.acquire().await.unwrap();
+        let waiting = acquire_image_load(&semaphore);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(held);
+        let permit = waiting.await.unwrap();
+        assert_eq!(semaphore.available_permits(), 0);
+        drop(permit);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn image_load_queue_timeout_reports_overload_without_leaking_capacity() {
+        let semaphore = tokio::sync::Semaphore::new(1);
+        let held = semaphore.acquire().await.unwrap();
+        assert!(matches!(
+            acquire_image_load(&semaphore).await,
+            Err(PluginError::Overloaded)
+        ));
+        drop(held);
+        assert_eq!(semaphore.available_permits(), 1);
+        assert!(acquire_image_load(&semaphore).await.is_ok());
+    }
 
     #[test]
     fn create_limiter_allows_twenty_per_window() {

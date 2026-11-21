@@ -6,8 +6,10 @@ use fluxdown_ui_account::AccountRailButton;
 use fluxdown_ui_components::FluxIcon;
 use fluxdown_ui_downloads::{DownloadHostActions, DownloadView};
 use fluxdown_ui_rss::RssView;
-use fluxdown_ui_settings::{PushHost, PushView};
-use fluxdown_ui_shell::{ShellAction, ShellChrome, ShellRoute, ShellView, main_window_options};
+use fluxdown_ui_settings::{PushHost, PushView, VersionButton, VersionHost};
+use fluxdown_ui_shell::{
+    ChromeEditingChanged, ShellAction, ShellChrome, ShellRoute, ShellView, main_window_options,
+};
 use gpui::{App, AppContext as _, Window, WindowHandle, px, size};
 use gpui_component::{Icon, Root};
 
@@ -141,16 +143,43 @@ fn open_with(cx: &mut App, focus: bool) -> Option<WindowHandle<Root>> {
                 ),
             }
         }
+        let version_button = cx.new(|cx| {
+            VersionButton::new(
+                translator.clone(),
+                settings_store.clone(),
+                VersionHost {
+                    open_update_prompt: Rc::new(crate::windows::update_prompt::open),
+                    check_update: Rc::new(crate::update_notices::check_now),
+                    open_logs_folder: Rc::new(crate::menus::open_logs_folder),
+                    open_about: Rc::new(crate::menus::open_about),
+                },
+                cx,
+            )
+        });
         let chrome = ShellChrome {
-            widgets: crate::chrome_layout::widgets(&downloads, cx),
+            widgets: crate::chrome_layout::widgets(&downloads, &version_button, cx),
             catalog: crate::chrome_layout::catalog(),
             on_layout_change: Rc::new(|value, cx| {
                 Desktop::set_pref(cx, crate::chrome_layout::CHROME_LAYOUT_PREF, value);
             }),
         };
         let shell = cx.new(|cx| ShellView::new(translator.clone(), routes, actions, chrome, cx));
+        // 页面插槽不进 chrome 布局：编辑模式下由插槽自己提供外观切换。
+        let title_bar_for_editing = downloads_title_bar.downgrade();
+        cx.subscribe(&shell, move |_, event: &ChromeEditingChanged, cx| {
+            let editing = event.0;
+            let Ok(()) = title_bar_for_editing.update(cx, |title_bar, cx| {
+                title_bar.set_editing(editing, cx);
+            }) else {
+                // 下载页插槽已随窗口释放，无需同步编辑态。
+                return;
+            };
+        })
+        .detach();
         shell.update(cx, |shell, cx| {
             shell.observe_widget_source(&downloads, cx);
+            // 版本条目被隐藏时，更新状态变化决定是否临时显示它。
+            shell.observe_widget_source(&version_button, cx);
             let preferences = Desktop::preferences(cx).clone();
             activity::apply_visibility(shell, &preferences, cx);
             crate::chrome_layout::apply(shell, &preferences, cx);
@@ -162,7 +191,7 @@ fn open_with(cx: &mut App, focus: bool) -> Option<WindowHandle<Root>> {
         let shutdown_status = crate::power::status(cx);
         let shutdown_port = crate::power::shutdown_port(cx);
         downloads.update(cx, |downloads, _| {
-            downloads.set_host_actions(DownloadHostActions {
+            let host = DownloadHostActions {
                 open_new_download: Some(Rc::new(|context, _, cx| {
                     crate::windows::new_download::open(cx, context);
                 })),
@@ -196,7 +225,8 @@ fn open_with(cx: &mut App, focus: bool) -> Option<WindowHandle<Root>> {
                 on_user_started: Some(Rc::new(crate::progress_windows::user_started)),
                 run_plugin_command: Some(crate::plugin_contributions::command_runner()),
                 plugin_tab_view: Some(crate::plugin_contributions::tab_view_factory()),
-            });
+            };
+            downloads.set_host_actions(host);
         });
 
         attach(&session, &downloads, cx);
@@ -265,7 +295,9 @@ pub fn should_close(window: &mut Window, cx: &mut App) -> bool {
     if Desktop::active_task_count(cx) == 0 {
         crate::lifecycle::quit_everything(cx);
     } else {
-        confirm_active_tasks(window, cx, |_, cx| crate::lifecycle::quit_everything(cx));
+        confirm_active_tasks(window, cx, |_window, cx| {
+            crate::lifecycle::quit_everything(cx);
+        });
     }
     false
 }

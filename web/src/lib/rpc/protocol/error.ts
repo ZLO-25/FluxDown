@@ -60,6 +60,8 @@ export type ErrorReason =
   | 'taskStateConflict'
   | 'taskDeviceMismatch'
   | 'saveDirUnavailable'
+  | 'taskFilesInUse'
+  | 'taskFilesNotDeleted'
   | 'pairingCodeInvalid'
   | 'pairingSessionExpired'
   | 'pairingTimeout'
@@ -97,6 +99,7 @@ export type ErrorReason =
   | 'referralAlreadyUsed'
   | 'referralPlanExcluded'
   | 'referralCodeTaken'
+  | 'subscriptionConflict'
   | 'unknown';
 
 /** `error.data`：应用错误的机器可读详情。 */

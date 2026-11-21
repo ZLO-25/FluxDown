@@ -1,15 +1,15 @@
 //! 常驻插件宿主的 RPC：可移植视图会话（open / event / close / snapshot / keepalive）、
 //! 命令与 invoke。作为 `service` 的子模块编译，复用其私有辅助函数。
 
+use super::{DaemonService, internal_error, invalid_argument, parse_params, to_value};
 use fluxdown_engine::plugin::PluginError;
 use fluxdown_protocol::{
-    PluginCommandParams, PluginInvokeParams, PluginPageInvokeParams, PluginPageInvokeResultDto,
-    PluginViewEventParams, PluginViewKeepaliveParams, PluginViewOpenParams, PluginViewOpenedDto,
-    PluginViewSessionParams, PluginViewSnapshotDto, RpcErrorObject, method, normalize_view,
+    PluginArchiveRulesParams, PluginCommandParams, PluginInvokeParams, PluginPageInvokeParams,
+    PluginPageInvokeResultDto, PluginViewEventParams, PluginViewKeepaliveParams,
+    PluginViewOpenParams, PluginViewOpenedDto, PluginViewSessionParams, PluginViewSnapshotDto,
+    RpcErrorObject, method, normalize_view,
 };
 use serde_json::{Map, Value, json};
-
-use super::{DaemonService, internal_error, invalid_argument, parse_params, to_value};
 
 /// 宿主可预期的失败（插件不存在 / 未启用 / 视图未声明 / 脚本抛错）按参数错误返回；
 /// 超时、内存超限、并发过载等运行时故障按内部错误返回。
@@ -34,6 +34,17 @@ impl DaemonService {
     ) -> Result<Value, RpcErrorObject> {
         let manager = self.plugin_manager()?;
         match method_name {
+            method::DAEMON_PLUGIN_ARCHIVE_RULES => {
+                let params = parse_params::<PluginArchiveRulesParams>(params)?;
+                let value = manager
+                    .archive_rules_status(&params.identity, params.refresh)
+                    .await
+                    .map_err(|error| host_error("identity", &error))?;
+                let status =
+                    serde_json::from_value::<fluxdown_protocol::PluginArchiveRulesDto>(value)
+                        .map_err(|error| internal_error(error.to_string()))?;
+                to_value(status)
+            }
             method::DAEMON_PLUGIN_VIEW_OPEN => {
                 let params = parse_params::<PluginViewOpenParams>(params)?;
                 let (session, raw) = manager
@@ -55,6 +66,11 @@ impl DaemonService {
                     }
                 };
                 self.events.plugin_views().open(&session, tree.clone());
+                // 插件可能在 init 里就 `ctx.close()` 了：引擎已结束会话、关闭事件先于登记发出，
+                // 这里补清存储，避免留下永不关闭的条目（客户端缓存了关闭动作，登记后自行收尾）。
+                if !manager.has_view_session(&session) {
+                    self.events.plugin_views().close(&session);
+                }
                 to_value(PluginViewOpenedDto {
                     session,
                     seq: 0,
@@ -94,6 +110,13 @@ impl DaemonService {
                     .snapshot(&params.session)
                     .ok_or_else(unknown_session)?;
                 to_value(PluginViewSnapshotDto { seq, tree })
+            }
+            method::DAEMON_PLUGIN_VIEW_SET_LOCALE => {
+                let params = parse_params::<fluxdown_protocol::PluginViewLocaleParams>(params)?;
+                manager
+                    .set_view_locale(&params.session, params.locale)
+                    .map_err(|_| unknown_session())?;
+                Ok(json!({}))
             }
             method::DAEMON_PLUGIN_VIEW_KEEPALIVE => {
                 let params = parse_params::<PluginViewKeepaliveParams>(params)?;
@@ -189,6 +212,17 @@ flux.rpc.handle("sum", async (a) => a.x + a.y);
         ) -> Result<BridgeHttpResponse, PluginError> {
             Err(PluginError::Runtime("no network in test".to_owned()))
         }
+        async fn image_request(
+            &self,
+            _plugin_id: &str,
+            _req: BridgeHttpRequest,
+            _hosts: Vec<String>,
+        ) -> Result<Vec<u8>, PluginError> {
+            use base64::Engine as _;
+            Ok(base64::engine::general_purpose::STANDARD.decode(
+                "iVBORw0KGgoAAAANSUhEUgAAACAAAAAQCAIAAAD4YuoOAAAAHUlEQVR4nGMQaThAU8QwasGoBaMWjFowasFQsAAAZsSoH59Hy/YAAAAASUVORK5CYII="
+            ).unwrap())
+        }
         async fn storage_get(&self, _plugin_id: &str, _key: &str) -> Option<String> {
             None
         }
@@ -205,8 +239,8 @@ flux.rpc.handle("sum", async (a) => a.x + a.y);
     }
 
     struct Fixture {
-        service: DaemonService,
-        frames: broadcast::Receiver<fluxdown_protocol::EventFrame>,
+        service: Arc<DaemonService>,
+        frames: broadcast::Receiver<std::sync::Arc<fluxdown_protocol::EventFrame>>,
         base: std::path::PathBuf,
     }
 
@@ -255,7 +289,13 @@ flux.rpc.handle("sum", async (a) => a.x + a.y);
         let frames = events.subscribe();
         let manager = Arc::new(PluginManager::new(
             Arc::new(QuickJsScriptRuntime::new(1).unwrap()),
-            Arc::new(NullBridge),
+            Arc::new(fluxdown_engine::plugin::audit::AuditingBridge::new(
+                Arc::new(NullBridge),
+                fluxdown_engine::plugin::audit::AuditLog::new(
+                    db.clone(),
+                    &tokio::runtime::Handle::current(),
+                ),
+            )),
             db.clone(),
             root,
             "1.0.0".to_owned(),
@@ -281,7 +321,7 @@ flux.rpc.handle("sum", async (a) => a.x + a.y);
             Some(manager),
         );
         Fixture {
-            service,
+            service: Arc::new(service),
             frames,
             base,
         }
@@ -304,7 +344,7 @@ flux.rpc.handle("sum", async (a) => a.x + a.y);
                 .await
                 .expect("a plugin view frame arrives")
                 .expect("event channel open");
-            if let ServiceEvent::Daemon(DaemonEvent::PluginViewFrame(frame)) = frame.event {
+            if let ServiceEvent::Daemon(DaemonEvent::PluginViewFrame(frame)) = frame.event.clone() {
                 return frame;
             }
         }
@@ -331,6 +371,226 @@ flux.rpc.handle("sum", async (a) => a.x + a.y);
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_locale_changes_preserve_view_state_and_other_sessions() {
+        let mut f = fixture_with(
+            json!({
+                "identity": ID, "name": "Locales", "version": "1.0.0",
+                "main": { "entry": "main.js" },
+                "settings": [{
+                    "key": "quality", "title": "清晰度", "type": "string",
+                    "localizations": {"en": {"title": "Quality"}}
+                }],
+                "contributes": {
+                    "views": [{"id": "counter", "title": "Counter", "location": "activity"}]
+                }
+            }),
+            r#"
+flux.ui.view("counter", {
+  init: () => ({ n: 0 }),
+  render: (state, ctx) => flux.ui.h("stack", {},
+    flux.ui.h("text", { text: `${ctx.locale}:${state.n}` })),
+  event: (state) => { state.n += 1; }
+});
+"#,
+            &[],
+        )
+        .await;
+        let listed = call(&f, "daemon.plugin.list", json!({})).await.unwrap();
+        assert_eq!(
+            listed[0]["settings"][0]["localizations"]["en"]["title"],
+            "Quality"
+        );
+        let first = call(
+            &f,
+            "daemon.plugin.view.open",
+            json!({"identity": ID, "view": "counter", "locale": "en"}),
+        )
+        .await
+        .unwrap();
+        let second = call(
+            &f,
+            "daemon.plugin.view.open",
+            json!({"identity": ID, "view": "counter", "locale": "zh"}),
+        )
+        .await
+        .unwrap();
+        let session = first["session"].as_str().unwrap();
+        assert_eq!(first["tree"]["c"][0]["p"]["text"], "en:0");
+        assert_eq!(second["tree"]["c"][0]["p"]["text"], "zh:0");
+        press(&f, session, "press").await;
+        let changed = next_frame(&mut f).await;
+        assert_eq!(changed.session, session);
+        call(
+            &f,
+            "daemon.plugin.view.setLocale",
+            json!({"session": session, "locale": "zh-TW"}),
+        )
+        .await
+        .unwrap();
+        let localized = next_frame(&mut f).await;
+        assert_eq!(localized.session, session);
+        let snapshot = call(
+            &f,
+            "daemon.plugin.view.snapshot",
+            json!({"session": session}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot["tree"]["c"][0]["p"]["text"], "zh-TW:1");
+        let other = call(
+            &f,
+            "daemon.plugin.view.snapshot",
+            json!({"session": second["session"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(other["tree"]["c"][0]["p"]["text"], "zh:0");
+        call(
+            &f,
+            "daemon.plugin.view.setLocale",
+            json!({"session": session, "locale": "en"}),
+        )
+        .await
+        .unwrap();
+        let restored = next_frame(&mut f).await;
+        assert_eq!(restored.session, session);
+        let snapshot = call(
+            &f,
+            "daemon.plugin.view.snapshot",
+            json!({"session": session}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot["tree"]["c"][0]["p"]["text"], "en:1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn image_resources_cross_js_and_authenticated_http_and_expire_on_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let f = fixture_with(
+            json!({
+                "identity": ID, "name": "Images", "version": "1.0.0",
+                "permissions": ["auth"],
+                "main": { "entry": "main.js", "imageHosts": ["covers.example"] },
+                "contributes": {
+                    "views": [{ "id": "counter", "title": "Cover", "location": "activity" }]
+                },
+            }),
+            r#"
+flux.ui.view("counter", {
+  init: async (ctx) => {
+    const opts = { url: "https://covers.example/a.png", maxWidth: 16, maxHeight: 16 };
+    const src = await ctx.images.load(opts);
+    for (let i = 0; i < 200; i++) {
+      if (await ctx.images.load(opts) !== src) throw new Error("identical images must share a reference");
+    }
+    const batch = await Promise.all(Array.from({ length: 20 }, () => ctx.images.load(opts)));
+    if (batch.some(value => value !== src)) throw new Error("concurrent images must share a reference");
+    return { src };
+  },
+  render: (st) => st.src
+    ? flux.ui.h("image", { src: st.src, alt: "cover" })
+    : flux.ui.h("text", { text: "released" }),
+  event: async (st, ev, ctx) => {
+    if (ev.type === "release") {
+      const src = st.src;
+      st.src = null;
+      await ctx.images.release(src);
+      await flux.images.release({ session: ctx.session, src });
+    }
+  },
+});
+"#,
+            &[],
+        )
+        .await;
+        let request = json!({ "identity": ID, "view": "counter" });
+        assert!(
+            call(&f, "daemon.plugin.view.open", request.clone())
+                .await
+                .is_err()
+        );
+        f.service
+            .plugin_manager()
+            .unwrap()
+            .grant_consent(ID, &["auth".to_owned()], &["covers.example".to_owned()])
+            .await
+            .unwrap();
+        let opened = call(&f, "daemon.plugin.view.open", request.clone())
+            .await
+            .unwrap();
+        let session = opened["session"].as_str().unwrap();
+        let src = opened["tree"]["p"]["src"].as_str().unwrap();
+        let id = src.strip_prefix("flux-image:").unwrap();
+        let bytes = f.service.plugin_image(session, id).unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let width = u32::from_be_bytes(bytes.get(16..20).unwrap().try_into().unwrap());
+        let height = u32::from_be_bytes(bytes.get(20..24).unwrap().try_into().unwrap());
+        assert_eq!((width, height), (16, 8));
+        let other = call(&f, "daemon.plugin.view.open", request).await.unwrap();
+        assert!(
+            f.service
+                .plugin_image(other["session"].as_str().unwrap(), id)
+                .is_none()
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let server = tokio::spawn(crate::http::serve(
+            listener,
+            f.service.clone(),
+            "image-test-token".to_owned(),
+            cancel.clone(),
+        ));
+        async fn get(address: std::net::SocketAddr, path: &str, token: &str) -> Vec<u8> {
+            let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+            socket.write_all(format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            ).as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            response
+        }
+        let path = format!("/plugin-images/{session}/{id}");
+        let response = get(address, &path, "wrong").await;
+        assert!(response.starts_with(b"HTTP/1.1 401"));
+        let response = get(address, &path, "image-test-token").await;
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        let header_end = response.windows(4).position(|b| b == b"\r\n\r\n").unwrap() + 4;
+        let headers = String::from_utf8_lossy(&response[..header_end]);
+        assert!(headers.contains("content-type: image/png"));
+        assert!(headers.contains("cache-control: no-store"));
+        assert!(headers.contains("x-content-type-options: nosniff"));
+        assert_eq!(&response[header_end..], bytes.as_ref());
+        press(&f, session, "release").await;
+        let response = get(address, &path, "image-test-token").await;
+        assert!(response.starts_with(b"HTTP/1.1 404"));
+        let other_session = other["session"].as_str().unwrap();
+        let other_id = other["tree"]["p"]["src"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("flux-image:")
+            .unwrap();
+        assert!(f.service.plugin_image(other_session, other_id).is_some());
+        call(
+            &f,
+            "daemon.plugin.view.close",
+            json!({ "session": session }),
+        )
+        .await
+        .unwrap();
+        let response = get(address, &path, "image-test-token").await;
+        assert!(response.starts_with(b"HTTP/1.1 404"));
+        cancel.cancel();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -617,6 +877,81 @@ flux.rpc.handle("optsErrors", async () => optsErrors);
             .await
             .unwrap(),
             json!(["TypeError", "TypeError", "TypeError", "TypeError"])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actions_from_init_reach_clients_and_closed_session_is_not_stored() {
+        let mut f = fixture_with(
+            json!({
+                "identity": ID, "name": "Views", "version": "1.0.0",
+                "main": { "entry": "main.js" },
+                "contributes": {
+                    "views": [{ "id": "gate", "title": "Gate", "location": "activity" }],
+                },
+            }),
+            r#"
+flux.ui.view("gate", {
+  init: async (ctx) => { await ctx.navigate("downloads"); ctx.close(); return {}; },
+  render: () => flux.ui.h("text", { text: "bye" }),
+});
+"#,
+            &[],
+        )
+        .await;
+        let opened = call(
+            &f,
+            "daemon.plugin.view.open",
+            json!({ "identity": ID, "view": "gate" }),
+        )
+        .await
+        .unwrap();
+        let session = opened["session"].as_str().unwrap().to_owned();
+        // 存储没有留下已在 init 里关闭的会话。
+        let error = call(
+            &f,
+            "daemon.plugin.view.snapshot",
+            json!({ "session": session }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.data.as_ref().map(|data| data.code),
+            Some(ApplicationErrorCode::InvalidArgument)
+        );
+        // 动作照样广播（跳转在前、关闭在后），客户端缓存后在登记会话时执行。
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            let frame = tokio::time::timeout(Duration::from_secs(10), f.frames.recv())
+                .await
+                .expect("plugin view events arrive")
+                .expect("event channel open");
+            match frame.event.clone() {
+                ServiceEvent::Daemon(DaemonEvent::PluginViewFrame(frame))
+                    if frame.session == session =>
+                {
+                    assert_eq!(frame.seq, 0);
+                    seen.push(format!("{:?}", frame.effects));
+                }
+                ServiceEvent::Daemon(DaemonEvent::PluginViewClosed { session: s, reason })
+                    if s == session =>
+                {
+                    seen.push(reason);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                format!(
+                    "{:?}",
+                    vec![fluxdown_protocol::ViewEffect::Navigate {
+                        target: "downloads".to_owned()
+                    }]
+                ),
+                "requested".to_owned(),
+            ]
         );
     }
 }

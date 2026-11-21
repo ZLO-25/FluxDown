@@ -51,26 +51,21 @@ enum NetworkPortInput {
 // MARK: - 连通性测试请求
 
 enum NetworkProxyTest {
-    /// 各模式测试发送的内容（镜像 GPUI `proxy.rs::test_control` 与 Web `TestConnectionRow`）：
-    /// - 手动：当前表单里的 `proxy_*` 五个键；
-    /// - 系统：已检测到的系统代理（类型 / 地址 / 端口，无凭据）；未检测到则无可测；
-    /// - 不使用 / 自动：没有确定的代理端点可测，返回 nil（不显示按钮）。
-    static func request(mode: NetworkProxyMode, form: SettingsConfigForm, system: SystemProxyDto?) -> ProxyTestRequest? {
-        switch mode {
-        case .manual:
-            return ProxyTestRequest(
-                proxyType: form.string("proxy_type", default: "http"),
-                host: form.string("proxy_host"),
-                port: form.string("proxy_port"),
-                username: form.string("proxy_username"),
-                password: form.string("proxy_password")
-            )
-        case .system:
-            guard let system, system.detected else { return nil }
-            return ProxyTestRequest(proxyType: system.proxyType, host: system.host, port: String(system.port))
-        case .none, .auto:
-            return nil
-        }
+    /// 手动分组的测试：任何模式下都发送表单里的 `proxy_*` 五个键。
+    static func manual(form: SettingsConfigForm) -> ProxyTestRequest {
+        ProxyTestRequest(
+            proxyType: form.string("proxy_type", default: "http"),
+            host: form.string("proxy_host"),
+            port: form.string("proxy_port"),
+            username: form.string("proxy_username"),
+            password: form.string("proxy_password")
+        )
+    }
+
+    /// 系统分组的测试：已检测到的系统代理（类型 / 地址 / 端口，无凭据）；未检测到返回 nil。
+    static func system(dto: SystemProxyDto?) -> ProxyTestRequest? {
+        guard let dto, dto.detected else { return nil }
+        return ProxyTestRequest(proxyType: dto.proxyType, host: dto.host, port: String(dto.port))
     }
 
     /// 失败详情：代理端点不接受 TLS 握手（把 HTTP 代理选成了 HTTPS）给出可操作的提示；否则取主机错误文案。
@@ -86,18 +81,20 @@ enum NetworkProxyTest {
 /// 本页的每一行（页面渲染与设置搜索共用同一份可见性判定）。
 nonisolated enum NetworkRow: String, CaseIterable, Identifiable {
     case mode, type, host, port, username, password, noList, test
+    case rules, rulesAdd, rulesTest
     case siteAuth, siteAuthAdd, siteAuthClear
 
     var id: String { "network.\(rawValue)" }
 
     /// 搜索面包屑里的分组名文案键。
     nonisolated enum Group {
-        case mode, manual, siteAuth
+        case mode, manual, rules, siteAuth
 
         var titleKey: String {
             switch self {
             case .mode: "proxySettings"
             case .manual: "proxyModeManual"
+            case .rules: "proxyRulesTitle"
             case .siteAuth: "settingsSiteAuthTitle"
             }
         }
@@ -107,6 +104,7 @@ nonisolated enum NetworkRow: String, CaseIterable, Identifiable {
         switch self {
         case .mode: .mode
         case .type, .host, .port, .username, .password, .noList, .test: .manual
+        case .rules, .rulesAdd, .rulesTest: .rules
         case .siteAuth, .siteAuthAdd, .siteAuthClear: .siteAuth
         }
     }
@@ -121,6 +119,9 @@ nonisolated enum NetworkRow: String, CaseIterable, Identifiable {
         case .password: "proxyPassword"
         case .noList: "proxyNoList"
         case .test: "proxyTestConnection"
+        case .rules: "proxyRulesTitle"
+        case .rulesAdd: "proxyRulesAdd"
+        case .rulesTest: "proxyRouteTest"
         case .siteAuth: "settingsSiteAuthTitle"
         case .siteAuthAdd: "settingsSiteAuthAdd"
         case .siteAuthClear: "settingsSiteAuthClearAll"
@@ -131,6 +132,8 @@ nonisolated enum NetworkRow: String, CaseIterable, Identifiable {
         switch self {
         case .mode: "proxySettingsDesc"
         case .noList: "proxyNoListDesc"
+        case .rules: "proxyRulesDesc"
+        case .rulesTest: "proxyRouteTestDesc"
         case .siteAuth: "settingsSiteAuthDesc"
         default: nil
         }
@@ -146,14 +149,21 @@ nonisolated enum NetworkRow: String, CaseIterable, Identifiable {
         case .username: "proxy_username"
         case .password: "proxy_password"
         case .noList: "proxy_no_list"
-        case .test, .siteAuth, .siteAuthAdd, .siteAuthClear: nil
+        case .rules: "proxy_rules"
+        case .test, .rulesAdd, .rulesTest, .siteAuth, .siteAuthAdd, .siteAuthClear: nil
         }
     }
 
     var symbol: String {
+        switch self {
+        case .rules: return "arrow.triangle.branch"
+        case .rulesAdd: return "plus" // = FluxSymbol.add；纯逻辑文件不依赖 FluxUI
+        case .rulesTest: return "magnifyingglass"
+        default: break
+        }
         switch group {
-        case .mode, .manual: "globe"
-        case .siteAuth: "key.fill"
+        case .mode, .manual, .rules: return "globe"
+        case .siteAuth: return "key.fill"
         }
     }
 
@@ -162,18 +172,18 @@ nonisolated enum NetworkRow: String, CaseIterable, Identifiable {
         configKey.map { SettingsItem(id: id, key: $0, titleKey: titleKey, detailKey: detailKey) }
     }
 
-    /// 手动配置分组需要主机配置已加载且模式为手动；代理模式行只需配置已加载；
+    /// 手动配置分组只需主机配置已加载（各模式都会用到这些字段，切模式不隐藏）；
+    /// 代理模式行与站点规则同样只需配置已加载；
     /// 站点凭据走 `daemon.siteAuth.*`（`daemon.*` 恒可用），与配置是否已加载无关。
-    func isVisible(mode: NetworkProxyMode, isLoaded: Bool) -> Bool {
+    func isVisible(isLoaded: Bool) -> Bool {
         switch group {
-        case .mode: isLoaded
-        case .manual: isLoaded && mode == .manual
+        case .mode, .manual, .rules: isLoaded
         case .siteAuth: true
         }
     }
 
-    static func visible(mode: NetworkProxyMode, isLoaded: Bool) -> [NetworkRow] {
-        allCases.filter { $0.isVisible(mode: mode, isLoaded: isLoaded) }
+    static func visible(isLoaded: Bool) -> [NetworkRow] {
+        allCases.filter { $0.isVisible(isLoaded: isLoaded) }
     }
 }
 

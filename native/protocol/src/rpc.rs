@@ -23,10 +23,18 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`crate::judge_frame`] 判定），v16 增加外部恢复任务通知（`AgentEvent::CaptureTasksResumed`），
 /// v17 取消全量任务单帧：快照与替换事件只带任务总数（`DaemonSnapshot.taskTotal` /
 /// `queueTotal`），任务表经 `system.taskPage` 分页载入（`DaemonEvent::TablesReloading`），
-/// `TaskDto` 默认值字段不再上线（反序列化须容忍缺省）。
-pub const PROTOCOL_VERSION: u32 = 17;
-/// 旧客户端不能解析新增事件，必须在握手时拒绝混用而非运行中断连。
-pub const MIN_PROTOCOL_VERSION: u32 = 17;
+/// `TaskDto` 默认值字段不再上线（反序列化须容忍缺省），v18–v24 曾承载的临时文件分享协议已整体移除，
+/// v25 增加周期会员卡：`CloudPlan.billingPeriodDays`、`CloudProfile` / `AgentSessionDto.activeSubscription`、
+/// `ErrorReason::SubscriptionConflict`，v26 增加 BT 防吸血：`daemon.bt.guard.*` 方法、
+/// `DaemonEvent::{BtGuardChanged, BtGuardCloudRefreshWanted, BtGuardEvidenceReady}` 与 `BtPeerDto` 嫌疑字段，
+/// v27 增加定时睡眠与无任务定时：`PowerArmParams.action` / `PowerStatusDto.action`
+/// （纯增量，旧客户端忽略未知字段与方法），v28 增加 eD2K 实况与网络检测：
+/// `daemon.task.ed2kStatus`、`daemon.ed2k.idCheck`、`daemon.ed2k.kadBootstrap`、
+/// `daemon.ed2k.nodesSubscription.refresh` 与只读配置键 `ed2k_nodes_dat_count` /
+/// `ed2k_nodes_dat_updated_at`（纯增量）。
+pub const PROTOCOL_VERSION: u32 = 28;
+/// 旧客户端不能解析 v19 起的协议语义，必须在握手时拒绝混用。
+pub const MIN_PROTOCOL_VERSION: u32 = 19;
 /// 服务收到 `system.shutdown` 而退出时的 WebSocket 关闭原因：客户端据此停止重连与重拉。
 pub const CLOSE_REASON_SERVICE_QUIT: &str = "service-quit";
 /// headless 服务为应用更新而重启时的 WebSocket 关闭原因：浏览器客户端保持重连，
@@ -314,16 +322,6 @@ impl RpcResponse {
             jsonrpc: JSONRPC_VERSION.to_owned(),
             id: None,
             error: RpcErrorObject::parse_error(message),
-        })
-    }
-
-    /// 创建无法恢复请求 ID 的无效请求响应。
-    #[must_use]
-    pub fn invalid_request_failure(message: impl Into<String>) -> Self {
-        Self::Failure(RpcFailureResponse {
-            jsonrpc: JSONRPC_VERSION.to_owned(),
-            id: None,
-            error: RpcErrorObject::invalid_request(message),
         })
     }
 }

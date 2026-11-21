@@ -1,4 +1,4 @@
-//! 完成后自动关机的界面侧：状态机与执行归 agent（托盘驻留、界面全部关闭后仍要按时关机）。
+//! 定时关机 / 睡眠的界面侧：状态机与执行归 agent（托盘驻留、界面全部关闭后仍要按时执行）。
 //!
 //! 这里只做三件事：把 agent 快照中的 `power` 投影成状态栏读取的 [`SharedShutdownStatus`]；
 //! 把状态栏请求转成 `agent.power.arm/disarm`；倒计时期间在主窗口挂常驻通知（无主窗口时由
@@ -7,7 +7,9 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use fluxdown_protocol::{AgentEvent, PowerArmParams, PowerStatusDto, ServiceEvent, method};
+use fluxdown_protocol::{
+    AgentEvent, PowerAction, PowerArmParams, PowerStatusDto, ServiceEvent, method,
+};
 use fluxdown_ui_downloads::{SharedShutdownStatus, ShutdownPort, ShutdownRequest, ShutdownStatus};
 use gpui::{App, Global};
 use gpui_component::WindowExt as _;
@@ -37,16 +39,33 @@ pub fn install(cx: &mut App) {
             ShutdownRequest::Disarm => {
                 client.call::<Value, Value>(method::AGENT_POWER_DISARM, None)
             }
-            ShutdownRequest::ArmAfter(delay) => client.call::<PowerArmParams, Value>(
+            ShutdownRequest::Arm { delay, action } => client.call::<PowerArmParams, Value>(
                 method::AGENT_POWER_ARM,
                 Some(PowerArmParams {
                     delay_secs: delay.as_secs(),
+                    action,
+                    low_speed: None,
                 }),
             ),
+            ShutdownRequest::ArmLowSpeed { condition, action } => client
+                .call::<PowerArmParams, Value>(
+                    method::AGENT_POWER_ARM,
+                    Some(PowerArmParams {
+                        delay_secs: fluxdown_protocol::POWER_LOW_SPEED_WARNING_SECS,
+                        action,
+                        low_speed: Some(condition),
+                    }),
+                ),
         };
         cx.spawn(async move |cx| {
-            if let Err(error) = call.await {
-                log::warn!("completion shutdown action failed: {:?}", error.code);
+            let refused = match call.await {
+                Ok(value) => value.get("armed").and_then(Value::as_bool) == Some(false),
+                Err(error) => {
+                    log::warn!("scheduled power action request failed: {:?}", error.code);
+                    true
+                }
+            };
+            if refused {
                 cx.update(|cx| {
                     let Some(handle) = WindowRegistry::handle(cx, &WindowKey::Main) else {
                         return;
@@ -59,7 +78,7 @@ pub fn install(cx: &mut App) {
                     if let Err(error) = handle.update(cx, |_, window, cx| {
                         window.push_notification(Notification::error(message), cx);
                     }) {
-                        log::debug!("shutdown failure notification window released: {error:#}");
+                        log::debug!("power failure notification window released: {error:#}");
                     }
                 });
             }
@@ -70,7 +89,6 @@ pub fn install(cx: &mut App) {
         status: status.clone(),
         port,
     });
-
     let session = Desktop::global(cx).session.clone();
     if let Some(power) = session.read(cx).agent_snapshot().map(|body| body.power) {
         apply(&status, power, cx);
@@ -107,8 +125,9 @@ pub fn shutdown_port(cx: &App) -> Option<ShutdownPort> {
 }
 
 fn apply(status: &SharedShutdownStatus, power: PowerStatusDto, cx: &mut App) {
+    let previous = status.get();
     let next = shutdown_status(power);
-    if status.get() == next {
+    if previous == next {
         return;
     }
     status.set(next);
@@ -119,8 +138,12 @@ fn apply(status: &SharedShutdownStatus, power: PowerStatusDto, cx: &mut App) {
     {
         downloads.update(cx, |_, cx| cx.notify());
     }
+    // 倒计时每秒推送一次剩余时间：实时数字只在状态栏刷新，通知只在倒计时开始（或动作变化）时
+    // 弹一次——重复 push 同 id 通知会每秒重放入场动画。
+    let started = previous.countdown_remaining.is_none() || previous.action != next.action;
     match next.countdown_remaining {
-        Some(remaining) => show_countdown(cx, remaining),
+        Some(_) if started => show_countdown(cx, next.action),
+        Some(_) => {}
         None => clear_countdown(cx),
     }
 }
@@ -129,21 +152,25 @@ fn shutdown_status(power: PowerStatusDto) -> ShutdownStatus {
     ShutdownStatus {
         armed_delay: power.armed_delay_secs.map(Duration::from_secs),
         countdown_remaining: power.countdown_remaining_secs.map(Duration::from_secs),
+        low_speed: power.low_speed,
+        low_speed_elapsed_secs: power.low_speed_elapsed_secs,
+        action: power.action,
     }
 }
 
 struct ShutdownNote;
 
-fn show_countdown(cx: &mut App, remaining: Duration) {
+fn show_countdown(cx: &mut App, action: PowerAction) {
     let Some(handle) = WindowRegistry::handle(cx, &WindowKey::Main) else {
         return;
     };
+    let (notice_key, cancel_key) = match action {
+        PowerAction::Shutdown => ("shutdownCountdownNotice", "shutdownCancelButton"),
+        PowerAction::Sleep => ("sleepCountdownNotice", "sleepCancelButton"),
+    };
     let translator = Desktop::global(cx).translator.read(cx).clone();
-    let message = translator.text_with(
-        "shutdownCountdown",
-        &[("time", &format_remaining(remaining))],
-    );
-    let cancel_label = translator.text("shutdownCancelButton").to_owned();
+    let message = translator.text(notice_key).to_owned();
+    let cancel_label = translator.text(cancel_key).to_owned();
     if let Err(error) = handle.update(cx, |_, window, cx| {
         let note = Notification::warning(message)
             .id::<ShutdownNote>()
@@ -171,23 +198,5 @@ fn clear_countdown(cx: &mut App) {
         })
     {
         log::debug!("view or window released before lifecycle update: {error:#}");
-    }
-}
-
-/// `mm:ss`，与 agent 托盘 tooltip 一致。
-fn format_remaining(remaining: Duration) -> String {
-    let total = remaining.as_secs();
-    format!("{:02}:{:02}", total / 60, total % 60)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_remaining_pads_minutes_and_seconds() {
-        assert_eq!(format_remaining(Duration::from_secs(65)), "01:05");
-        assert_eq!(format_remaining(Duration::from_secs(5)), "00:05");
-        assert_eq!(format_remaining(Duration::from_secs(600)), "10:00");
     }
 }

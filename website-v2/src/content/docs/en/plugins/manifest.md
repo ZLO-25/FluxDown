@@ -31,13 +31,14 @@ This page is the field-by-field reference. For a guided walkthrough see [Your fi
   "main": { "entry": "main.js", "events": ["onDone"], "background": false },
   "contributes": {
     "views": [{ "id": "dashboard", "title": "Dashboard", "location": "activity" }],
-    "commands": [{ "id": "refresh", "title": "Refresh", "palette": true }]
+    "commands": [{ "id": "refresh", "title": "Refresh", "palette": true }],
+    "archive": "archive.js"
   },
   "settings": [
     { "key": "quality", "title": "Preferred quality", "type": "string", "widget": "select",
       "options": [ { "value": "hd", "label": "HD" }, { "value": "sd", "label": "SD" } ], "default": "hd" }
   ],
-  "permissions": []
+  "permissions": ["archive"]
 }
 ```
 
@@ -60,7 +61,7 @@ A plugin may declare any combination of `resolvers`, `subscriptions`, `hooks`, `
 | `interceptors` | no | object | Task interceptors (request rewrite, segment filtering, post-processing). See [`interceptors`](#interceptors). |
 | `auth` | no | object | Platform login entry. See [`auth`](#auth). |
 | `main` | no | object | Always-on script for portable views, commands and background logic. See [`main`](#main). |
-| `contributes` | no | object | Views, commands, browser sniff rules and page scripts. See [`contributes`](#contributes). |
+| `contributes` | no | object | Views, commands, archive classification, browser sniff rules and page scripts. See [`contributes`](#contributes). |
 | `permissions` | no | array | Capability grants; unknown values are rejected. See [`permissions`](#permissions). |
 | `settings` | no | array | Declarative settings fields. See [`settings[]`](#settings). |
 
@@ -205,6 +206,9 @@ Validation runs after `auth`, in this order: `entry` path → `stages` non-empty
 | `entry` | yes | Classic script (not an ES module); safe relative path inside the package, extension `.js`, file must exist. |
 | `events` | no | Events delivered to the script; each must be one of `onStart`, `onError`, `onDone`, `onMetaProbed`, `onCancel`. |
 | `background` | no | Boolean. `true` keeps the script running with the daemon. Requires the `background` permission. |
+| `imageHosts` | no | Defaults to `[]`. Lowercase DNS hostnames or IP literals whose remote images `main` may load through `ctx.images` / `flux.images`. At most 64 unique entries; same host syntax as `desktop.networkHosts`. Included in network consent. |
+
+Remote image loading is performed by the host, never directly by the UI. Declare every image source host in `main.imageHosts`; requests to other hosts are rejected. Existing manifests may omit this field (equivalent to `[]`). See the [API reference](/docs/en/plugins/api-reference/).
 
 `main` is the always-on part of a plugin: portable views, commands and background logic run here, inside the daemon. See the [UI guide](/docs/en/plugins/ui-guide/).
 
@@ -218,12 +222,33 @@ Validation runs after `auth`, in this order: `entry` path → `stages` non-empty
                 "portable": true, "icon": "icons/dashboard.svg" }],
     "commands": [{ "id": "refresh", "title": "Refresh", "palette": true, "taskMenu": false }],
     "sniffRules": "rules.json",
-    "pageScripts": [{ "id": "hello", "title": "Hello", "matches": ["https://*.example.com/*"], "js": ["page/hello.js"] }]
+    "pageScripts": [{ "id": "hello", "title": "Hello", "matches": ["https://*.example.com/*"], "js": ["page/hello.js"] }],
+    "archive": "archive.js"
   }
 }
 ```
 
-Empty `views` / `commands` arrays are the same as leaving them out.
+Empty `views` / `commands` arrays are the same as leaving them out. `archive` contributes a local directory router; it does not rename files or take over the save root.
+
+### `archive`
+
+`contributes.archive` names an in-package `.js` file and requires `permissions: ["archive"]`. `minAppVersion` should be `0.6.5` when using the new phase/content context (matching development host; not a claim that this version has been published).
+
+The host calls `globalThis.archive(ctx)` for tasks following authorized default-directory routing. `ctx` contains `fileName`, optional source `metadata`, `isGroup`, `phase: "start" | "complete"`, fixed UTC `createdDate` (`YYYY-MM-DD`, or `""` for an invalid legacy timestamp), optional host-observed `detectedType: { kind, mime, extension }`, and optional `categoryRouting`. `categoryRouting: true` advertises category-result support; older hosts omit it, and plugins must explicitly reject category routing when it is absent. `kind` uses the lowercase snake_case file-format vocabulary: `archive`, `audio`, `compressed`, `database`, `diagram`, `disk`, `document`, `ebook`, `executable`, `font`, `formula`, `geospatial`, `image`, `metadata`, `model`, `other`, `package`, `playlist`, `presentation`, `rom`, `spreadsheet`, `subtitle`, `video`. `metadata` is source-provided, not content recognition. The callback receives no file bytes, paths, URLs, request headers, or credentials; server-provided MIME is not used as content evidence.
+
+Eligible files are evaluated at start and re-evaluated at completion against the final processed artifact, even when start already selected a directory. A successful completion result can replace the cached start path; `null`, invalid output, or an error retains the prior valid choice. Plugins may return `null` for ordinary files at start and decide at completion from `detectedType`. Groups are routed only at the root at start (`isGroup: true`), without content reading or `detectedType`.
+
+Category results are accepted only for completed, non-group files. The host rejects `{ category }` at start and for groups; group routing continues to support `{ directories }` and legacy `{ folderName }`.
+
+Return `null` / `undefined`, `{ category: "audio" }`, or `{ directories: ["Video", "Bilibili"] }` for safe directory components beneath the authorized default directory (up to 8 levels, joined path at most 180 UTF-8 bytes). Category is one of the stable built-in identifiers `video`, `audio`, `document`, `image`, `program`, `archive`, or `other`; it is mutually exclusive with `directories` and `folderName`. The host resolves it against the submission's category configuration snapshot to the configured visible category's save directory. A renamed category retains its stable identifier (`builtinType`); missing, hidden, or directory-less categories are declined. Custom categories are not guessed. Existing `{ folderName: "The Expanse" }` remains supported with its existing category-child behavior. Explicit directories bypass automatic category resolution. Explicit save directories bypass the callback. eD2K tasks are not moved. A BT task may be archived only at its first completion when exactly one non-padding file is actually selected, including a single selected file from a multi-file torrent; the host invokes the unchanged callback contract using that file's actual filename and content. The entire BT task root is moved with storage migration/reseeding; multi-file selections, errors, conflicts and explicit directories stay put. No initial destination is predicted, and later selection changes or restarts do not cause another archive attempt. An asynchronous move may briefly leave the file at its original location before a location-change event arrives; no sidebar category is added. Invalid output is ignored and does not fail the download. See the [API reference](/docs/en/plugins/api-reference/#archivectx) for full behavior.
+
+### `archiveRules`
+
+`contributes.archiveRules` declares a bounded JSON classification pack verified against a publisher-pinned Ed25519 public key. `entry` is a safe package-relative `.json` file; the signed seed is validated during package installation. `publicKey` is 64 hexadecimal characters. Optional `updateUrl` must be a public HTTPS URL without credentials or a fragment; its hostname is included in the consent network-host list. Updates are checked daily when automatic updates are enabled and can also be requested explicitly or manually. A failed fetch or verification retains the last verified rules. Rules only classify future eligible files; they never reclassify historic files.
+
+Hosts that predate this key and permission reject the plugin as an invalid manifest (unknown key and unknown permission), so set `minAppVersion` to the next release or later.
+
+The entry is `globalThis.archive = (ctx) => result` with `ctx = { fileName }`. It returns `{ folderName: string }`, or `null` / `undefined` for no folder, and may be sync or async. It is called only for tasks that use category routing, when routing picks a category directory (a matching rule that has a directory, or the "Other" fallback directory); the saved folder is reused afterwards and the file name is never changed. The script only has `flux.settings`, `flux.logger` and `console`. The full behaviour (call timing, multiple plugins, `folderName` rules, failures, limits) is in the [API reference](/docs/en/plugins/api-reference/#archivectx).
 
 ### `views[]`
 
@@ -233,7 +258,7 @@ At most 16.
 |---|---|---|
 | `id` | yes | Matches `^[a-z][a-z0-9-]{0,31}$`; unique among views. |
 | `title` | yes | 1–40 characters. |
-| `location` | yes | `activity`, `settings`, `taskDetail` or `window`. At most one view may use `settings`. |
+| `location` | yes | `activity`, `settings`, `taskDetail`, `window` or `auth`. At most one view may use `settings`, and at most one may use `auth`. An `auth` view requires the top-level `auth` declaration (`auth.entry`, which in turn requires the `auth` permission), otherwise the manifest fails with `location 为 auth 的 view 要求声明 auth`. It replaces the content of the plugin's **Log in** dialog in the desktop app (GPUI) and the Web UI (the Web UI only shows portable implementations); mobile apps do not render it and keep the default login flow. See [Custom login UI](/docs/en/plugins/auth-guide/#custom-login-ui). Hosts that predate this location reject the plugin as an unknown `location`, so set `minAppVersion` to the next release or later. |
 | `desktop` | no | Native desktop implementation, see below. A view **without** `desktop` is portable and requires `main`. |
 | `portable` | no | Boolean, default `false`. Only allowed together with `desktop`. `true` means `main` also implements this view (via `flux.ui.view`) so clients that cannot run desktop scripts can show it; requires `main`. |
 | `icon` | no | Package-relative path of a `.svg` file (any `location`; currently only used by the `activity` bar). At most 16 KiB (16384 bytes), valid UTF-8, an SVG document (starts with `<svg` or `<?xml` and contains `<svg`). The host treats it as a **monochrome mask** tinted with the theme color and only uses its alpha channel, so a 24×24 `viewBox` with `stroke="currentColor"` or `fill="currentColor"` (lucide style) works best; colors are flattened to one tone. Omit it to get the default icon. |
@@ -364,6 +389,7 @@ Extra host capabilities a plugin opts into. Empty or omitted = the base sandbox 
 | `pageScripts` | Run the plugin's scripts on the web pages listed in `contributes.pageScripts` (Full risk). |
 | `background` | Keep `main` running with the daemon (`main.background`). |
 | `intercept` | Declare `interceptors` to read and change a task's request, segments, quality and finished file while it runs. |
+| `archive` | Declare `contributes.archive`: choose one subfolder inside the task's category folder from the file name. It can read plugin settings and write the plugin log; it has no file, network, task or process access (Elevated risk). |
 
 Unknown values fail the whole manifest. Risk levels, consent and audit are explained in [Permissions, Consent & Audit](/docs/en/plugins/permissions/); the API behind each permission is in the [API reference](/docs/en/plugins/api-reference/).
 
@@ -376,6 +402,7 @@ Permissions that a declaration depends on:
 | any `views[].desktop` | `desktop` |
 | `contributes.sniffRules` | `browserRules` |
 | `contributes.pageScripts` (non-empty) | `pageScripts` |
+| `contributes.archive` | `archive` |
 
 (`tasks`, `ffmpeg` and `ytdlp` are checked when the API is called, not by the manifest.)
 
@@ -401,7 +428,7 @@ Each entry describes one field; the app generates the form on desktop and Web. K
 | `key` | yes | Unique within the plugin, not empty. Read back as `flux.settings.<key>`. |
 | `title` | yes | Form label. |
 | `description` | no | Help text below the field. |
-| `type` | yes | `string`, `number`, or `boolean`. |
+| `localizations` | no | Per-client display translations; see [Localizing setting text](#localizing-setting-text). |
 | `widget` | no | Defaults by type: string→`text`, number→`number`, boolean→`toggle`. |
 | `options` | select only | Non-empty list of `{ "value", "label" }`. |
 | `default` | no | **Always a string**, even for numbers (`"3"`) and booleans (`"true"` / `"false"`). For select, must be one of the option values; for number, must parse as a finite number and fall inside `min` / `max`. |
@@ -410,6 +437,24 @@ Each entry describes one field; the app generates the form on desktop and Web. K
 | `pattern` | string only | A **JavaScript RegExp** (not a Rust regex) validated against the value on save. It is compiled at install time; an invalid pattern rejects the install. |
 | `helperScript` | string only | A snippet the host shows a **Copy** button for, next to the field. The host only copies the text to the clipboard — it never runs it. The user pastes it into the target site's browser DevTools console (typical use: read `document.cookie` and copy a login cookie back into the field). Non-empty, at most 4 KB. |
 | `helperLabel` | with `helperScript` | Button label, at most 60 characters. Only valid together with `helperScript`; a generic "Copy helper script" label is used when omitted. |
+
+#### Localizing setting text
+
+Add an optional `localizations` object to a setting. Locale keys use BCP-47-like hyphenated tags; each value may translate `title`, `description`, `helperLabel`, and option labels keyed by the existing option **value**. These translations never alter setting keys, option values, defaults, or validation.
+
+```json
+"localizations": {
+  "en": { "title": "Preferred quality", "options": { "hd": "High definition" } },
+  "zh-Hans": { "title": "偏好画质", "options": { "hd": "高清" } }
+}
+```
+
+The client uses its own UI language, independently of the daemon language. For each text it tries the most-specific locale, progressively shorter tags, then `en`, then the original manifest text; blank translations are skipped. Existing manifests without localizations remain valid and display their original text. Custom views continue to receive `ctx.locale`; it is hot-updated and should be re-read inside `render` after language changes rather than caching localized strings in `init`. Desktop scripts can use the live `fluxdown.locale()` getter. Update custom views when the client language changes.
+
+Locale keys are case-insensitive: use a 2–8 letter language followed by optional 1–8 character alphanumeric subtags separated by `-`; duplicates after case folding are rejected. A setting supports at most 64 locales, and each translated string at most 4096 Unicode characters. Unknown members, unknown option values, and `helperLabel` without `helperScript` are rejected.
+
+Chinese UI aliases are supported: `zh` can use `zh-Hans` / `zh-CN`, and `zh-HK` / `zh-MO` can use `zh-Hant` / `zh-TW`; an explicit `Hans` / `Hant` script overrides a conflicting region. Include a translation for the original language too when the original text is not English, otherwise the English fallback can take precedence. Changing language updates labels without clearing unsaved setting values. For portable views, the host updates only that session's `ctx.locale` and re-renders with its existing state; it does not rerun `init` or invoke an input event.
+
 
 ### Widget × type matrix
 
@@ -447,15 +492,15 @@ The manifest is validated when the plugin is installed and every time it is load
 
 ### Order of checks
 
-identity format → `name` non-empty → `version` format → `minAppVersion` format → `icon` path safety → at most one resolver → resolver `entry` path, non-empty `match.urls`, `timeoutMs ≠ 0`, `memoryLimitMb ≠ 0` → at most one subscription → `providerId` format and not `rss`, `entry` path, `timeoutMs ≠ 0` → hooks `entry` path, non-empty valid `events`, non-empty `match.urls` if present → auth `entry` path, `auth` permission present, `timeoutMs ≠ 0` → `main` (path, `.js`, valid `events`, `background` permission) → `contributes` (view and command limits and ids, `settings` location at most once, `portable` only with `desktop`, `main` required for portable views and commands, desktop entry and size and hosts rules, `desktop` permission, view `icon` path / `.svg` extension, `sniffRules` path / extension / `browserRules` permission, then `pageScripts`: at most 16 → `pageScripts` permission → per script: `id` format and uniqueness, `title` length, `matches` count and patterns, `excludeMatches` count and patterns, `js` count, safe `.js` paths, no duplicates) → `settings` (keys unique, per-field rules and widget × type matrix) → every `permissions` value known.
+identity format → `name` non-empty → `version` format → `minAppVersion` format → `icon` path safety → at most one resolver → resolver `entry` path, non-empty `match.urls`, `timeoutMs ≠ 0`, `memoryLimitMb ≠ 0` → at most one subscription → `providerId` format and not `rss`, `entry` path, `timeoutMs ≠ 0` → hooks `entry` path, non-empty valid `events`, non-empty `match.urls` if present → auth `entry` path, `auth` permission present, `timeoutMs ≠ 0` → `main` (path, `.js`, valid `events`, `background` permission) → `contributes` (view and command limits and ids, `settings` location at most once, `portable` only with `desktop`, `main` required for portable views and commands, desktop entry and size and hosts rules, `desktop` permission, view `icon` path / `.svg` extension, `sniffRules` path / extension / `browserRules` permission, `archive` package-relative path / `.js` extension / `archive` permission, then `pageScripts`: at most 16 → `pageScripts` permission → per script: `id` format and uniqueness, `title` length, `matches` count and patterns, `excludeMatches` count and patterns, `js` count, safe `.js` paths, no duplicates) → `settings` (keys unique, per-field rules and widget × type matrix) → every `permissions` value known.
 
 ### Files that must exist
 
-At install and load time the package must contain every declared entry script (`resolvers[0].entry`, `hooks.entry`, `auth.entry`, `subscriptions[0].entry`, `main.entry`), every `desktop.entry`, every view `icon` (which must also pass the icon content check above), the `sniffRules` file (which must also pass the content check above) and every file listed in a page script's `js` (each at most 256 KiB of valid UTF-8, at most 384 KiB per script once joined). A missing file is reported as `包内缺少文件 '<path>'` (“the package is missing file '<path>'”); an entry script that exists but cannot be read as UTF-8 text is reported as `读取入口文件 '<path>' 失败: …` (“failed to read entry file”). This applies to dev-mode plugins too: the plugin is listed as **Load failed** instead of failing later, on the first call.
+At install and load time the package must contain every declared entry script (`resolvers[0].entry`, `hooks.entry`, `auth.entry`, `subscriptions[0].entry`, `main.entry`, `contributes.archive`), every `desktop.entry`, every view `icon` (which must also pass the icon content check above), the `sniffRules` file (which must also pass the content check above) and every file listed in a page script's `js` (each at most 256 KiB of valid UTF-8, at most 384 KiB per script once joined). A missing file is reported as `包内缺少文件 '<path>'` (“the package is missing file '<path>'”); an entry script that exists but cannot be read as UTF-8 text is reported as `读取入口文件 '<path>' 失败: …` (“failed to read entry file”). This applies to dev-mode plugins too: the plugin is listed as **Load failed** instead of failing later, on the first call.
 
 ### Compile checks at install
 
-Syntax errors are rejected at install time rather than discovered on the first download. The compile check covers the **resolver, hooks, auth and subscription** entry scripts (up to four, one per declared kind). It does **not** cover `main` (compiled on demand) or desktop scripts (never compiled by the engine). Each `settings[].pattern` is also compiled as a JavaScript RegExp at install time; an invalid pattern rejects the install.
+Syntax errors are rejected at install time rather than discovered on the first download. The compile check covers the **resolver, hooks, interceptors, auth, subscription and archive** entry scripts (up to six, one per declared kind). Each script is evaluated once in a bare context where `flux` and `console` do not exist, so top-level code must not call them. It does **not** cover `main` (compiled on demand) or desktop scripts (never compiled by the engine). Each `settings[].pattern` is also compiled as a JavaScript RegExp at install time; an invalid pattern rejects the install.
 
 A failed install changes nothing: a first install leaves no folder behind, and an update restores the previous version.
 

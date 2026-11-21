@@ -40,6 +40,86 @@ pub fn is_always_running_queue(queue_id: &str) -> bool {
     queue_id == MAIN_QUEUE_ID
 }
 
+/// Source-provided archive classification hints. These are descriptive metadata only:
+/// never credentials, URLs, or filesystem paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ArchiveMetadata {
+    pub platform: String,
+    pub media_kind: String,
+    pub creator_id: String,
+    pub creator_name: String,
+    pub series_id: String,
+    pub series_title: String,
+    pub collection_id: String,
+    pub collection_title: String,
+}
+
+/// Lifecycle stage of an archive decision.
+///
+/// ```
+/// use fluxdown_engine::model::ArchivePhase;
+/// assert_eq!(serde_json::to_string(&ArchivePhase::Complete).unwrap(), "\"complete\"");
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ArchivePhase {
+    /// Before writing a single file, or when choosing a task group's root.
+    #[default]
+    Start,
+    /// After final processing of a complete single-file artifact.
+    Complete,
+}
+
+/// Content-observed format facts, independent of the name and HTTP response MIME.
+///
+/// ```
+/// use fluxdown_engine::model::ArchiveDetectedType;
+/// let detected = ArchiveDetectedType { kind: "image", mime: "image/png".into(), extension: "png".into() };
+/// assert_eq!(detected.mime, "image/png");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ArchiveDetectedType {
+    /// The recognizer's broad format kind, not a user-defined classification.
+    pub kind: &'static str,
+    /// Content-observed media type.
+    pub mime: String,
+    /// Canonical format extension without the dot; never a rename instruction.
+    pub extension: String,
+}
+
+/// Context passed to archive-folder plugins.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveContext {
+    pub file_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ArchiveMetadata>,
+    pub is_group: bool,
+    /// Start prediction or completed-artifact decision.
+    pub phase: ArchivePhase,
+    /// UTC creation date (`YYYY-MM-DD`); empty for invalid legacy timestamps.
+    pub created_date: String,
+    /// Bounded local content recognition; absent before completion or when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_type: Option<ArchiveDetectedType>,
+    /// Whether this host supports resolving archive category identifiers.
+    pub category_routing: bool,
+    /// Bounded hexadecimal file prefix for host-side signed rule matching.
+    /// Never serialized to arbitrary plugin scripts.
+    #[serde(skip)]
+    pub header_hex: Option<String>,
+}
+
+/// Validated archive destination returned by a plugin, with legacy-shape provenance.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArchiveDirectories {
+    pub components: Vec<String>,
+    pub legacy: bool,
+    /// Stable builtin category identifier, mutually exclusive with directory components.
+    pub category: String,
+}
+
 /// 持久化任务信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskInfo {
@@ -69,6 +149,9 @@ pub struct TaskInfo {
     /// 任务结束时间，Unix seconds 时间戳（空 = 尚未完成）。
     /// 记录下载真正完成（status→3）的时刻，不含插件 hook 后处理耗时。
     pub completed_at: String,
+    /// 落盘文件的哈希记录，格式 `algo=hexhash`（空 = 尚未计算）。完成时由校验和
+    /// 校验或「下载完成后计算哈希」写入，也可按需计算；重新下载时清空。
+    pub file_hash: String,
     /// 配置的分段（线程）数。0 = 自动（segment_advisor 动态计算）。
     /// 供 UI 展示与「创建后改线程数」编辑；与运行时实际分片数可能不同。
     pub segments: i32,
@@ -96,10 +179,17 @@ pub struct TaskInfo {
     pub seed_time_limit_minutes: i64,
     /// 任务级不活跃做种时长上限（分钟）。哨兵语义同上。
     pub seed_inactive_time_limit_minutes: i64,
-    /// 任务级做种上传限速（B/s）。0 = 无单任务限制，>0 = 自定义。
-    /// 在 torrent 加入 librqbit 会话时烘焙生效（下载开始 / 重启续种 /
-    /// 句柄丢失后重新挂载）；已 live 的句柄不热改。
+    /// 任务级上传限速（B/s）。0 = 无单任务限制，>0 = 自定义。下载与做种期间都生效，
+    /// 加入 librqbit 会话时烘焙，已 live 的句柄经 `set_task_bt_limits` 热改。
     pub seed_upload_limit_bps: i64,
+    /// BT 选片：按文件顺序下载（对齐 qBittorrent「按顺序下载」）。默认 false = 最稀有优先。
+    pub bt_sequential: bool,
+    /// BT 选片：先下载每个选中文件首尾各 1% 的块（对齐 qBittorrent「先下载首尾文件块」）。
+    pub bt_first_last_pieces_first: bool,
+    /// 任务级 BT 下载限速（B/s）。0 = 无单任务限制。烘焙与热改同上传限速。
+    pub bt_download_limit_bps: i64,
+    /// 超级做种（BEP 16）：任务完成后以初始做种模式上传。
+    pub bt_super_seeding: bool,
     /// Source page URL captured by the browser extension (empty = none).
     pub referrer: String,
     /// 所属任务组 ID（空 = 不属于任何组）。多文件任务组裂变/建组时写入；
@@ -122,6 +212,8 @@ pub struct TaskInfo {
     /// 加速来源累计字节（跨运行累加，进度复位时随之清零）。源站字节 =
     /// `downloaded_bytes` − 三者之和。
     pub source_bytes: SourceBytes,
+    /// Non-secret task-level overrides; request credentials live in the credential store.
+    pub properties: crate::task_edit::TaskProperties,
 }
 
 /// 按加速来源累计的已写入字节。

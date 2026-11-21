@@ -82,7 +82,7 @@ impl Projection {
         &self.epoch
     }
 
-    /// 当前偏好 `custom_categories` 构建的分类路由；没有任何分类配置目录时为 `None`。
+    /// 当前偏好构建的授权路由；无分类规则时为空规则路由，仍支持插件归档分类。
     pub(crate) fn category_route(&self) -> Option<CategoryRouteDto> {
         CategoryRouteDto::from_preference(
             self.snapshot
@@ -284,6 +284,10 @@ impl Projection {
             | DaemonEvent::ComponentsChanged(_)
             | DaemonEvent::WebhooksChanged(_)
             | DaemonEvent::WebhooksCleared
+            // BT 防吸血：状态变化经 `Notice` 通知宿主刷新；云名单 / 证据事件只由 agent 消费。
+            | DaemonEvent::BtGuardChanged
+            | DaemonEvent::BtGuardCloudRefreshWanted { .. }
+            | DaemonEvent::BtGuardEvidenceReady { .. }
             | DaemonEvent::RssChanged { .. } => None,
             // 整表替换 / 宣告重载：投影已进入加载态，下发「加载态」快照（`tasks_loading = true`）。
             DaemonEvent::SnapshotReplaced(_) | DaemonEvent::TablesReloading { .. } => {

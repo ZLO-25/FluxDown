@@ -85,6 +85,16 @@ public struct DownloadTask: Sendable, Hashable, Identifiable {
     public var seedingStatus: SeedingStatus
     public var seedingMessage: String
     public var seedingTimeSecs: Int64
+    /// BT 选片：按顺序下载。缺省 / 非 BT = false。
+    public var btSequential: Bool
+    /// BT 选片：先下载首尾文件块。缺省 / 非 BT = false。
+    public var btFirstLastPiecesFirst: Bool
+    /// 任务级 BT 下载限速（字节/秒，0 = 不限；`daemon.task.setBtLimits.downloadLimitBps`）。旧主机缺省 0。
+    public var btDownloadLimitBps: Int64
+    /// 任务级上传限速（字节/秒，0 = 不限；与 `setBtLimits.uploadLimitBps` / 做种限制的上传限速同一值）。
+    public var seedUploadLimitBps: Int64
+    /// 超级做种（`daemon.task.setSuperSeeding`）。旧主机缺省 false。
+    public var btSuperSeeding: Bool
 
     public init(
         taskId: String,
@@ -107,7 +117,12 @@ public struct DownloadTask: Sendable, Hashable, Identifiable {
         uploadedBytes: Int64 = 0,
         seedingStatus: SeedingStatus = .none,
         seedingMessage: String = "",
-        seedingTimeSecs: Int64 = 0
+        seedingTimeSecs: Int64 = 0,
+        btSequential: Bool = false,
+        btFirstLastPiecesFirst: Bool = false,
+        btDownloadLimitBps: Int64 = 0,
+        seedUploadLimitBps: Int64 = 0,
+        btSuperSeeding: Bool = false
     ) {
         self.taskId = taskId
         self.url = url
@@ -130,6 +145,11 @@ public struct DownloadTask: Sendable, Hashable, Identifiable {
         self.seedingStatus = seedingStatus
         self.seedingMessage = seedingMessage
         self.seedingTimeSecs = seedingTimeSecs
+        self.btSequential = btSequential
+        self.btFirstLastPiecesFirst = btFirstLastPiecesFirst
+        self.btDownloadLimitBps = btDownloadLimitBps
+        self.seedUploadLimitBps = seedUploadLimitBps
+        self.btSuperSeeding = btSuperSeeding
     }
 
     public var id: String { taskId }
@@ -330,7 +350,7 @@ public struct RuntimeStats: Sendable, Hashable {
     }
 }
 
-/// 引擎发起的选择请求（X1–X3），到期按 `defaultChoice` 处理。
+/// 引擎发起的选择请求（X1–X3），到期按 `defaultChoice` 处理；`noDeadline` = 不自动处理。
 public struct SelectionRequest: Sendable, Hashable, Identifiable {
     public var requestId: String
     public var taskId: String
@@ -353,11 +373,17 @@ public struct SelectionRequest: Sendable, Hashable, Identifiable {
     }
 
     public var id: String { requestId }
+
+    /// 「无截止」（protocol `SELECTION_NO_DEADLINE` = i64::MAX）：用户关闭了 BT 选择的自动选择默认项。
+    public static let noDeadline: Int64 = .max
+
+    /// 有自动按默认项处理的截止时刻（否则不显示倒计时、不自动答复）。
+    public var hasDeadline: Bool { deadlineUnixMs != Self.noDeadline }
 }
 
 public enum SelectionKind: Sendable, Hashable {
     case hls([HlsOption])
-    case bt([BtFile])
+    case bt([BtFile], saveDir: String)
     case variant([VariantOption])
     case fileExists(FileConflict)
     case plugin(site: String, url: String, candidates: [PluginCandidate])
@@ -434,11 +460,26 @@ public struct VariantOption: Sendable, Hashable {
 
 public enum SelectionOutcome: Sendable, Hashable {
     case hls(index: Int32)
-    case bt(indices: [Int32])
+    /// `customName`：用户改过的任务名（单文件 = 文件名，多文件 = 外层目录名）；nil = 沿用原名。
+    case bt(indices: [Int32], saveDir: String?, customName: String?)
     case variant(index: Int32)
     case fileExists(action: FileExistsAction)
     case plugin(identity: String, remember: Bool)
     case cancelled
+}
+
+/// BT 选择框「名称」输入的提交值（同 GPUI `bt_name_outcome`）：去首尾空白后为空或与预填名相同 → nil（不改名）。
+public func btNameOutcome(initial: String, input: String) -> String? {
+    let name = input.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !name.isEmpty, name != initial.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+    return name
+}
+
+public extension SelectionKind {
+    /// 「取消」是否删除任务（连同文件）：BT 取消 = 删除任务（同 GPUI），其它选择取消 = 答复 `.cancelled`（任务保持暂停）。
+    var cancelDeletesTask: Bool {
+        if case .bt = self { true } else { false }
+    }
 }
 
 /// `ServiceHello` 的 UI 相关子集。能力名见 README §2.1（`daemon.rss`、`agent.sync` …）。

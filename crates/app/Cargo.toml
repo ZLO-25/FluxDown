@@ -38,6 +38,7 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "sync", "process", "time", "net", "macros", "fs"] }
 tokio-tungstenite = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 fluxdown_ui_components = { version = "0.1.0", path = "../components" }
 mimalloc = "0.1.52"
@@ -52,7 +53,10 @@ gpui = { workspace = true, features = ["test-support"] }
 [target.'cfg(windows)'.build-dependencies]
 winresource.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = ["UI_ViewManagement"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSRunningApplication", "NSDockTile", "NSImage", "NSImageView", "NSView", "NSResponder", "NSControl", "NSCell"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSData", "NSGeometry", "NSObject"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSData", "NSObject"] }

@@ -53,10 +53,84 @@ export function rangeHint(field: SettingFieldDto): string | null {
   return null
 }
 
+/** Locale candidates for a client-local manifest setting presentation. */
+function settingLocaleCandidates(locale: string): string[] {
+  const normalized = locale.trim().replaceAll('_', '-').toLowerCase()
+  const parts = normalized.split('-')
+  const candidates: string[] = []
+  const add = (candidate: string) => {
+    if (!candidates.includes(candidate)) candidates.push(candidate)
+  }
+  const chinese = parts[0] === 'zh'
+  for (let end = parts.length; end > 0; end -= 1) {
+    const parent = parts.slice(0, end).join('-')
+    if (parent && (!chinese || parent !== 'zh')) add(parent)
+  }
+  if (chinese) {
+    const script = parts.slice(1).find((part) => part === 'hans' || part === 'hant')
+    const region = parts[1]
+    const aliases = script === 'hant' || (!script && ['tw', 'hk', 'mo'].includes(region ?? ''))
+      ? ['zh-hant', 'zh-tw', 'zh']
+      : script === 'hans' || (!script && ['cn', 'sg'].includes(region ?? ''))
+        ? ['zh-hans', 'zh-cn', 'zh']
+        : parts.length === 1 ? ['zh', 'zh-hans', 'zh-cn'] : ['zh']
+    aliases.forEach(add)
+  }
+  add('en')
+  return candidates
+}
+
+/** Derive presentation-only field text; setting keys, defaults and option values stay untouched. */
+export function localizedSettingField(field: SettingFieldDto, locale: string): SettingFieldDto {
+  const localizations = field.localizations ?? {}
+  const candidates = settingLocaleCandidates(locale)
+  const translations = candidates.map((candidate) => Object.entries(localizations).find(([key]) => key.toLowerCase() === candidate)?.[1])
+  const text = (select: (value: NonNullable<SettingFieldDto['localizations']>[string]) => string | undefined, original: string) => {
+    for (const localization of translations) {
+      const value = localization && select(localization)
+      if (value?.trim()) return value
+    }
+    return original
+  }
+  return {
+    ...field,
+    title: text((value) => value.title, field.title),
+    description: text((value) => value.description, field.description),
+    helperLabel: text((value) => value.helperLabel, field.helperLabel ?? ''),
+    options: field.options.map((option) => ({
+      ...option,
+      label: text((value) => value.options?.[option.value], option.label),
+    })),
+  }
+}
+
 // ── 市场 ────────────────────────────────────────────────────
 
 /** 市场列表每次展开的条数。 */
 export const MARKET_PAGE_SIZE = 50
+
+/** 目录最长可信时长：超过后再次进入插件页会重新拉取，保证「更新」徽标不陈旧（对齐 GPUI `MARKET_MAX_AGE`）。 */
+export const MARKET_MAX_AGE_MS = 10 * 60 * 1000
+
+export interface MarketLoadState {
+  /** 是否发起过加载。 */
+  requested: boolean
+  /** 上次失败是断连类：连接恢复后自动重试一次。 */
+  retryOnReconnect: boolean
+  /** 当前展示的是失败态。 */
+  failed: boolean
+  /** 上次成功加载完成的时刻（毫秒时间戳）；从未成功为 null。 */
+  loadedAt: number | null
+}
+
+/**
+ * 目录是否需要（重新）加载（对齐 GPUI `market_needs_load`）：从未请求、断连失败待重试、或上次成功加载已过期。
+ * 失败且非断连类时不自动重试——由手动刷新恢复。
+ */
+export function marketNeedsLoad(state: MarketLoadState, now: number): boolean {
+  if (!state.requested || state.retryOnReconnect) return true
+  return !state.failed && state.loadedAt !== null && now - state.loadedAt >= MARKET_MAX_AGE_MS
+}
 
 /** 市场条目关键字过滤：名称 / id / 描述 / 作者 / 标签任一命中（大小写不敏感）。 */
 export function filterMarket(entries: readonly MarketEntryDto[], query: string): MarketEntryDto[] {
@@ -67,6 +141,28 @@ export function filterMarket(entries: readonly MarketEntryDto[], query: string):
     (entry) =>
       hit(entry.name) || hit(entry.pluginId) || hit(entry.description) || hit(entry.author) || entry.tags.some(hit),
   )
+}
+
+/**
+ * 分页切片（对齐 GPUI `market::page_of`）：前 `limit` 条可见，`remaining` = 其后还没展开的条数
+ * （0 = 不显示「显示更多」）。公开市场与专属插件区共用。
+ */
+export function pageOf<T>(items: readonly T[], limit: number): { visible: T[]; remaining: number } {
+  const shown = Math.min(Math.max(0, limit), items.length)
+  return { visible: items.slice(0, shown), remaining: items.length - shown }
+}
+
+/** 专属插件区条目数达到该值才出现搜索框（对齐 GPUI `PRIVATE_SEARCH_MIN_ENTRIES`）。 */
+export const PRIVATE_SEARCH_MIN_ENTRIES = 8
+
+/** 专属插件区是否显示搜索框（`total` = 可装条目数，未过滤）。 */
+export function privateSearchVisible(total: number): boolean {
+  return total >= PRIVATE_SEARCH_MIN_ENTRIES
+}
+
+/** 专属插件区过滤（对齐 GPUI `market::filter_private`）：搜索框不可见时忽略 `query`，可见时同公开市场规则。 */
+export function filterPrivate(entries: readonly MarketEntryDto[], query: string): MarketEntryDto[] {
+  return privateSearchVisible(entries.length) ? filterMarket(entries, query) : [...entries]
 }
 
 /** 引擎只安装 `yanked === 'none'` 的条目。 */
@@ -118,9 +214,27 @@ export function versionNewer(candidate: string, current: string): boolean {
 
 export type MarketAction = 'install' | 'update' | 'installed' | 'unavailable'
 
-/** 市场条目相对本机安装状态的动作；开发模式插件不被市场覆盖。 */
+/** 私有商店条目（`agent.privatePlugin.list`）；公开市场条目无 `channel`。 */
+export function isPrivateEntry(entry: MarketEntryDto): boolean {
+  return entry.channel === 'private'
+}
+
+/**
+ * 私有条目的安装将替换本机同 id 的非私有插件（公开市场 / 本机包安装的；dev 副本不算）：
+ * 权限确认弹窗据此追加替换警示。与 Rust `market::replaces_local_plugin` 逐条对齐。
+ */
+export function replacesLocalPlugin(entry: MarketEntryDto, installed: PluginDto | undefined): boolean {
+  return isPrivateEntry(entry) && installed !== undefined && !installed.devMode && installed.source !== 'private'
+}
+
+/**
+ * 市场条目相对本机安装状态的动作；开发模式插件不被市场覆盖。
+ * 私有隔离（镜像 crates/extensions/src/market.rs `market_action`）：`source === 'private'` 的已装插件
+ * 只受私有条目更新，公开条目对它一律按「已安装」处理（不给公开 Update / Install）。
+ */
 export function marketAction(entry: MarketEntryDto, installed: PluginDto | undefined): MarketAction {
   if (installed === undefined) return installable(entry) ? 'install' : 'unavailable'
+  if (installed.source === 'private' && !isPrivateEntry(entry)) return 'installed'
   if (!installed.devMode && installable(entry) && versionNewer(entry.version, installed.version)) return 'update'
   return 'installed'
 }
@@ -131,12 +245,64 @@ export function permissionsToConfirm(entry: MarketEntryDto, installed: PluginDto
   return entry.permissions.filter((permission) => !granted.includes(permission))
 }
 
-/** 已安装版本在市场中的撤回标记；未撤回或市场无此版本返回 null。 */
+/**
+ * 已安装版本在目录中的撤回标记；未撤回或目录无此版本返回 null。
+ * 私有隔离：`source === 'private'` 的插件只认私有条目，其余插件只认公开条目。
+ */
 export function installedVersionYanked(entries: readonly MarketEntryDto[], plugin: PluginDto): string | null {
   if (plugin.devMode) return null
-  const hit = entries.find((entry) => entry.pluginId === plugin.identity && entry.version === plugin.version)
+  const privateSource = plugin.source === 'private'
+  const hit = entries.find(
+    (entry) => isPrivateEntry(entry) === privateSource && entry.pluginId === plugin.identity && entry.version === plugin.version,
+  )
   if (hit === undefined || hit.yanked === '' || hit.yanked === 'none') return null
   return hit.yanked
+}
+
+/** 私有条目授权到期时间的展示串：缺省 / null / 空 = 永久（null）；无法解析原样返回，解析成功交给 `format`。 */
+export function privateExpiryText(expiresAt: string | null | undefined, format: (date: Date) => string): string | null {
+  if (expiresAt === undefined || expiresAt === null || expiresAt.trim() === '') return null
+  const ms = Date.parse(expiresAt)
+  return Number.isNaN(ms) ? expiresAt : format(new Date(ms))
+}
+
+/** 私有目录加载状态：`signedIn` 为 null = 尚未拿到过应答。 */
+export interface PrivateCatalogState {
+  loading: boolean
+  /** 拉取失败（只影响专属区）。 */
+  failed: boolean
+  signedIn: boolean | null
+  entries: readonly MarketEntryDto[]
+}
+
+/** 专属区呈现：hidden 整区不展示（未请求 / 已登录无授权，防存在性暗示）。 */
+export type PrivateSectionView = 'hidden' | 'loading' | 'error' | 'signIn' | 'list'
+
+/** 专属区呈现判定（镜像 crates/extensions/src/market.rs `private_section_view`）。 */
+export function privateSectionView(state: PrivateCatalogState): PrivateSectionView {
+  if (state.failed) return 'error'
+  if (state.signedIn === null) return state.loading ? 'loading' : 'hidden'
+  if (!state.signedIn) return 'signIn'
+  return latestPerPlugin(state.entries).length === 0 ? 'hidden' : 'list'
+}
+
+/** 私有目录的初始状态：尚未请求。 */
+export const INITIAL_PRIVATE_CATALOG: PrivateCatalogState = { loading: false, failed: false, signedIn: null, entries: [] }
+
+/**
+ * 发起一次拉取后的状态（镜像 GPUI `PrivateUi::begin_load`）。
+ * `reset`：丢弃已有目录回到加载态（首次 / 重试 / 登录态变化）。
+ * 否则（刷新 / 安装时发现版本已变）：已加载的目录保持显示，完成后整体替换，不闪空；
+ * 失败态没有可展示的条目，回到加载态。
+ */
+export function beginPrivateLoad(current: PrivateCatalogState, reset: boolean): PrivateCatalogState {
+  if (reset || current.failed) return { ...INITIAL_PRIVATE_CATALOG, loading: true }
+  return { ...current, loading: true }
+}
+
+/** 拉取失败后的状态：只影响专属区，错误条取代列表。 */
+export function failedPrivateLoad(current: PrivateCatalogState): PrivateCatalogState {
+  return { ...current, loading: false, failed: true }
 }
 
 /** 市场 `yanked` 标记 → i18n 键；空 / 未知值不展示。 */
@@ -174,6 +340,8 @@ export function permissionKeys(permission: string): { name: string; desc: string
       return { name: 'pluginPermInterceptName', desc: 'pluginPermInterceptDesc' }
     case 'pageScripts':
       return { name: 'pluginPermPageScriptsName', desc: 'pluginPermPageScriptsDesc' }
+    case 'archive':
+      return { name: 'pluginPermArchiveName', desc: 'pluginPermArchiveDesc' }
     default:
       return null
   }
@@ -189,6 +357,7 @@ const ELEVATED_PERMISSIONS: readonly string[] = [
   'browserRules',
   'background',
   'intercept',
+  'archive',
 ]
 
 /** 风险等级：含 `desktop` / `pageScripts` → full；含任一提权权限 → elevated；否则 standard。 */
@@ -244,6 +413,28 @@ export function postInstallConsent(plugin: PluginDto, confirmed: ConsentSet | nu
   if (pending.permissions.length === 0 && pending.networkHosts.length === 0) return 'none'
   if (confirmed !== null && consentMatches(confirmed, pending)) return 'grant'
   return 'dialog'
+}
+
+/** 各对话框当前指向的插件 identity（未打开为 null）。 */
+export interface DialogIdentities {
+  detail: string | null
+  settings: string | null
+  auth: string | null
+  consent: string | null
+}
+
+/** 对话框对应的最新插件快照；插件已卸载为 null。授权框另需仍有待授权项（别处已授权则为 null → 关闭）。 */
+export type LiveDialogPlugins = { [K in keyof DialogIdentities]: PluginDto | null }
+
+export function liveDialogPlugins(plugins: readonly PluginDto[], open: DialogIdentities): LiveDialogPlugins {
+  const find = (identity: string | null) => (identity === null ? null : (plugins.find((plugin) => plugin.identity === identity) ?? null))
+  const consent = find(open.consent)
+  return {
+    detail: find(open.detail),
+    settings: find(open.settings),
+    auth: find(open.auth),
+    consent: consent !== null && postInstallConsent(consent, null) === 'none' ? null : consent,
+  }
 }
 
 // ── 插件登录挑战 ────────────────────────────────────────────

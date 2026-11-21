@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fluxdown_protocol::{
-    CloudOrder, CloudPlan, CloudProfile, CloudReferralValidateResult, RpcErrorData, method,
+    CloudOrder, CloudPlan, CloudProfile, CloudReferralValidateResult, CloudSubscription,
+    RpcErrorData, method,
 };
 use fluxdown_ui_components::{
     ButtonVariant, ControlExt as _, FluxIcon, QrPalette, button, caption_number, card,
@@ -34,8 +35,9 @@ use crate::{
     AccountCommand,
     billing::{
         CardState, PollAction, campaign_progress, card_state, format_countdown, format_local_date,
-        format_minor, normalize_code, owned_price, payable, plan_icon, poll_action, price_display,
-        purchasable_plans, remaining_secs, validate_reason_key,
+        format_minor, is_subscription_plan, normalize_code, owned_price, owned_sort, payable,
+        plan_icon, poll_action, price_display, purchasable_plans, remaining_secs,
+        validate_reason_key,
     },
     errors::{ErrorContext, error_text},
     host::AccountHost,
@@ -235,6 +237,30 @@ impl PlanPurchaseDialog {
             .filter(|code| !code.is_empty())
     }
 
+    /// 生效中的周期会员卡（来自 agent 会话；`/me` 刷新会更新）。
+    fn active_subscription(&self, cx: &App) -> Option<CloudSubscription> {
+        self.host
+            .read(cx)
+            .controller
+            .session()
+            .and_then(|session| session.active_subscription.clone())
+    }
+
+    /// 某套餐的卡片状态（统一取会话里的当前套餐 / 会员卡）。
+    fn state_of_plan(&self, plan: &CloudPlan, cx: &App) -> CardState {
+        let current = self.current_plan_code(cx);
+        let owned = owned_price(&self.plans, current.as_deref());
+        let base_sort = owned_sort(&self.plans, current.as_deref());
+        card_state(
+            plan,
+            current.as_deref(),
+            owned,
+            self.credit_minor,
+            self.active_subscription(cx).as_ref(),
+            base_sort,
+        )
+    }
+
     fn device_id(&self, cx: &App) -> Option<String> {
         self.host
             .read(cx)
@@ -318,14 +344,7 @@ impl PlanPurchaseDialog {
 
     fn card_state_of(&self, code: &str, cx: &App) -> Option<CardState> {
         let plan = self.plans.iter().find(|plan| plan.code == code)?;
-        let current = self.current_plan_code(cx);
-        let owned = owned_price(&self.plans, current.as_deref());
-        Some(card_state(
-            plan,
-            current.as_deref(),
-            owned,
-            self.credit_minor,
-        ))
+        Some(self.state_of_plan(plan, cx))
     }
 
     fn select(&mut self, code: &str, cx: &mut Context<Self>) {
@@ -623,10 +642,32 @@ impl PlanPurchaseDialog {
                 self.render_empty(tokens, cx).into_any_element()
             }
             Catalog::Ready => {
-                let cards: Vec<_> = visible
-                    .iter()
-                    .map(|plan| self.render_plan_card(plan, tokens, cx).into_any_element())
-                    .collect();
+                let mut cards: Vec<gpui::AnyElement> = Vec::new();
+                let (periodic, lifetime): (Vec<&CloudPlan>, Vec<&CloudPlan>) =
+                    visible.iter().partition(|plan| is_subscription_plan(plan));
+                let grouped = !periodic.is_empty() && !lifetime.is_empty();
+                for (key, group) in [
+                    ("accountPurchaseGroupLifetime", lifetime),
+                    ("accountPurchaseGroupCards", periodic),
+                ] {
+                    if group.is_empty() {
+                        continue;
+                    }
+                    if grouped {
+                        cards.push(
+                            div()
+                                .w_full()
+                                .text_size(tokens.typography.xs.size)
+                                .line_height(tokens.typography.xs.line_height)
+                                .text_color(tokens.colors.muted_foreground)
+                                .child(self.text(key, cx))
+                                .into_any_element(),
+                        );
+                    }
+                    for plan in group {
+                        cards.push(self.render_plan_card(plan, tokens, cx).into_any_element());
+                    }
+                }
                 dialog_scroll_body(
                     "plan-list",
                     Some(max_height),
@@ -668,9 +709,17 @@ impl PlanPurchaseDialog {
             .as_ref()
             .and_then(|code| self.plans.iter().find(|plan| &plan.code == code))
         {
+            if self.state_of_plan(plan, cx) == CardState::Renewable {
+                buy_label = self.text("accountRenew", cx).to_string();
+            }
+            let credit = if is_subscription_plan(plan) {
+                0
+            } else {
+                self.credit_minor
+            };
             buy_label = format!(
                 "{buy_label} · {}",
-                format_minor(payable(plan, self.credit_minor), &plan.currency)
+                format_minor(payable(plan, credit), &plan.currency)
             );
         }
         h_flex()
@@ -819,9 +868,18 @@ impl PlanPurchaseDialog {
         let components = theme.components();
         let accent = tokens.colors.accent_foreground;
         let plan_color = parse_hex_color(&plan.color).unwrap_or(accent);
-        let current = self.current_plan_code(cx);
-        let owned = owned_price(&self.plans, current.as_deref());
-        let state = card_state(plan, current.as_deref(), owned, self.credit_minor);
+        let state = self.state_of_plan(plan, cx);
+        let subscription_conflict = is_subscription_plan(plan)
+            && state == CardState::TierBlocked
+            && self.active_subscription(cx).is_some();
+        let conflict_tip = self.text("errReasonSubscriptionConflict", cx);
+        let period_tag = plan.billing_period_days.map(|days| {
+            t_with(
+                self.host.read(cx).translator().read(cx),
+                "accountPeriodDays",
+                &[("days", &days.to_string())],
+            )
+        });
         let selectable = state.selectable();
         let selected = self.selected.as_deref() == Some(plan.code.as_str());
         let membership = self
@@ -844,7 +902,9 @@ impl PlanPurchaseDialog {
         let text_xs = tokens.typography.xs;
 
         let state_tag = match state {
-            CardState::Current => Some((self.text("accountPlanCurrent", cx), accent)),
+            CardState::Current | CardState::Renewable => {
+                Some((self.text("accountPlanCurrent", cx), accent))
+            }
             CardState::TierBlocked | CardState::CreditBlocked => Some((
                 self.text("accountPlanLowerTier", cx),
                 tokens.colors.muted_foreground,
@@ -1003,6 +1063,9 @@ impl PlanPurchaseDialog {
                 tokens.colors.surface
             })
             .when(!selectable, |this| this.opacity(BLOCKED_OPACITY))
+            .when(subscription_conflict, |this| {
+                this.tooltip(move |window, cx| tooltip_view(conflict_tip.clone(), window, cx))
+            })
             .when(selectable && !selected, |this| {
                 this.hover(move |style| style.bg(row_hover))
             })
@@ -1047,6 +1110,16 @@ impl PlanPurchaseDialog {
                                     .child(plan.name.clone()),
                             )
                             .when_some(badge, |this, badge| this.child(badge))
+                            .when_some(period_tag, |this, label| {
+                                this.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(extended.caption.size)
+                                        .line_height(extended.caption.line_height)
+                                        .text_color(tokens.colors.muted_foreground)
+                                        .child(label),
+                                )
+                            })
                             .when_some(state_tag, |this, (label, color)| {
                                 this.child(
                                     div()

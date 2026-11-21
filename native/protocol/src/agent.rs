@@ -131,6 +131,9 @@ pub struct CloudPlan {
     pub campaign: Option<CloudPlanCampaign>,
     #[serde(default = "default_true")]
     pub purchasable: bool,
+    /// 周期会员卡的周期天数；`None` = 永久套餐。
+    #[serde(default)]
+    pub billing_period_days: Option<u32>,
 }
 
 fn default_badge_style() -> String {
@@ -162,6 +165,22 @@ pub struct CloudProfile {
     pub current_plan: Option<CloudPlan>,
     #[serde(default)]
     pub purchase_credit_minor: i64,
+    /// 当前生效的周期会员卡；没有为 `None`。
+    #[serde(default)]
+    pub active_subscription: Option<CloudSubscription>,
+}
+
+/// 生效中的周期会员卡（手动续费；到期回到永久套餐权益）。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase", default)]
+pub struct CloudSubscription {
+    pub plan_code: String,
+    pub plan_name: String,
+    /// 开始时间（RFC 3339）。
+    pub starts_at: String,
+    /// 到期时间（RFC 3339）。
+    pub ends_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -276,6 +295,9 @@ pub struct AgentSessionDto {
     pub entitlements: Entitlements,
     pub current_plan: Option<CloudPlan>,
     pub device: CloudDevice,
+    /// 当前生效的周期会员卡；没有为 `None`。
+    #[serde(default)]
+    pub active_subscription: Option<CloudSubscription>,
 }
 
 /// 邮箱或设备验证步骤的无令牌元数据。
@@ -448,6 +470,28 @@ pub struct PluginFavoriteResultDto {
     pub plugin_id: String,
     pub favorited: bool,
     pub count: u64,
+}
+
+/// `agent.privatePlugin.list`：FluxCloud 私有商店中当前账号被授权的条目。
+///
+/// 未登录时不发任何云请求，返回 `signedIn:false` 与空列表；已登录但无授权同样是空列表。
+/// 条目复用 [`MarketEntryDto`]（`channel == "private"`，`mirrors` 恒空，`expiresAt` 为授权到期时间）。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PrivatePluginListDto {
+    pub signed_in: bool,
+    pub entries: Vec<crate::daemon::MarketEntryDto>,
+}
+
+/// `agent.privatePlugin.install`：`version` = 用户确认权限时看到的版本；云端当前可装版本不一致时
+/// 以 `marketVersionChanged` 拒绝，由客户端刷新目录后重新确认。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PrivatePluginInstallRequest {
+    pub plugin_id: String,
+    pub version: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -661,23 +705,62 @@ pub struct ShellStatusDto {
     pub global_shortcuts: crate::shortcuts::GlobalShortcutsStatusDto,
 }
 
-/// 完成后关机的调度状态（agent 拥有状态机与执行）。
+/// 定时电源操作：到点关机还是睡眠（挂起到内存）。
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum PowerAction {
+    #[default]
+    Shutdown,
+    Sleep,
+}
+
+/// Low-speed power actions always allow this many seconds to cancel before execution.
+pub const POWER_LOW_SPEED_WARNING_SECS: u64 = 30;
+
+/// Aggregate download speed must stay strictly below `threshold_bps` for `duration_secs`.
+/// Accepted ranges: 1..=1 GiB/s and 60..=86400 seconds.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PowerLowSpeedCondition {
+    pub threshold_bps: u64,
+    pub duration_secs: u64,
+}
+
+/// 定时关机 / 睡眠的调度状态（agent 拥有状态机与执行）。
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct PowerStatusDto {
     /// 已排定的延迟（秒）；`None` = 未启用。
     pub armed_delay_secs: Option<u64>,
-    /// 全部任务结束、真正开始倒计时后的剩余秒数；等待任务完成阶段为 `None`。
+    /// 全部任务结束（或排定时本就没有任务）、真正开始倒计时后的剩余秒数；等待任务完成阶段为 `None`。
     pub countdown_remaining_secs: Option<u64>,
+    /// 已排定的操作；未启用时为默认值（旧 agent 缺省 = 关机）。
+    #[serde(default)]
+    pub action: PowerAction,
+    /// `None` retains the completion-based trigger.
+    #[serde(default)]
+    pub low_speed: Option<PowerLowSpeedCondition>,
+    /// Continuous qualifying seconds; `None` while blocked, disconnected, or above the threshold.
+    #[serde(default)]
+    pub low_speed_elapsed_secs: Option<u64>,
 }
 
-/// `agent.power.arm` 参数：全部任务完成后再等待 `delay_secs` 秒关机（0 = 立即）。
+/// `agent.power.arm` 参数：没有任务时立即开始倒计时，否则全部任务完成后再等待 `delay_secs`
+/// 秒执行 `action`。`delay_secs = 0`（完成后立即）只在有任务时接受。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct PowerArmParams {
     pub delay_secs: u64,
+    /// 缺省 = 关机（旧客户端）。
+    #[serde(default)]
+    pub action: PowerAction,
+    /// When present, `delay_secs` is replaced by the fixed cancellable warning interval.
+    #[serde(default)]
+    pub low_speed: Option<PowerLowSpeedCondition>,
 }
 
 /// agent 配置同步状态投影。
@@ -951,6 +1034,9 @@ impl PendingCaptureDto {
 pub struct CaptureResolveParams {
     pub transaction_id: String,
     pub accepted: bool,
+    /// 即使目录等于捕获表单的预填分类目录，也显式禁用分类路由。
+    #[serde(default, skip_serializing_if = "crate::daemon::is_false")]
+    pub disable_category_route: bool,
     /// 确认时官方 UI 表单产出的建任务参数（`None` = 按捕获原请求建任务）。
     ///
     /// agent 以捕获原请求为底合并：`url` / `method` / `body` / `audioUrl` 恒取捕获值；
@@ -1046,6 +1132,18 @@ pub struct PlatformOpenPathParams {
     #[serde(default)]
     pub reveal: bool,
 }
+
+/// `agent.platform.copyTaskFiles` 参数：要写入系统剪贴板的任务（产物必须已在磁盘上）。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformCopyTaskFilesParams {
+    /// 非空；重复 id 只计一次，上限 [`PLATFORM_COPY_TASK_FILES_MAX`]。
+    pub task_ids: Vec<String>,
+}
+
+/// 一次 `agent.platform.copyTaskFiles` 最多写入的任务数（防止整表误选拖垮 daemon 逐个查询）。
+pub const PLATFORM_COPY_TASK_FILES_MAX: usize = 1000;
 
 /// 按文件（而非扩展名）取图标的扩展名（小写）：图标内嵌在文件自身里。其余类型的图标只由
 /// 扩展名关联决定，调用方按扩展名缓存即可。`.lnk` / `.url` 故意不在内：它们的图标路径可以
@@ -1475,6 +1573,9 @@ pub struct CategoryRouteDto {
     /// 「其他」分类的目录；空 = 不兜底。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub other_dir: String,
+    /// Visible builtin category identifiers mapped to configured save directories at submission.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub archive_categories: std::collections::BTreeMap<String, String>,
 }
 
 /// [`CategoryRouteDto`] 的单条普通分类规则。
@@ -1498,8 +1599,8 @@ pub struct CategoryRuleDto {
 }
 
 impl CategoryRouteDto {
-    /// 由分类列表（已按 `position` 排序）构建路由；没有任何分类配置目录时为 `None`。
-    /// 「其他」无目录时，未配置目录的普通分类不影响结果，直接省略。
+    /// 由分类列表（已按 `position` 排序）构建已授权路由；即使没有分类规则也返回空规则路由，
+    /// 以便宿主在默认保存目录任务上运行插件归档分类。
     #[must_use]
     pub fn from_categories(categories: &[CustomCategoryDto]) -> Option<Self> {
         let visible = || categories.iter().filter(|category| category.visible);
@@ -1520,12 +1621,22 @@ impl CategoryRouteDto {
                 save_dir: category.save_dir.trim().to_owned(),
             })
             .collect::<Vec<_>>();
-        let routes = !other_dir.is_empty() || rules.iter().any(|rule| !rule.save_dir.is_empty());
-        routes.then_some(Self { rules, other_dir })
+        let archive_categories = visible()
+            .filter_map(|category| {
+                let kind = category.builtin_type.as_deref()?;
+                let dir = category.save_dir.trim();
+                (kind != "all" && !dir.is_empty()).then(|| (kind.to_owned(), dir.to_owned()))
+            })
+            .collect();
+        Some(Self {
+            rules,
+            other_dir,
+            archive_categories,
+        })
     }
 
-    /// 由 `custom_categories` 偏好值（[`CUSTOM_CATEGORIES_PREF_KEY`] 对应的 JSON）构建路由；
-    /// 偏好缺失 / 无法解析 / 没有任何分类配置目录时为 `None`。
+    /// 由 `custom_categories` 偏好值构建路由；缺失或无法解析时也返回空规则路由，
+    /// 以授权默认保存目录任务使用插件归档分类。
     #[must_use]
     pub fn from_preference(value: Option<&serde_json::Value>) -> Option<Self> {
         Self::from_categories(&CustomCategoryDto::from_preference(value))
@@ -1584,6 +1695,7 @@ mod category_route_helper_tests {
                 save_dir: "/pictures".to_owned(),
             }],
             other_dir: "/other".to_owned(),
+            ..Default::default()
         }
     }
 
@@ -1613,7 +1725,10 @@ mod category_route_helper_tests {
 
     #[test]
     fn category_from_preference_reads_custom_categories_value() {
-        assert_eq!(CategoryRouteDto::from_preference(None), None);
+        assert_eq!(
+            CategoryRouteDto::from_preference(None),
+            Some(CategoryRouteDto::default())
+        );
         let mut categories = CustomCategoryDto::builtin_defaults();
         for category in &mut categories {
             if category.builtin_type.as_deref() == Some("other") {
@@ -1627,6 +1742,44 @@ mod category_route_helper_tests {
         assert_eq!(
             CategoryRouteDto::from_preference(Some(&as_text)),
             Some(route)
+        );
+    }
+    #[test]
+    fn archive_category_routes_follow_stable_type_not_display_name() {
+        let mut categories = CustomCategoryDto::builtin_defaults();
+        let image = categories
+            .iter_mut()
+            .find(|category| category.builtin_type.as_deref() == Some("image"))
+            .expect("image baseline");
+        image.name = "摄影收藏".to_owned();
+        image.save_dir = " /photos ".to_owned();
+        let route = CategoryRouteDto::from_categories(&categories).expect("route");
+        assert_eq!(
+            route.archive_categories.get("image").map(String::as_str),
+            Some("/photos")
+        );
+        let image = categories
+            .iter_mut()
+            .find(|category| category.builtin_type.as_deref() == Some("image"))
+            .expect("image baseline");
+        image.save_dir = "/new-photos".to_owned();
+        let updated = CategoryRouteDto::from_categories(&categories).expect("updated route");
+        assert_eq!(
+            updated.archive_categories.get("image").map(String::as_str),
+            Some("/new-photos")
+        );
+        assert_eq!(
+            route.archive_categories.get("image").map(String::as_str),
+            Some("/photos")
+        );
+        categories
+            .iter_mut()
+            .for_each(|category| category.visible = false);
+        assert!(
+            CategoryRouteDto::from_categories(&categories)
+                .expect("hidden route")
+                .archive_categories
+                .is_empty()
         );
     }
 }
@@ -1646,6 +1799,7 @@ mod capture_dto_tests {
         .expect("deserialize without request");
         assert_eq!(params.transaction_id, "tx-1");
         assert!(params.accepted);
+        assert!(!params.disable_category_route);
         assert!(params.request.is_none());
     }
 

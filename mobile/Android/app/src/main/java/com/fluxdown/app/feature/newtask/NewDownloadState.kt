@@ -95,16 +95,18 @@ internal class AdvancedState {
 internal class NewDownloadState(
     prefill: String,
     defaultSaveDir: String,
-    /** 表单首次给出的、未经分类预填的保存目录；随新建请求提交，由 Rust 按分类规则决定是否路由。 */
+    /** 表单首次给出的、未经分类预填的保存目录；仅自动路由时随请求提交。 */
     private val offeredSaveDir: String,
     defaultQueueId: String,
     defaultSegments: Int,
     /** 打开时预选的「下载到」目标（[DispatchTarget.id]）；null = 当前主机。 */
     private val initialTargetId: String? = null,
     categories: List<CustomCategoryDto> = emptyList(),
+    rememberedMode: String = "auto",
 ) {
     var urlText by mutableStateOf(prefill)
     var saveDir by mutableStateOf(defaultSaveDir)
+        private set
     var rename by mutableStateOf("")
     var queueId by mutableStateOf(defaultQueueId)
     var threadMode by mutableStateOf(
@@ -135,7 +137,9 @@ internal class NewDownloadState(
     val advanced = AdvancedState()
 
     private val initialSaveDir = defaultSaveDir
-    private var lastAuto: String? = null
+    /** 表单最近一次由程序写入目录框的值（自动跟随 / 切换模式）；null = 尚未写过。 */
+    private var lastWritten: String? = null
+    private var manuallySelectedSaveDir = false
 
     /** 分类选择模式；默认自动。 */
     var mode by mutableStateOf<SaveDirMode>(SaveDirMode.Auto)
@@ -164,7 +168,7 @@ internal class NewDownloadState(
 
     /** 有未提交内容：关闭前需要确认。 */
     val isDirty: Boolean
-        get() = urlText.isNotBlank() || rename.isNotBlank() || (saveDir != initialSaveDir && saveDir != lastAuto) ||
+        get() = urlText.isNotBlank() || rename.isNotBlank() || (saveDir != initialSaveDir && saveDir != lastWritten) ||
             mode != SaveDirMode.Auto || queueId != initialQueueId ||
             targetId != initialTargetId || remoteSaveDir.isNotBlank() ||
             advanced.modified(single = true, singleHttp = true).isNotEmpty()
@@ -209,11 +213,28 @@ internal class NewDownloadState(
     private val external = HashMap<String, ExternalDownload>()
     private var primaryUrl: String? = null
 
-    /** 分类选择器可选项：可见、非「全部」、已配置目录的分类（按 position）；空 = 不显示选择器。 */
+    /** 分类选择器可选项：可见、非「全部」、已配置目录的分类（按 position）；空列表仍提供自动 / 不分类。 */
     val categoryOptions: List<CustomCategoryDto> =
         categories.filter { it.visible && !it.isAll && it.saveDir.trim().isNotEmpty() }
             .map { it.copy(saveDir = it.saveDir.trim()) }
             .sortedBy { it.position }
+
+    // 必须位于 categoryOptions 之后：Kotlin 按声明顺序初始化，提前读会拿到 null。
+    init {
+        mode = restoreMode(rememberedMode, categoryOptions)
+        when (val restored = mode) {
+            SaveDirMode.Auto -> Unit
+            SaveDirMode.None -> {
+                saveDir = offeredSaveDir
+                lastWritten = offeredSaveDir.trim()
+            }
+            is SaveDirMode.Category -> {
+                val dir = categoryOptions.first { it.id == restored.id }.saveDir
+                saveDir = dir
+                lastWritten = dir
+            }
+        }
+    }
 
     /** 预测目录：重命名（仅单条）> 第一条链接已识别的文件名 > 空串（交给 URL 末段回退）。 */
     fun predictedDir(): String? {
@@ -228,34 +249,56 @@ internal class NewDownloadState(
         val dir = predictedDir() ?: return null
         return categoryOptions.firstOrNull { it.saveDir == dir }
     }
+    fun rememberedMode(): String = when (val selected = mode) {
+        SaveDirMode.Auto -> "auto"
+        SaveDirMode.None -> "none"
+        is SaveDirMode.Category -> "category:${selected.id}"
+    }
+
+    /** 目录框未被手改：为空 / 等于最近一次程序写入值；尚未写过则等于 offered。 */
+    private fun untouched(): Boolean {
+        val current = saveDir.trim()
+        if (current.isEmpty()) return true
+        val written = lastWritten?.takeIf { it.isNotEmpty() }
+        return current == (written ?: offeredSaveDir.trim())
+    }
 
     /**
-     * 自动模式下按预测目录改写目录框：当前值为空 / 等于 offered / 等于上次自动写入值才覆盖（用户手改后不再覆盖）；
+     * 自动模式下按预测目录改写目录框：仅目录框未被手改（[untouched]）才覆盖；
      * [force] = 从其他模式切回时无条件重算。
      */
     fun syncAuto(force: Boolean = false) {
-        if (mode != SaveDirMode.Auto || categoryOptions.isEmpty()) return
-        val current = saveDir.trim()
-        if (!force && current.isNotEmpty() && current != offeredSaveDir && current != lastAuto) return
-        val target = predictedDir() ?: offeredSaveDir
+        if (mode != SaveDirMode.Auto || manuallySelectedSaveDir || categoryOptions.isEmpty()) return
+        if (!force && !untouched()) return
+        val target = predictedDir() ?: offeredSaveDir.trim()
         if (saveDir != target) saveDir = target
-        lastAuto = target
+        lastWritten = target
     }
+
+    /** 保存目录由用户键入或浏览选择；其值不再被自动预测覆盖，也不触发自动分类路由。 */
+    fun setSaveDirManually(dir: String) {
+        saveDir = dir
+        manuallySelectedSaveDir = true
+    }
+
 
     fun selectMode(next: SaveDirMode) {
         when (next) {
             SaveDirMode.Auto -> {
+                manuallySelectedSaveDir = false
                 mode = next
                 syncAuto(force = true)
             }
             SaveDirMode.None -> {
                 mode = next
                 saveDir = offeredSaveDir
+                lastWritten = offeredSaveDir.trim()
             }
             is SaveDirMode.Category -> {
                 val dir = categoryOptions.firstOrNull { it.id == next.id }?.saveDir ?: return
                 mode = next
                 saveDir = dir
+                lastWritten = dir
             }
         }
     }
@@ -322,7 +365,8 @@ internal class NewDownloadState(
                 httpUser = if (authOk) adv.httpUser.trim() else "",
                 httpPassword = if (authOk) adv.httpPassword else "",
                 saveSiteAuth = authOk && adv.saveSiteAuth,
-                offeredSaveDir = offeredSaveDir.takeIf { mode == SaveDirMode.Auto },
+                // 仅自动且未显式手动选择目录时交给 Rust 路由；手动选择包括等于默认目录。
+                offeredSaveDir = offeredSaveDir.takeIf { mode == SaveDirMode.Auto && !manuallySelectedSaveDir && untouched() }
             )
         }
     }
@@ -331,7 +375,16 @@ internal class NewDownloadState(
     fun keepOnly(urls: Set<String>) = retain(entries.filter { it.url in urls })
 
     companion object {
+        fun restoreMode(value: String, options: List<CustomCategoryDto>): SaveDirMode = when {
+            value == "none" -> SaveDirMode.None
+            value.startsWith("category:") -> {
+                val id = value.removePrefix("category:")
+                if (options.any { it.id == id }) SaveDirMode.Category(id) else SaveDirMode.Auto
+            }
+            else -> SaveDirMode.Auto
+        }
         private const val USER_AGENT = "User-Agent"
+        const val LAST_CATEGORY_MODE_KEY = "download.last_category_mode"
 
         /**
          * [external] 非空 = 外部唤起：链接与请求上下文按 [addExternal] 规则预填；保存目录由「自动」分类模式按文件名
@@ -342,6 +395,7 @@ internal class NewDownloadState(
             state: HostState,
             external: ExternalDownload? = null,
             targetId: String? = null,
+            rememberedMode: String = state.preferences.string(LAST_CATEGORY_MODE_KEY, "auto"),
         ): NewDownloadState {
             val cfg = state.config
             val offered = cfg["default_save_dir"].orEmpty().trim()
@@ -353,6 +407,7 @@ internal class NewDownloadState(
                 defaultSegments = cfg["default_segments"]?.toIntOrNull() ?: 0,
                 initialTargetId = targetId,
                 categories = CustomCategoryDto.fromPreference(state.preferences[CustomCategoryDto.PREFERENCE_KEY]),
+                rememberedMode = rememberedMode,
             ).also { form ->
                 external?.let(form::addExternal)
                 form.syncAuto()

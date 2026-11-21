@@ -1,6 +1,6 @@
 //! 关于：版本、软件更新、日志导出、浏览器扩展与捐赠链接。
 
-use fluxdown_protocol::{ReleaseNoteDto, method};
+use fluxdown_protocol::{ReleaseNoteDto, UpdateInstallKind, UpdatePhase, method};
 use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, loading_button};
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -21,10 +21,12 @@ const CHROME_STORE: &str = "https://chromewebstore.google.com/search/FluxDown";
 const FIREFOX_STORE: &str = "https://addons.mozilla.org/firefox/addon/fluxdown/";
 const EDGE_STORE: &str = "https://microsoftedge.microsoft.com/addons/search/FluxDown";
 const DONATE: &str = "https://fluxdown.com/sponsor";
+const DB_IP: &str = "https://db-ip.com";
+const FLAG_ICONS: &str = "https://github.com/lipis/flag-icons";
 /// 更新说明正文的行高（字号倍数）：多行列表项与中文长句比控件文字需要更宽松的行距。
 const RELEASE_NOTES_LINE_HEIGHT: f32 = 1.6;
 
-pub(crate) fn page(ctx: &SectionContext, _cx: &mut App) -> SettingsPage {
+pub(crate) fn page(ctx: &SectionContext, cx: &mut App) -> SettingsPage {
     SettingsPage::new(
         "about",
         ctx.t("settingsCatAbout"),
@@ -33,21 +35,48 @@ pub(crate) fn page(ctx: &SectionContext, _cx: &mut App) -> SettingsPage {
     )
     .sections([
         version_section(ctx),
-        update_section(ctx),
+        update_section(ctx, cx),
         logs_section(ctx),
         links_section(ctx),
+        open_source_section(ctx),
     ])
 }
 
 fn version_section(ctx: &SectionContext) -> SettingsSection {
     let version = SharedString::from(format!("v{APP_VERSION}"));
     let protocol = SharedString::from(fluxdown_protocol::PROTOCOL_VERSION.to_string());
+    let store = ctx.store();
+    let translator = ctx.translator.clone();
+    let copy = ctx.t("copyDiagnosticInfo");
     SettingsSection::new()
         .title(SharedString::from("FluxDown"))
         .row(ctx.item(
             "currentVersion",
             None,
-            Control::custom(move |_, _, _, cx: &mut App| body_text(cx).child(version.clone())),
+            Control::custom(move |_, _, _, cx: &mut App| {
+                let store = store.clone();
+                let translator = translator.clone();
+                h_flex()
+                    .gap(active_theme(cx).tokens().spacing.sm)
+                    .items_center()
+                    .child(body_text(cx).child(version.clone()))
+                    .child(
+                        button(
+                            "about-copy-diagnostics",
+                            copy.clone(),
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .on_click(move |_, window, cx| {
+                            crate::version_button::copy_diagnostics(
+                                &store,
+                                &translator,
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
+            }),
         ))
         .row(ctx.item(
             "protocolVersionLabel",
@@ -56,7 +85,7 @@ fn version_section(ctx: &SectionContext) -> SettingsSection {
         ))
 }
 
-fn update_section(ctx: &SectionContext) -> SettingsSection {
+fn update_section(ctx: &SectionContext, cx: &App) -> SettingsSection {
     let channels = vec![
         (SharedString::from("stable"), ctx.t("updateChannelStable")),
         (
@@ -64,7 +93,17 @@ fn update_section(ctx: &SectionContext) -> SettingsSection {
             ctx.t("updateChannelFrontier"),
         ),
     ];
-    SettingsSection::new()
+    let store = ctx.store.read(cx);
+    let silent_supported = matches!(
+        store.update_status().install_kind,
+        UpdateInstallKind::WindowsSetup
+            | UpdateInstallKind::WindowsPortable
+            | UpdateInstallKind::MacosApp
+            | UpdateInstallKind::LinuxAppImage
+            | UpdateInstallKind::LinuxPortable
+    );
+    let auto_check = store.pref_bool("general.auto_check_update", true);
+    let mut section = SettingsSection::new()
         .title(ctx.t("softwareUpdate"))
         .row(ctx.item(
             "updateChannel",
@@ -75,7 +114,18 @@ fn update_section(ctx: &SectionContext) -> SettingsSection {
             "autoCheckUpdate",
             Some("autoCheckUpdateBackgroundDesc"),
             ctx.pref_switch("general.auto_check_update", true),
-        ))
+        ));
+    if silent_supported {
+        section = section.row(
+            ctx.item(
+                "silentAutoUpdate",
+                Some("silentAutoUpdateDesc"),
+                ctx.pref_switch("general.silent_auto_update", false),
+            )
+            .disabled(!auto_check),
+        );
+    }
+    section
         .row(ctx.item(
             "checkUpdate",
             Some("checkUpdateDesc"),
@@ -89,7 +139,7 @@ fn check_update_control(ctx: &SectionContext) -> Control {
     let translator = ctx.translator.clone();
     Control::custom(move |disabled, _key, _window, cx: &mut App| {
         let tokens = active_theme(cx).tokens();
-        let (status, checking, installing, cancelling) = {
+        let (status, busy_checking, installing, cancelling) = {
             let store = store.read(cx);
             (
                 store.update_status().clone(),
@@ -98,8 +148,10 @@ fn check_update_control(ctx: &SectionContext) -> Control {
                 store.is_busy("updateCancel"),
             )
         };
+        // 后台自动检查也让按钮转圈；「检查中」状态行由按钮 loading 承担，不再单独显示。
+        let checking = busy_checking || status.phase == UpdatePhase::Checking;
         let lines: Vec<SharedString> = [
-            update_view::status_line(&status),
+            update_view::status_line(&status).filter(|_| status.phase != UpdatePhase::Checking),
             update_view::manual_line(&status),
         ]
         .into_iter()
@@ -437,6 +489,23 @@ fn links_section(ctx: &SectionContext) -> SettingsSection {
             ctx,
             "donateTitle",
             &[("donateButton", DONATE), ("officialWebsite", WEBSITE)],
+        ))
+}
+
+/// 第三方数据 / 素材署名：对端国家来自 DB-IP lite（CC BY 4.0，要求署名并链接），旗帜为 flag-icons（MIT）。
+/// 两者都是专有名词署名行，按原文显示，不走翻译（`link_item` 对非目录键回落为键名本身）。
+fn open_source_section(ctx: &SectionContext) -> SettingsSection {
+    SettingsSection::new()
+        .title(ctx.t("mobileOpenSource"))
+        .row(link_item(
+            ctx,
+            "IP Geolocation by DB-IP",
+            &[("db-ip.com", DB_IP)],
+        ))
+        .row(link_item(
+            ctx,
+            "flag-icons (MIT)",
+            &[("GitHub", FLAG_ICONS)],
         ))
 }
 

@@ -7,13 +7,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fluxdown_protocol::{
-    AgentEvent, AgentPreferencesDto, AgentSnapshot, ApplicationErrorCode, ComponentStatusDto,
+    AgentEvent, AgentPreferencesDto, AgentSnapshot, ApplicationErrorCode,
+    BtGuardFilterSourcesRefreshDto, BtGuardStateDto, BtPortStatusDto, ComponentStatusDto,
     ConnPolicySummaryDto, DaemonConfigPatch, DaemonConfigSnapshot, DaemonEvent,
     DiagnosticsReportDto, ErrorReason, GatewayPatchParams, GatewayStatusDto,
     PlatformIntegrationDto, PluginDto, QueueDto, RpcErrorData, ServiceEvent, SettingOwner,
     ShellStatusDto, SiteAuthEntryDto, SyncStatusDto, SystemProxyDto, UpdateStatusDto,
     WebhookDeliveryDto, method, setting_spec, setting_value_kind, value_to_daemon_config,
 };
+use fluxdown_ui_components::BusyHold;
 use gpui::{Context, SharedString};
 use serde_json::{Value, json};
 
@@ -27,10 +29,18 @@ pub(crate) use cloud_notify::CloudDeliveryLog;
 
 /// 本地编辑到写回 RPC 的合并窗口。
 const FLUSH_DEBOUNCE: Duration = Duration::from_millis(250);
+/// `load_attempts` 里防吸血总览的加载闸门（渲染期按需加载，`BtGuardChanged` 后重新放行）。
+pub(crate) const BT_GUARD_STATE_LOAD: &str = "btGuardState";
+/// 端口映射状态轮询的在途标记（`busy` 集合里的动作名）。
+const BT_PORT_STATUS_ACTION: &str = "btPortStatus";
 /// daemon 修订冲突时的自动重试上限。
 const MAX_CONFLICT_RETRIES: u8 = 3;
 /// Doctor 上一次修复结果（`{key, ok}`，`key` 为 i18n 键）在 `transient` 里的键。
 pub(crate) const DOCTOR_REPAIR_OUTCOME: &str = "doctor_repair_outcome";
+/// 代理页「手动配置」分组是否已展开（`transient` 键，`true` = 展开）；离开代理页即清除。
+pub(crate) const PROXY_MANUAL_EXPANDED: &str = "proxy_manual_expanded";
+/// 只属于某个分类页的视图状态：切换分类时全部清除，下次进入恢复默认。
+const PAGE_VIEW_STATE: &[&str] = &[PROXY_MANUAL_EXPANDED];
 
 /// 设置写回失败的 UI 可展示分类。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,9 +148,18 @@ pub struct SettingsStore {
     site_auth: Vec<SiteAuthEntryDto>,
     conn_policy: Option<ConnPolicySummaryDto>,
     system_proxy: Option<SystemProxyDto>,
+    /// BT 端口映射实况（`daemon.bt.portStatus`）；BT「连接」页签可见时由视图轮询，失败保留旧值。
+    bt_port_status: Option<BtPortStatusDto>,
     update: UpdateStatusDto,
+    /// BT 防吸血总览（`daemon.bt.guard.state`）；按需加载，`BtGuardChanged` 后重新放行加载。
+    bt_guard: Option<BtGuardStateDto>,
+    /// 每收到一次 `BtGuardChanged` +1：条目 / 事件面板据此重新拉取。
+    bt_guard_revision: u64,
+    /// 真正在途的动作；内部去重 / 自动加载闸门只看它（[`Self::in_flight`]）。
     busy: BTreeSet<&'static str>,
-    /// 同一 `action` 下具体是哪个按钮发起的（如某条修复 / 某个站点）；随 `action` 完成清除。
+    /// 每个动作的最短可见「进行中」：本机 RPC 常在一帧内返回，没有它按钮转圈根本画不出来。
+    busy_holds: BTreeMap<&'static str, BusyHold>,
+    /// 同一 `action` 下具体是哪个按钮发起的（如某条修复 / 某个站点）；下次同 `action` 发起时清除。
     busy_tags: BTreeMap<&'static str, SharedString>,
     last_error: Option<SettingsError>,
     /// 最近一次动作的成功提示（i18n 键）。
@@ -191,8 +210,12 @@ impl SettingsStore {
             site_auth: Vec::new(),
             conn_policy: None,
             system_proxy: None,
+            bt_port_status: None,
             update: UpdateStatusDto::default(),
+            bt_guard: None,
+            bt_guard_revision: 0,
             busy: BTreeSet::new(),
+            busy_holds: BTreeMap::new(),
             busy_tags: BTreeMap::new(),
             last_error: None,
             last_notice: None,
@@ -224,6 +247,21 @@ impl SettingsStore {
         self.daemon_connected = snapshot.daemon_connected;
         self.overlay_local_edits();
         self.last_error = None;
+        cx.notify();
+    }
+
+    /// Ingest the authoritative result of a direct revision-checked config patch.
+    pub(crate) fn absorb_daemon_snapshot(
+        &mut self,
+        snapshot: DaemonConfigSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        if snapshot.revision < self.daemon.revision {
+            return;
+        }
+        self.daemon = snapshot;
+        self.refresh_daemon_baselines();
+        self.overlay_local_edits();
         cx.notify();
     }
 
@@ -261,6 +299,10 @@ impl SettingsStore {
             }
             AgentEvent::Daemon(DaemonEvent::PluginsChanged(plugins)) => {
                 self.plugins.clone_from(plugins)
+            }
+            AgentEvent::Daemon(DaemonEvent::BtGuardChanged) => {
+                self.bt_guard_revision = self.bt_guard_revision.wrapping_add(1);
+                self.load_attempts.remove(BT_GUARD_STATE_LOAD);
             }
             AgentEvent::Daemon(DaemonEvent::ComponentsChanged(components)) => {
                 self.components.clone_from(components)
@@ -516,6 +558,10 @@ impl SettingsStore {
         self.system_proxy.as_ref()
     }
     #[must_use]
+    pub fn bt_port_status(&self) -> Option<&BtPortStatusDto> {
+        self.bt_port_status.as_ref()
+    }
+    #[must_use]
     pub fn update_status(&self) -> &UpdateStatusDto {
         &self.update
     }
@@ -533,8 +579,8 @@ impl SettingsStore {
     #[must_use]
     pub fn should_reveal_gateway_token(&self) -> bool {
         !self.stale
-            && !self.is_busy("gateway")
-            && !self.is_busy("gatewayToken")
+            && !self.in_flight("gateway")
+            && !self.in_flight("gatewayToken")
             && (self.gateway_token_stale
                 || (!self.transient.contains_key("gateway_user_token")
                     && !self.load_attempts.contains("gatewayToken")))
@@ -556,25 +602,37 @@ impl SettingsStore {
         self.transient.insert(key, value);
         cx.notify();
     }
+    /// 渲染用的「进行中」：在途，或仍在最短可见期内（见 [`BusyHold`]）。
     #[must_use]
     pub fn is_busy(&self, action: &str) -> bool {
+        self.in_flight(action) || self.busy_holds.get(action).is_some_and(BusyHold::is_held)
+    }
+    /// 请求是否真正在途：去重、自动加载等逻辑闸门用它，不受最短可见期影响。
+    #[must_use]
+    pub fn in_flight(&self, action: &str) -> bool {
         self.busy.contains(action)
     }
     /// `action` 进行中且由 `tag` 标记的按钮发起。
     #[must_use]
     pub fn is_busy_tagged(&self, action: &str, tag: &str) -> bool {
-        self.busy.contains(action) && self.busy_tags.get(action).is_some_and(|t| t == tag)
+        self.is_busy(action) && self.busy_tags.get(action).is_some_and(|t| t == tag)
     }
     /// `action` 进行中且未打标签（区分同一 action 下其他按钮发起的调用）。
     #[must_use]
     pub fn is_busy_untagged(&self, action: &str) -> bool {
-        self.busy.contains(action) && !self.busy_tags.contains_key(action)
+        self.is_busy(action) && !self.busy_tags.contains_key(action)
     }
     /// 给刚发起的 `action` 打上发起者标签，供对应按钮显示 loading；`action` 未在进行中则忽略。
     pub fn tag_busy(&mut self, action: &'static str, tag: impl Into<SharedString>) {
         if self.busy.contains(action) {
             self.busy_tags.insert(action, tag.into());
         }
+    }
+    /// 标记 `action` 开始：在途 + 最短可见期计时，并清掉上一次的发起者标签。
+    fn begin_busy(&mut self, action: &'static str, cx: &mut Context<Self>) {
+        self.busy.insert(action);
+        self.busy_tags.remove(action);
+        self.busy_holds.entry(action).or_default().start(cx);
     }
     #[must_use]
     pub fn last_error(&self) -> Option<&SettingsError> {
@@ -704,6 +762,11 @@ impl SettingsStore {
     pub fn pref_f64(&self, key: &str, default: f64) -> f64 {
         self.pref(key).and_then(Value::as_f64).unwrap_or(default)
     }
+    /// Whether a preference mutation is still queued or awaiting its agent acknowledgement.
+    #[must_use]
+    pub fn preference_pending(&self, key: &str) -> bool {
+        self.pending_prefs.contains_key(key) || self.inflight_prefs.contains_key(key)
+    }
 
     /// 写入偏好。云同步目录内的键自动进入同步；其余键为设备本地。
     /// `Value::Null` 是墓碑：agent 移除该偏好（同步键把删除同步给云端），不做值校验。
@@ -754,7 +817,7 @@ impl SettingsStore {
     // ───────────────────────── 网关 ─────────────────────────
 
     pub fn patch_gateway(&mut self, patch: GatewayPatchParams, cx: &mut Context<Self>) {
-        if self.is_busy("gateway") {
+        if self.in_flight("gateway") {
             return;
         }
         if self.stale {
@@ -825,8 +888,7 @@ impl SettingsStore {
             self.set_error(SettingsErrorKind::Disconnected, "", cx);
             return;
         }
-        self.busy.insert(action);
-        self.busy_tags.remove(action);
+        self.begin_busy(action, cx);
         self.last_error = None;
         self.last_notice = None;
         cx.notify();
@@ -851,8 +913,8 @@ impl SettingsStore {
             let result = future.await;
 
             let Ok(()) = this.update(cx, |this, cx| {
+                // 标签保留到最短可见期结束（下次发起时清除），转圈仍落在发起的那个按钮上。
                 this.busy.remove(action);
-                this.busy_tags.remove(action);
                 if let Err(error) = &result {
                     this.last_error = Some(SettingsError {
                         kind: SettingsErrorKind::from_rpc(error),
@@ -984,6 +1046,16 @@ impl SettingsStore {
         }
     }
 
+    /// 切换分类时清除页面级视图状态（见 [`PAGE_VIEW_STATE`]）。
+    pub fn clear_page_view_state(&mut self, cx: &mut Context<Self>) {
+        let before = self.transient.len();
+        self.transient
+            .retain(|key, _| !PAGE_VIEW_STATE.contains(key));
+        if self.transient.len() != before {
+            cx.notify();
+        }
+    }
+
     pub fn load_site_auth(&mut self, cx: &mut Context<Self>) {
         self.call_with(
             "siteAuth",
@@ -1017,6 +1089,77 @@ impl SettingsStore {
         {
             self.site_auth = entries;
         }
+    }
+
+    // ───────────────────────── BT 防吸血 ─────────────────────────
+
+    #[must_use]
+    pub fn bt_guard_state(&self) -> Option<&BtGuardStateDto> {
+        self.bt_guard.as_ref()
+    }
+    #[must_use]
+    pub fn bt_guard_revision(&self) -> u64 {
+        self.bt_guard_revision
+    }
+    /// 本地动作（添加 / 解除 / 加白）成功后立即通知条目 / 事件面板与总览刷新，不依赖事件回流。
+    pub fn bump_bt_guard_revision(&mut self, cx: &mut Context<Self>) {
+        self.bt_guard_revision = self.bt_guard_revision.wrapping_add(1);
+        self.load_attempts.remove(BT_GUARD_STATE_LOAD);
+        cx.notify();
+    }
+    pub fn load_bt_guard_state(&mut self, cx: &mut Context<Self>) {
+        self.load_attempts.insert(BT_GUARD_STATE_LOAD);
+        self.call_with(
+            "btGuardState",
+            method::DAEMON_BT_GUARD_STATE,
+            json!({}),
+            cx,
+            Self::absorb_bt_guard_state,
+        );
+    }
+    /// 「重新加载」：重读总览，并请求检查云名单更新（拉到新名单后经 `BtGuardChanged` 再次重读）。
+    pub fn reload_bt_guard(&mut self, cx: &mut Context<Self>) {
+        self.load_bt_guard_state(cx);
+        self.call_with(
+            "btGuardCloudRefresh",
+            method::DAEMON_BT_GUARD_CLOUD_REFRESH,
+            json!({}),
+            cx,
+            |_, _, _| {},
+        );
+    }
+    fn absorb_bt_guard_state(
+        &mut self,
+        result: Result<Value, RpcErrorData>,
+        cx: &mut Context<Self>,
+    ) {
+        // RPC 失败已由 `call_with` 记入 `last_error`；闸门保持置位，避免渲染期反复重发，
+        // 由「重新加载」按钮或 `BtGuardChanged` 重新放行。
+        let Ok(value) = result else { return };
+        match decode_wire::<BtGuardStateDto>(value) {
+            Some(state) => self.bt_guard = Some(state),
+            None => self.set_error(SettingsErrorKind::Failed, "", cx),
+        }
+    }
+    /// 立即刷新过滤文件订阅（慢方法：会拉取网络）；结果里的订阅状态直接并入总览。
+    pub fn refresh_bt_guard_filter_sources(&mut self, cx: &mut Context<Self>) {
+        self.call_with(
+            "btGuardFilterRefresh",
+            method::DAEMON_BT_GUARD_FILTER_SOURCES_REFRESH,
+            json!({}),
+            cx,
+            |this, result, cx| {
+                let Ok(value) = result else { return };
+                match decode_wire::<BtGuardFilterSourcesRefreshDto>(value) {
+                    Some(refreshed) => {
+                        if let Some(state) = &mut this.bt_guard {
+                            state.filter_sources = refreshed.sources;
+                        }
+                    }
+                    None => this.set_error(SettingsErrorKind::Failed, "", cx),
+                }
+            },
+        );
     }
 
     pub fn load_conn_policy(&mut self, cx: &mut Context<Self>) {
@@ -1066,11 +1209,55 @@ impl SettingsStore {
         }
     }
 
+    /// 端口映射状态轮询：不走 `call_with`——每 5 秒一次的后台刷新不能清掉 / 改写页面上的
+    /// 错误与提示横幅。上一轮仍在途则跳过；失败（含旧 daemon 无此方法）保留旧快照。
+    pub fn load_bt_port_status(&mut self, cx: &mut Context<Self>) {
+        if self.stale || self.in_flight(BT_PORT_STATUS_ACTION) {
+            return;
+        }
+        self.busy.insert(BT_PORT_STATUS_ACTION);
+        let future = self.port.call(method::DAEMON_BT_PORT_STATUS, json!({}));
+        cx.spawn(async move |this, cx| {
+            let result = future.await;
+            let Ok(()) = this.update(cx, |this, cx| {
+                this.busy.remove(BT_PORT_STATUS_ACTION);
+                this.absorb_bt_port_status(result, cx);
+            }) else {
+                // 设置视图或窗口已释放，结束回调，不再更新状态。
+                return;
+            };
+        })
+        .detach();
+    }
+    fn absorb_bt_port_status(
+        &mut self,
+        result: Result<Value, RpcErrorData>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Ok(value) = result
+            && let Ok(dto) = serde_json::from_value::<BtPortStatusDto>(value)
+            && self.bt_port_status.as_ref() != Some(&dto)
+        {
+            self.bt_port_status = Some(dto);
+            cx.notify();
+        }
+    }
+
     pub fn check_update(&mut self, channel: Option<String>, cx: &mut Context<Self>) {
         self.call_update(
             "update",
             method::AGENT_UPDATE_CHECK,
             json!({ "channel": channel }),
+            cx,
+        );
+    }
+
+    /// 后台下载并校验更新包（不安装）；就绪后由用户点「重启以更新」安装。
+    pub fn download_update(&mut self, cx: &mut Context<Self>) {
+        self.call_update(
+            "updateDownload",
+            method::AGENT_UPDATE_DOWNLOAD,
+            json!({}),
             cx,
         );
     }
@@ -1270,6 +1457,11 @@ impl SettingsStore {
 /// 窗口边界、侧栏设备区显隐等设备本地键一律 `sync:false`。
 fn preference_is_synced(key: &str) -> bool {
     setting_spec(key).is_some_and(|spec| spec.owner != SettingOwner::Excluded)
+}
+
+/// 解码 daemon 响应；形状不符返回 `None`（调用方据此显示错误，不得静默吞掉）。
+fn decode_wire<T: serde::de::DeserializeOwned>(value: Value) -> Option<T> {
+    serde_json::from_value(value).ok()
 }
 
 /// daemon wire 字符串 → 云同步目录键的 JSON 值。
@@ -1506,5 +1698,17 @@ mod tests {
         assert!(preference_is_synced("appearance.theme_mode"));
         assert!(preference_is_synced("bt.enable_dht"));
         assert!(preference_is_synced("custom_categories"));
+    }
+
+    #[test]
+    fn malformed_guard_state_is_detected_not_swallowed() {
+        use super::decode_wire;
+        assert!(decode_wire::<fluxdown_protocol::BtGuardStateDto>(json!("nope")).is_none());
+        assert!(
+            decode_wire::<fluxdown_protocol::BtGuardStateDto>(json!({"enabled": "x"})).is_none()
+        );
+        assert!(
+            decode_wire::<fluxdown_protocol::BtGuardFilterSourcesRefreshDto>(json!([1])).is_none()
+        );
     }
 }

@@ -69,7 +69,7 @@ const routeTree = rootRoute.addChildren([
     downloadsRoute,
     rssRoute,
     webhooksRoute,
-    pluginViewRoute,
+      pluginViewRoute,
     settingsRoute.addChildren([settingsIndexRoute, settingsCategoryRoute]),
   ]),
 ])

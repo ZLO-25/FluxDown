@@ -21,6 +21,7 @@ fn task_dto_json_carries_referrer() -> Result<(), serde_json::Error> {
         ignore_tls_errors: false,
         file_missing: false,
         completed_at: String::new(),
+        file_hash: String::new(),
         segments: 0,
         queue_order: 0,
         uploaded_bytes: 0,
@@ -33,19 +34,29 @@ fn task_dto_json_carries_referrer() -> Result<(), serde_json::Error> {
         seed_time_limit_minutes: -2,
         seed_inactive_time_limit_minutes: -2,
         seed_upload_limit_bps: 2048,
+        bt_sequential: true,
+        bt_first_last_pieces_first: false,
+        bt_download_limit_bps: 4096,
+        bt_super_seeding: true,
         referrer: "https://example.com/page".to_owned(),
         group_id: String::new(),
         rss_source_id: String::new(),
         origin_url: String::new(),
         auto_route: String::new(),
         source_bytes: SourceBytes::default(),
+        properties: Default::default(),
     };
     let dto = fluxdown_engine_protocol::task_info_to_dto(info);
     assert_eq!(dto.referrer, "https://example.com/page");
     assert_eq!(dto.seed_upload_limit_bps, 2048);
+    assert!(dto.bt_sequential && !dto.bt_first_last_pieces_first);
     let json = serde_json::to_string(&dto)?;
     assert!(json.contains(r#""referrer":"https://example.com/page""#));
     assert!(json.contains(r#""seedUploadLimitBps":2048"#));
+    assert!(json.contains(r#""btSequential":true"#));
+    assert!(!json.contains("btFirstLastPiecesFirst"));
+    assert!(json.contains(r#""btDownloadLimitBps":4096"#));
+    assert!(json.contains(r#""btSuperSeeding":true"#));
     Ok(())
 }
 
@@ -67,6 +78,7 @@ fn task_dto_json_carries_persisted_source_bytes() -> Result<(), serde_json::Erro
         ignore_tls_errors: false,
         file_missing: false,
         completed_at: String::new(),
+        file_hash: String::new(),
         segments: 0,
         queue_order: 0,
         uploaded_bytes: 0,
@@ -79,6 +91,10 @@ fn task_dto_json_carries_persisted_source_bytes() -> Result<(), serde_json::Erro
         seed_time_limit_minutes: -2,
         seed_inactive_time_limit_minutes: -2,
         seed_upload_limit_bps: 0,
+        bt_sequential: false,
+        bt_first_last_pieces_first: false,
+        bt_download_limit_bps: 0,
+        bt_super_seeding: false,
         referrer: String::new(),
         group_id: String::new(),
         rss_source_id: String::new(),
@@ -89,6 +105,7 @@ fn task_dto_json_carries_persisted_source_bytes() -> Result<(), serde_json::Erro
             proxy: 200,
             nic: 30,
         },
+        properties: Default::default(),
     };
     let dto = fluxdown_engine_protocol::task_info_to_dto(info);
     assert_eq!(

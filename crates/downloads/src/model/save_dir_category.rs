@@ -35,6 +35,53 @@ pub(crate) enum CategoryMode {
     Category(String),
 }
 
+/// Loads the persisted mode only when its category remains selectable.
+pub(crate) fn restore_category_mode(
+    value: Option<&str>,
+    options: &[NewDownloadCategory],
+) -> CategoryMode {
+    match value {
+        Some("none") => CategoryMode::NoCategory,
+        Some(value) => {
+            let Some(id) = value.strip_prefix("category:") else {
+                return CategoryMode::Auto;
+            };
+            if !id.is_empty() && options.iter().any(|option| option.id == id) {
+                CategoryMode::Category(id.to_owned())
+            } else {
+                CategoryMode::Auto
+            }
+        }
+        _ => CategoryMode::Auto,
+    }
+}
+
+/// Encodes the user's selected mode, never an automatic prediction.
+pub(crate) fn category_mode_preference(mode: &CategoryMode) -> String {
+    match mode {
+        CategoryMode::Auto => "auto".to_owned(),
+        CategoryMode::NoCategory => "none".to_owned(),
+        CategoryMode::Category(id) => format!("category:{id}"),
+    }
+}
+
+/// Directory written when a mode is selected; `None` means the category is no longer selectable.
+pub(crate) fn category_mode_save_dir(
+    mode: &CategoryMode,
+    options: &[NewDownloadCategory],
+    offered: &str,
+    predicted: Option<&str>,
+) -> Option<String> {
+    match mode {
+        CategoryMode::Auto => Some(predicted.unwrap_or(offered).to_owned()),
+        CategoryMode::NoCategory => Some(offered.to_owned()),
+        CategoryMode::Category(id) => options
+            .iter()
+            .find(|option| option.id == *id)
+            .map(|option| option.save_dir.clone()),
+    }
+}
+
 /// 下拉候选：按分类列表顺序（已按 `position` 排序），保留可见、非 `all`、目录非空的项。
 pub(crate) fn category_options(categories: &[CustomCategoryDto]) -> Vec<NewDownloadCategory> {
     categories
@@ -128,19 +175,39 @@ pub(crate) fn matched_category<'a>(
     options.iter().find(|option| option.save_dir == predicted)
 }
 
-/// 「自动」模式下预测输入变化时目录框应改成的值：目录框当前值（去空白）为空、等于初始目录
-/// 或等于上一次自动写入值才跟随，返回 `预测目录 ?? 初始目录`；用户手动改过则返回 `None`。
+/// 目录框是否仍是表单写入的值（用户没手动改过）：当前值（去空白）为空；表单写过目录框时
+/// 等于上一次写入值 `last_written`；尚未写过时等于初始目录。用户改回初始目录也算手改。
+pub(crate) fn dir_untouched(current: &str, offered: &str, last_written: Option<&str>) -> bool {
+    let current = current.trim();
+    current.is_empty()
+        || last_written.map_or(current == offered.trim(), |written| written == current)
+}
+
+/// 「自动」模式下预测输入变化时目录框应改成的值：只有保存目录仍遵循自动意图时才跟随。
 pub(crate) fn auto_follow_target(
     current: &str,
     offered: &str,
-    last_auto: Option<&str>,
+    last_written: Option<&str>,
     predicted: Option<&str>,
+    manually_edited: bool,
 ) -> Option<String> {
-    let current = current.trim();
-    let offered = offered.trim();
-    let following =
-        current.is_empty() || current == offered || last_auto.is_some_and(|auto| auto == current);
-    following.then(|| predicted.unwrap_or(offered).to_owned())
+    save_dir_untouched(current, offered, last_written, manually_edited)
+        .then(|| predicted.unwrap_or(offered.trim()).to_owned())
+}
+
+/// Whether the save-directory field still follows automatic intent.
+pub(crate) fn save_dir_untouched(
+    current: &str,
+    offered: &str,
+    last_written: Option<&str>,
+    manually_edited: bool,
+) -> bool {
+    !manually_edited && dir_untouched(current, offered, last_written)
+}
+
+/// Whether category routing is eligible for this selection state.
+pub(crate) fn category_route_eligible(mode: &CategoryMode, save_dir_untouched: bool) -> bool {
+    *mode == CategoryMode::Auto && save_dir_untouched
 }
 
 /// 常见的二级公共后缀（`co.uk` 这类）：三段域名以它结尾时注册域占两段，最左段不是子域，
@@ -261,7 +328,9 @@ mod tests {
     use serde::Deserialize;
 
     use super::{
-        auto_follow_target, category_options, matched_category, predict_save_dir,
+        CategoryMode, NewDownloadCategory, auto_follow_target, category_mode_preference,
+        category_mode_save_dir, category_options, category_route_eligible, dir_untouched,
+        matched_category, predict_save_dir, restore_category_mode, save_dir_untouched,
         suggest_rule_name, suggest_url_pattern,
     };
 
@@ -443,32 +512,158 @@ mod tests {
     }
 
     #[test]
+    fn empty_picker_options_do_not_remove_automatic_route_authorization() {
+        let options = category_options(&[]);
+        assert!(options.is_empty());
+        assert!(category_route_eligible(&CategoryMode::Auto, true));
+    }
+
+    #[test]
+    fn manual_directory_intent_survives_prediction_and_default_changes() {
+        let mode = CategoryMode::Auto;
+        for chosen in ["/downloads", "/videos"] {
+            for offered in ["/downloads", "/new-default"] {
+                // 手选旧默认目录或分类目录，即使路径仍等于程序写入值，也不得覆盖或路由。
+                assert_eq!(
+                    auto_follow_target(chosen, offered, Some(chosen), Some("/programs"), true),
+                    None
+                );
+                assert!(!category_route_eligible(
+                    &mode,
+                    save_dir_untouched(chosen, offered, Some(chosen), true),
+                ));
+
+                // 显式重选「自动」清除手动意图，恢复预测；写回的目录可继续参与提交路由。
+                let restored =
+                    auto_follow_target(chosen, offered, Some(chosen), Some("/programs"), false)
+                        .expect("automatic directory follows the new prediction");
+                assert_eq!(restored, "/programs");
+                assert!(category_route_eligible(
+                    &mode,
+                    save_dir_untouched(&restored, offered, Some(&restored), false),
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn auto_follow_only_while_the_user_has_not_edited_the_directory() {
-        // 空 / 等于初始目录 / 等于上次自动写入值：跟随预测（无预测回到初始目录）。
+        // 空 / 尚未写过时等于初始目录 / 等于上次写入值：跟随预测（无预测回到初始目录）。
         assert_eq!(
-            auto_follow_target("", "/dl", None, Some("/programs")).as_deref(),
+            auto_follow_target("", "/dl", None, Some("/programs"), false).as_deref(),
             Some("/programs")
         );
         assert_eq!(
-            auto_follow_target(" /dl ", "/dl", None, None).as_deref(),
+            auto_follow_target(" /dl ", "/dl", None, None, false).as_deref(),
             Some("/dl")
         );
         assert_eq!(
-            auto_follow_target("/programs", "/dl", Some("/programs"), Some("/videos")).as_deref(),
+            auto_follow_target(
+                "/programs",
+                "/dl",
+                Some("/programs"),
+                Some("/videos"),
+                false
+            )
+            .as_deref(),
             Some("/videos")
         );
         assert_eq!(
-            auto_follow_target("/programs", "/dl", Some("/programs"), None).as_deref(),
+            auto_follow_target("/programs", "/dl", Some("/programs"), None, false).as_deref(),
             Some("/dl")
         );
-        // 用户手动改过：不覆盖。
+        // Explicit manual edits and edits back to an earlier value must not be overwritten.
         assert_eq!(
-            auto_follow_target("/mine", "/dl", Some("/programs"), Some("/videos")),
+            auto_follow_target("/mine", "/dl", Some("/programs"), Some("/videos"), true),
             None
         );
         assert_eq!(
-            auto_follow_target("/programs", "/dl", None, Some("/videos")),
+            auto_follow_target("/programs", "/dl", None, Some("/videos"), true),
             None
+        );
+        assert_eq!(
+            auto_follow_target("/dl", "/dl", Some("/programs"), Some("/videos"), true),
+            None
+        );
+        assert!(!dir_untouched("/dl", "/dl", Some("/programs")));
+        // 改成另一个分类的目录同样算手改。
+        assert!(!dir_untouched("/videos", "/dl", Some("/programs")));
+        assert!(dir_untouched(" /programs ", "/dl", Some("/programs")));
+        assert!(dir_untouched("  ", "/dl", Some("/programs")));
+    }
+
+    #[test]
+    fn persisted_category_mode_restores_only_current_selectable_categories() {
+        let options = vec![NewDownloadCategory {
+            id: "video:custom".to_owned(),
+            builtin_type: None,
+            name: "Video".to_owned(),
+            icon: String::new(),
+            save_dir: "/downloads/video".to_owned(),
+        }];
+        assert_eq!(restore_category_mode(None, &options), CategoryMode::Auto);
+        assert_eq!(
+            restore_category_mode(Some("invalid"), &options),
+            CategoryMode::Auto
+        );
+        assert_eq!(
+            restore_category_mode(Some("category:"), &options),
+            CategoryMode::Auto
+        );
+        assert_eq!(
+            restore_category_mode(Some("category:stale"), &options),
+            CategoryMode::Auto
+        );
+        assert_eq!(
+            restore_category_mode(Some("category:video:custom"), &options),
+            CategoryMode::Category("video:custom".to_owned())
+        );
+        assert_eq!(
+            restore_category_mode(Some("none"), &[]),
+            CategoryMode::NoCategory
+        );
+        assert_eq!(category_mode_preference(&CategoryMode::Auto), "auto");
+        assert_eq!(category_mode_preference(&CategoryMode::NoCategory), "none");
+        assert_eq!(
+            category_mode_preference(&CategoryMode::Category("video:custom".to_owned())),
+            "category:video:custom"
+        );
+        assert!(category_route_eligible(&CategoryMode::Auto, true));
+        assert!(!category_route_eligible(&CategoryMode::Auto, false));
+        assert!(!category_route_eligible(&CategoryMode::NoCategory, true));
+        assert!(!category_route_eligible(
+            &CategoryMode::Category("video:custom".to_owned()),
+            true
+        ));
+        assert_eq!(
+            category_mode_save_dir(
+                &CategoryMode::Auto,
+                &options,
+                "/downloads",
+                Some("/downloads/video"),
+            )
+            .as_deref(),
+            Some("/downloads/video")
+        );
+        assert_eq!(
+            category_mode_save_dir(
+                &CategoryMode::NoCategory,
+                &options,
+                "/downloads",
+                Some("/downloads/video"),
+            )
+            .as_deref(),
+            Some("/downloads")
+        );
+        assert_eq!(
+            category_mode_save_dir(
+                &CategoryMode::Category("video:custom".to_owned()),
+                &options,
+                "/downloads",
+                None,
+            )
+            .as_deref(),
+            Some("/downloads/video")
         );
     }
 }

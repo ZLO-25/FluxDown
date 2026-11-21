@@ -1,19 +1,19 @@
 //! 下载拦截平面的插件侧：按任务挑选匹配插件，并把各阶段调用转给脚本运行时。
 
+use crate::logger::log_warn;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::{
-    CIRCUIT_BREAKER_THRESHOLD, EXTERNAL_TOOL_HOOK_BUDGET, PluginManager, build_typed_settings_json,
-    value_of,
+    EXTERNAL_TOOL_HOOK_BUDGET, LoadedPlugin, PluginManager, build_typed_settings_json, value_of,
 };
-use crate::intercept::{InterceptStage, InterceptorEntry, TaskInterceptor};
+use crate::intercept::{InterceptStage, InterceptorEntry, TaskEgressView, TaskInterceptor};
 use crate::plugin::audit::PluginAuditRow;
+use crate::plugin::call_egress::CallEgress;
 use crate::plugin::manifest::{
-    InterceptFailure, PERMISSION_AUTH, PERMISSION_FFMPEG, PERMISSION_INTERCEPT, PERMISSION_YTDLP,
-    url_glob_match,
+    InterceptFailure, PERMISSION_ARCHIVE, PERMISSION_AUTH, PERMISSION_FFMPEG, PERMISSION_INTERCEPT,
+    PERMISSION_YTDLP, url_glob_match,
 };
 use crate::plugin::quickjs::HARD_TIMEOUT_CEILING;
 use crate::plugin::runtime::{
@@ -58,15 +58,25 @@ impl PluginManager {
                 })
             })
             .collect();
-        if entries.is_empty() {
+        entries.sort_by(|a, b| a.identity.cmp(&b.identity));
+        let has_archivers = snapshot.iter().any(|p| {
+            p.enabled
+                && p.manifest.has_permission(PERMISSION_ARCHIVE)
+                && p.manifest
+                    .contributes
+                    .as_ref()
+                    .is_some_and(|c| c.archive.is_some() || c.archive_rules.is_some())
+        });
+        if entries.is_empty() && !has_archivers {
             return crate::intercept::noop();
         }
-        entries.sort_by(|a, b| a.identity.cmp(&b.identity));
         Arc::new(PluginTaskInterceptor {
             pm: self.clone(),
             task_id: task_id.to_string(),
             source_url: source_url.to_string(),
             entries,
+            has_archivers,
+            egress: std::sync::Mutex::new(None),
         })
     }
 
@@ -78,17 +88,19 @@ impl PluginManager {
         stage: InterceptStage,
         arg_json: String,
         file_root: Option<PathBuf>,
+        egress: Option<Arc<CallEgress>>,
     ) -> Result<Option<String>, PluginError> {
         let (manifest, streak, source, dev_mode) = {
             let snapshot = self.plugins.read().await.clone();
-            let Some(p) = snapshot
-                .iter()
-                .find(|p| p.manifest.identity == identity && p.enabled)
-            else {
-                return Err(PluginError::Runtime(format!(
-                    "插件 {identity} 已卸载或被禁用"
-                )));
+            let Some(p) = snapshot.iter().find(|p| p.manifest.identity == identity) else {
+                return Err(PluginError::Runtime(format!("插件 {identity} 已卸载")));
             };
+            if !p.enabled {
+                return Err(PluginError::Runtime(format!(
+                    "插件 {identity} {}",
+                    p.disabled_reason.describe()
+                )));
+            }
             let source = p.intercept_source().await;
             (p.manifest.clone(), p.timeout_streak.clone(), source, p.dev)
         };
@@ -148,6 +160,7 @@ impl PluginManager {
             ytdlp_permitted,
             auth_permitted: manifest.has_permission(PERMISSION_AUTH),
             private_network_allowed: dev_mode,
+            egress: egress.clone(),
         };
         let result = self
             .runtime
@@ -162,18 +175,8 @@ impl PluginManager {
                 finalize.then(|| task_id.to_string()),
             )
             .await;
-
-        match &result {
-            Err(PluginError::Timeout) | Err(PluginError::MemoryLimitExceeded) => {
-                let n = streak.fetch_add(1, Ordering::SeqCst) + 1;
-                if n >= CIRCUIT_BREAKER_THRESHOLD {
-                    self.trip_circuit_breaker(identity).await;
-                }
-            }
-            _ => {
-                streak.store(0, Ordering::SeqCst);
-            }
-        }
+        self.note_execution(identity, &streak, result.as_ref().err(), egress.as_deref())
+            .await;
 
         let (outcome, detail) = match &result {
             Ok(_) => ("ok", String::new()),
@@ -188,6 +191,208 @@ impl PluginManager {
             &detail,
         ));
         result
+    }
+    async fn matching_archive_rules(
+        &self,
+        snapshot: &[LoadedPlugin],
+        context: &crate::model::ArchiveContext,
+        task_id: &str,
+    ) -> Option<String> {
+        let mut plugins: Vec<_> = snapshot
+            .iter()
+            .filter(|plugin| {
+                plugin.enabled
+                    && plugin.manifest.has_permission(PERMISSION_ARCHIVE)
+                    && plugin
+                        .manifest
+                        .contributes
+                        .as_ref()
+                        .and_then(|contributes| contributes.archive_rules.as_ref())
+                        .is_some()
+            })
+            .collect();
+        plugins.sort_by(|left, right| left.manifest.identity.cmp(&right.manifest.identity));
+        let bounded_context = context.header_hex.as_deref().and_then(|header| {
+            let valid = (2..=8192).contains(&header.len())
+                && header.len() % 2 == 0
+                && header.bytes().all(|byte| byte.is_ascii_hexdigit());
+            (!valid).then(|| crate::model::ArchiveContext {
+                header_hex: None,
+                ..context.clone()
+            })
+        });
+        let context = bounded_context.as_ref().unwrap_or(context);
+        for plugin in plugins {
+            let identity = &plugin.manifest.identity;
+            if let Some((folder, rule_id, sequence)) =
+                self.archive_rule_match(identity, context).await
+            {
+                self.audit.record(PluginAuditRow::new(
+                    identity,
+                    "daemon",
+                    "archive.rules",
+                    task_id,
+                    "ok",
+                    format!("rule={rule_id} sequence={sequence}"),
+                ));
+                return Some(folder);
+            }
+        }
+        None
+    }
+
+    /// Ask callbacks in identity order, then signed rules; retain failures for task activity.
+    pub(super) async fn archive_directories(
+        &self,
+        context: crate::model::ArchiveContext,
+        task_id: &str,
+    ) -> Result<Option<crate::model::ArchiveDirectories>, String> {
+        let snapshot = self.plugins.read().await.clone();
+        let mut candidates: Vec<_> = snapshot
+            .iter()
+            .filter(|plugin| {
+                plugin.enabled
+                    && plugin.manifest.has_permission(PERMISSION_ARCHIVE)
+                    && plugin
+                        .manifest
+                        .contributes
+                        .as_ref()
+                        .and_then(|contributes| contributes.archive.as_ref())
+                        .is_some()
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.manifest.identity.cmp(&b.manifest.identity));
+        let mut problems = Vec::new();
+        for plugin in candidates {
+            let identity = &plugin.manifest.identity;
+            let problem = match self.archive_one(plugin, &context, task_id).await {
+                Ok(Some(directories)) => return Ok(Some(directories)),
+                Ok(None) => continue,
+                Err(problem) => problem,
+            };
+            log_warn!("[plugin] archive {identity} skipped: {problem}");
+            problems.push(format!("{identity}：{problem}"));
+        }
+        if let Some(folder) = self
+            .matching_archive_rules(&snapshot, &context, task_id)
+            .await
+        {
+            return Ok(Some(crate::model::ArchiveDirectories {
+                components: vec![folder],
+                legacy: true,
+                category: String::new(),
+            }));
+        }
+        if problems.is_empty() {
+            Ok(None)
+        } else {
+            Err(problems.join("；"))
+        }
+    }
+
+    /// 调用单个归档插件并记审计与熔断；`Err` 为可展示的失败原因。
+    async fn archive_one(
+        &self,
+        plugin: &LoadedPlugin,
+        context: &crate::model::ArchiveContext,
+        task_id: &str,
+    ) -> Result<Option<crate::model::ArchiveDirectories>, String> {
+        let identity = &plugin.manifest.identity;
+        let audit = |outcome: &str, detail: &str| {
+            self.audit.record(PluginAuditRow::new(
+                identity, "daemon", "archive", task_id, outcome, detail,
+            ));
+        };
+        let Some(source) = plugin.archive_source().await else {
+            audit("error", "archive entry unavailable");
+            return Err("归档脚本不可读".to_string());
+        };
+        let values = self.load_setting_values(identity).await;
+        if let Some(field) = plugin
+            .manifest
+            .settings
+            .iter()
+            .find(|field| field.required && value_of(&values, field).is_none())
+        {
+            audit("error", "required setting missing");
+            return Err(format!("需先配置「{}」", field.title));
+        }
+        let settings_json = build_typed_settings_json(&plugin.manifest, &values);
+        let script = PluginScript {
+            identity: identity.clone(),
+            source,
+            entry_fn_hint: PluginEntryKind::Archive,
+            version: plugin.manifest.version.clone(),
+            app_version: self.app_version.clone(),
+        };
+        let result = self
+            .runtime
+            .invoke_archive(
+                &script,
+                context.clone(),
+                settings_json,
+                self.bridge.clone(),
+                ExecutionBudget {
+                    timeout: DEFAULT_INTERCEPT_TIMEOUT,
+                    memory_limit_bytes: self.resolve_budget.memory_limit_bytes,
+                },
+            )
+            .await;
+        self.note_execution(
+            identity,
+            &plugin.timeout_streak,
+            result.as_ref().err(),
+            None,
+        )
+        .await;
+        match result {
+            Ok(Some(value)) => {
+                if !value.category.is_empty() {
+                    if !matches!(
+                        value.category.as_str(),
+                        "video" | "audio" | "document" | "image" | "program" | "archive" | "other"
+                    ) || !value.directories.is_empty()
+                        || !value.folder_name.is_empty()
+                        || context.is_group
+                        || context.phase != crate::model::ArchivePhase::Complete
+                    {
+                        audit("error", "invalid category output");
+                        return Err("归档分类标识不合法或与目录输出冲突".to_owned());
+                    }
+                    audit("ok", "");
+                    return Ok(Some(crate::model::ArchiveDirectories {
+                        category: value.category,
+                        ..Default::default()
+                    }));
+                }
+                match crate::category_route::normalize_archive_directories(
+                    &value.directories,
+                    &value.folder_name,
+                ) {
+                    Some(components) => {
+                        audit("ok", "");
+                        Ok(Some(crate::model::ArchiveDirectories {
+                            legacy: value.directories.is_empty(),
+                            components,
+                            category: String::new(),
+                        }))
+                    }
+                    None => {
+                        audit("error", "invalid directories");
+                        Err("返回的归档目录不合法".to_owned())
+                    }
+                }
+            }
+            Ok(None) => {
+                audit("ok", "");
+                Ok(None)
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                audit("error", &detail);
+                Err(detail)
+            }
+        }
     }
 }
 
@@ -206,6 +411,9 @@ struct PluginTaskInterceptor {
     task_id: String,
     source_url: String,
     entries: Vec<InterceptorEntry>,
+    has_archivers: bool,
+    /// 任务当前出口（见 [`crate::intercept::sync_egress`]）；`None` = 全局出口。
+    egress: std::sync::Mutex<Option<TaskEgressView>>,
 }
 
 #[async_trait::async_trait]
@@ -216,6 +424,36 @@ impl TaskInterceptor for PluginTaskInterceptor {
 
     fn source_url(&self) -> &str {
         &self.source_url
+    }
+    fn has_archivers(&self) -> bool {
+        self.has_archivers
+    }
+
+    async fn archive_directories(
+        &self,
+        context: crate::model::ArchiveContext,
+    ) -> Result<Option<crate::model::ArchiveDirectories>, String> {
+        if !self.has_archivers {
+            return Ok(None);
+        }
+        let pm = self.pm.clone();
+        let task_id = self.task_id.clone();
+        let handle = self
+            .pm
+            .runtime_handle()
+            .spawn(async move { pm.archive_directories(context, &task_id).await });
+        let mut guard = AbortGuard(handle);
+        match (&mut guard.0).await {
+            Ok(result) => result,
+            Err(error) => Err(format!("插件运行时任务异常: {error}")),
+        }
+    }
+
+    fn set_egress(&self, egress: TaskEgressView) {
+        *self
+            .egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(egress);
     }
 
     async fn call(
@@ -228,8 +466,15 @@ impl TaskInterceptor for PluginTaskInterceptor {
         let pm = self.pm.clone();
         let task_id = self.task_id.clone();
         let identity = identity.to_string();
+        // 每次调用一个新的观测器：拦截阶段不换路，只用于熔断豁免。
+        let egress = self
+            .egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .map(|view| Arc::new(CallEgress::new(view.proxy, view.explicit, view.rules)));
         let handle = self.pm.runtime_handle().spawn(async move {
-            pm.intercept(&identity, &task_id, stage, arg_json, file_root)
+            pm.intercept(&identity, &task_id, stage, arg_json, file_root, egress)
                 .await
         });
         let mut guard = AbortGuard(handle);

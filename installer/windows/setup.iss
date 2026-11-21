@@ -7,7 +7,7 @@
 ; client, so the Flutter auto-updater (`setup.exe /SILENT`) upgrades in place.
 ; The GPUI in-app updater (native/agent/src/update/install) runs this installer with
 ; `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-` after the agent and daemon have exited;
-; the silent [Run] entry then relaunches the desktop with `--after-update`.
+; manual updates relaunch the desktop; /BACKGROUNDUPDATE restarts only the agent.
 
 #define MyAppName "FluxDown"
 #define MyAppPublisher "FluxDown"
@@ -111,10 +111,17 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Check: DesktopIconAlreadyExists
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent shellexec
+; Setup started elevated ("Run as administrator", an elevated winget): runasoriginaluser has no
+; original user to fall back to, so a direct launch would hand the administrator token to the
+; desktop and the agent it starts, whose pipes the browser relay then cannot open (#951 / #787).
+; `fluxdown-agent --launch-desktop` starts the desktop unelevated through the shell instead
+; (native/agent/src/platform/elevation.rs).
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent shellexec; Check: not IsAdmin
+Filename: "{app}\{#MyAgentExeName}"; Parameters: "--launch-desktop"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent; Check: IsAdmin
 ; Silent (auto-)update: relaunch the UI. `--after-update` makes the desktop wait for the
 ; previous instance to finish exiting instead of forwarding activation to it.
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--after-update"; Flags: nowait skipifdoesntexist skipifnotsilent runasoriginaluser
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--after-update"; Flags: nowait skipifdoesntexist skipifnotsilent runasoriginaluser; Check: not IsAdmin and not IsBackgroundUpdate
+Filename: "{app}\{#MyAgentExeName}"; Parameters: "--launch-desktop --after-update"; Flags: nowait skipifdoesntexist skipifnotsilent; Check: IsAdmin and not IsBackgroundUpdate
 
 [Registry]
 ; Autostart launches the resident agent (tray), same value the agent writes itself
@@ -146,6 +153,10 @@ Type: dirifempty; Name: "{localappdata}\FluxDown\nmh"
 Type: files; Name: "{app}\com.fluxdown.nmh.json"
 Type: files; Name: "{app}\com.fluxdown.nmh.firefox.json"
 
+; 应用图标功能（agent 的 exe_icon）给 exe 打图标补丁时在安装目录留的临时副本；正常流程会自己删除，
+; 这里兜底崩溃遗留，否则卸载后安装目录删不掉。
+Type: files; Name: "{app}\.fluxdown-desktop.exe.icon-*.tmp"
+
 [Code]
 const
   RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
@@ -162,6 +173,11 @@ var
   LegacyFluxdownScheme, LegacyEd2kScheme, LegacyMagnetScheme: Boolean;
   { Directory of the all-users install found in HKLM ('' when none). }
   LegacyAllUsersDir: String;
+
+function IsBackgroundUpdate: Boolean;
+begin
+  Result := ExpandConstant('{param:BACKGROUNDUPDATE|0}') <> '0';
+end;
 
 function DesktopIconAlreadyExists: Boolean;
 begin
@@ -338,6 +354,12 @@ begin
     Log('Legacy all-users install in ' + LegacyDir + ' has no uninstaller; installing alongside it.');
     Exit;
   end;
+  { Background updates must never show UAC for a legacy all-users uninstall. }
+  if IsBackgroundUpdate then
+  begin
+    Result := FmtMessage(CustomMessage('LegacyAllUsersRemoveFailed'), [LegacyDir]);
+    Exit;
+  end;
 
   if SuppressibleMsgBox(FmtMessage(CustomMessage('LegacyAllUsersFound'), [LegacyDir]),
     mbInformation, MB_OKCANCEL, IDOK) <> IDOK then
@@ -377,7 +399,9 @@ end;
 { PrepareToInstall force-kills every FluxDown process before the legacy
   migration. When that migration aborts a silent (auto-)update, nothing would
   bring the app back: the agent that started setup has already exited. Start
-  whichever install is still there so the user is not left without FluxDown. }
+  whichever install is still there so the user is not left without FluxDown.
+  This runs before [Files], so the agent on disk is the previous release that
+  does not know `--launch-desktop`: launch the desktop directly. }
 procedure RelaunchAfterAbortedUpdate;
 var
   ResultCode: Integer;
@@ -450,7 +474,8 @@ begin
   { Force-kill every FluxDown process as a fallback in case Restart Manager
     fails: the resident agent/daemon/relay keep their exes locked otherwise.
     Matches by image name, so a legacy all-users copy is stopped too. }
-  Exec('taskkill', '/f /im {#MyAppExeName} /im {#MyAgentExeName} /im fluxdownd.exe /im fluxdown_nmh.exe /im {#LegacyExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if not IsBackgroundUpdate then
+    Exec('taskkill', '/f /im {#MyAppExeName} /im {#MyAgentExeName} /im fluxdownd.exe /im fluxdown_nmh.exe /im {#LegacyExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   { Upgrade installs must overwrite the previous uninstaller; a stray
     read-only attribute on it makes CreateFile fail with access denied.
     Clear the attribute up-front (no-op when the files do not exist). }
@@ -459,7 +484,7 @@ begin
   { Small delay to ensure file locks are released }
   Sleep(500);
   Result := RemoveLegacyAllUsersInstall;
-  if (Result <> '') and WizardSilent then
+  if (Result <> '') and WizardSilent and not IsBackgroundUpdate then
     RelaunchAfterAbortedUpdate;
 end;
 
@@ -470,6 +495,23 @@ begin
     MigrateLegacyAutostart;
     MigrateLegacyIntegrations;
     RestoreLegacyIntegrations;
+  end;
+end;
+
+{ Also runs on failure: leave the old/new agent available, never open the UI.
+  /NOCLOSEAPPLICATIONS prevents killing a window or task opened during setup. }
+procedure DeinitializeSetup;
+var
+  ResultCode: Integer;
+  Agent: String;
+begin
+  if not IsBackgroundUpdate then
+    Exit;
+  Agent := ExpandConstant('{app}\{#MyAgentExeName}');
+  if FileExists(Agent) then
+  begin
+    if not ExecAsOriginalUser(Agent, '--background-update', '', SW_HIDE, ewNoWait, ResultCode) then
+      Log(Format('Could not restart background agent (error %d).', [ResultCode]));
   end;
 end;
 

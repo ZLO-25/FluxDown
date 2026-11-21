@@ -1,19 +1,27 @@
 // 任务行 / 分组头右键菜单（移植 task_table.rs 的 `context_menu_items` 与 `group_context_menu`）。
-// 「打开文件 / 在文件夹中显示」仅在 agent 下发 `agent.openTaskFiles`（同机）时出现，其余情况用浏览器下载已完成文件。
+// 「打开文件 / 在文件夹中显示」仅在 agent 下发 `agent.openTaskFiles`（同机）时出现，「复制文件」仅在下发
+// `agent.copyTaskFiles`（同机桌面会话）时出现；远程 / NAS 连接都用浏览器下载已完成文件。
 
 import {
   AppWindow,
+  Circle,
   CircleAlert,
   CircleCheck,
+  CircleDot,
   Copy,
   Download,
+  FileDown,
+  Files,
   Layers,
   Link2,
+  Magnet,
   FolderOpen,
+  Gauge,
   Pause,
   PanelRight,
   Pen,
   Play,
+  Square,
   SquareCheck,
   RotateCw,
   Rows3,
@@ -27,6 +35,7 @@ import type { PluginCommandRef } from '../../plugins/contributions'
 import type { MenuEntry } from '../../../ui'
 import {
   canOpenGroupFolder,
+  canCopyTaskFiles,
   canOpenTaskFile,
   canRedownload,
   canRevealTaskFile,
@@ -34,11 +43,17 @@ import {
   confirmDeleteWithFiles,
   confirmIgnorePluginRetry,
   copySourceLink,
+  canCopyUrls,
   copyUrls,
+  copyMagnet,
+  exportTorrent,
+  canShareTorrent,
+  copyTaskFiles,
   deleteGroup,
   deleteViews,
   downloadViewsFiles,
   isDownloadable,
+  isMovingStorage,
   isPluginRetryError,
   moveViewsToQueue,
   openTaskFile,
@@ -51,15 +66,32 @@ import {
   retryFailedInGroup,
   revealTaskFile,
   toggleBoost,
+  setPieceOrder,
+  setFirstLastPieces,
+  setSuperSeeding,
+  forceRecheckViews,
   verifyTaskIntegrity,
 } from '../model/actions'
 import { remoteCan } from '../model/batchPlan'
-import { canChangeSegments, canChangeUrl, canVerifyIntegrity } from '../model/taskEdit'
+import {
+  canChangeSegments,
+  canChangeUrl,
+  canForceRecheck,
+  canMoveStorage,
+  canRename,
+  canSetPiecePicking,
+  canSetSuperSeeding,
+  canSetTaskLimits,
+  canVerifyIntegrity,
+  pieceOptionAllOn,
+  pieceOrder,
+  superSeedingAllOn,
+} from '../model/taskEdit'
 import { canPause, canResumeSeeding } from '../model/task'
 import type { DownloadTaskView } from '../model/task'
 import { anyActive, anyResumable } from '../model/groupTree'
 import type { GroupCounts } from '../model/groupTree'
-import { openChangeSegments, openChangeUrl, openGroupDetail, openRename } from '../dialogs'
+import { openChangeSegments, openChangeUrl, openGroupDetail, openMoveStorage, openRename, openTaskEdit, openTaskLimits } from '../dialogs'
 
 type Translate = (key: string, params?: Record<string, string | number>) => string
 
@@ -162,11 +194,23 @@ export function buildTaskMenu({ t, views, queues, queueName, showDetail, selecti
       onSelect: () => void revealTaskFile(only.taskId),
     })
   }
-  if (only && only.source === 'local') {
+  if (canCopyTaskFiles(views)) {
+    entries.push({
+      type: 'item',
+      key: 'copy-files',
+      label: t('copyFileAction'),
+      icon: Files,
+      onSelect: () => void copyTaskFiles(views),
+    })
+  }
+  if (only && canRename(only)) {
     entries.push({ type: 'item', key: 'rename', label: t('renameTask'), icon: Pen, onSelect: () => openRename(only.taskId) })
   }
   if (only && canChangeUrl(only)) {
     entries.push({ type: 'item', key: 'change-url', label: t('webChangeUrl'), icon: Link2, onSelect: () => openChangeUrl(only.taskId) })
+  }
+  if (only) {
+    entries.push({ type: 'item', key: 'edit-task', label: t('taskEditTitle'), icon: Pen, onSelect: () => openTaskEdit(only.taskId) })
   }
   if (only && canChangeSegments(only)) {
     entries.push({
@@ -186,6 +230,61 @@ export function buildTaskMenu({ t, views, queues, queueName, showDetail, selecti
       onSelect: () => void verifyTaskIntegrity(only),
     })
   }
+  if (canSetPiecePicking(views)) {
+    const order = pieceOrder(views)
+    const endsOn = pieceOptionAllOn(views)
+    entries.push({
+      type: 'sub',
+      key: 'btPiecePicking',
+      label: t('btPiecePicking'),
+      entries: [
+        {
+          type: 'item',
+          key: 'btRarestFirst',
+          label: t('btRarestFirst'),
+          icon: order === 'rarest' ? CircleDot : Circle,
+          onSelect: () => void setPieceOrder(views, false),
+        },
+        {
+          type: 'item',
+          key: 'btSequential',
+          label: t('btSequentialDownload'),
+          icon: order === 'sequential' ? CircleDot : Circle,
+          onSelect: () => void setPieceOrder(views, true),
+        },
+        {
+          type: 'item',
+          key: 'btFirstLastPiecesFirst',
+          label: t('btFirstLastPiecesFirst'),
+          icon: endsOn ? SquareCheck : Square,
+          onSelect: () => void setFirstLastPieces(views, endsOn),
+        },
+      ],
+    })
+  }
+  if (canForceRecheck(views)) {
+    entries.push({ type: 'item', key: 'btForceRecheck', label: t('btForceRecheck'), icon: RotateCw, onSelect: () => void forceRecheckViews(views) })
+  }
+  if (only && canMoveStorage(views)) {
+    // 同一任务的移动尚未结束时不再打开选择器（GPUI `bt_moving`）。
+    const onSelect = () => {
+      if (!isMovingStorage(only.taskId)) openMoveStorage(only.taskId)
+    }
+    entries.push({ type: 'item', key: 'btMoveStorage', label: t('btMoveStorage'), icon: FolderOpen, onSelect })
+  }
+  if (only && canSetTaskLimits(views)) {
+    entries.push({ type: 'item', key: 'btTaskLimits', label: t('btTaskLimits'), icon: Gauge, onSelect: () => openTaskLimits(only.taskId) })
+  }
+  if (canSetSuperSeeding(views)) {
+    const superOn = superSeedingAllOn(views)
+    entries.push({
+      type: 'check',
+      key: 'btSuperSeeding',
+      label: t('btSuperSeeding'),
+      checked: superOn,
+      onSelect: () => void setSuperSeeding(views, !superOn),
+    })
+  }
   if (views.every(canRedownload)) {
     entries.push({
       type: 'item',
@@ -195,7 +294,13 @@ export function buildTaskMenu({ t, views, queues, queueName, showDetail, selecti
       onSelect: () => void redownloadViews(views),
     })
   }
-  entries.push({ type: 'item', key: 'copy-url', label: t('copyUrl'), icon: Copy, onSelect: () => copyUrls(views) })
+  if (canCopyUrls(views)) {
+    entries.push({ type: 'item', key: 'copy-url', label: t('copyUrl'), icon: Copy, onSelect: () => copyUrls(views) })
+  }
+  if (only && canShareTorrent(views)) {
+    entries.push({ type: 'item', key: 'copy-magnet', label: t('btCopyMagnet'), icon: Magnet, onSelect: () => void copyMagnet(only) })
+    entries.push({ type: 'item', key: 'export-torrent', label: t('btExportTorrent'), icon: FileDown, onSelect: () => void exportTorrent(only) })
+  }
   if (allLocal && queues.length > 0) {
     entries.push({
       type: 'sub',

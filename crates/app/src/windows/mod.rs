@@ -54,7 +54,7 @@ pub enum WindowKey {
     GroupDetail(String),
     /// 独立下载进度 / 完成窗口（每任务一个）。
     Progress(String),
-    /// 「发现新版本」提醒（不依赖主窗口，托盘驻留时由 agent 拉起界面后单独弹出）。
+    /// 更新窗口（不依赖主窗口）：只在用户主动时打开（菜单「检查更新…」、顶栏更新按钮）。
     UpdatePrompt,
     /// 插件桌面界面（contributes.views 的 desktop 入口，gpui-shell 运行），key 为 `<identity>/<viewId>`。
     Plugin(String),
@@ -114,10 +114,8 @@ impl WindowRegistry {
             registry.confirming.remove(&window_id);
             (registry.open.is_empty(), key)
         };
-        match closed_key {
-            Some(WindowKey::Completion) => crate::completion_windows::window_closed(cx),
-            Some(WindowKey::UpdatePrompt) => crate::update_notices::prompt_closed(cx),
-            _ => {}
+        if let Some(WindowKey::Completion) = closed_key {
+            crate::completion_windows::window_closed(cx);
         }
         if last_closed {
             crate::lifecycle::quit_ui(cx);
@@ -155,14 +153,17 @@ impl WindowRegistry {
         }
         let label = format!("{key:?}");
         let opened_at = std::time::Instant::now();
-        let options = crate::app_icon::window_options(options);
+        let options = crate::app_icon::window_options(options, cx);
         let result = cx.open_window(options, move |window, cx| {
             crate::logging::observe_new_window(label, opened_at, window, cx);
             // 「跟随系统」主题：系统明暗切换时重新解析；外观变化不会触发整窗刷新，必须显式订阅。
             window
                 .observe_window_appearance(fluxdown_ui_theme::sync_system_theme)
                 .detach();
-            build(window, cx)
+            let view = build(window, cx);
+            #[cfg(windows)]
+            crate::text_scale::follow_on_activation(&view, window, cx);
+            view
         });
         match result {
             Ok(handle) => {
@@ -170,6 +171,9 @@ impl WindowRegistry {
                 let registry = cx.global_mut::<Self>();
                 registry.ids.insert(any.window_id(), key.clone());
                 registry.open.insert(key, any);
+                // 窗口类图标来自 exe 资源；非默认应用图标要请 agent 给新窗口补设（日志即可，不阻塞开窗）。
+                #[cfg(windows)]
+                crate::app_icon::sync_window_icons(cx);
                 Some(handle)
             }
             Err(error) => {

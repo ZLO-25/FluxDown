@@ -1,7 +1,7 @@
 // 各方法的 params / 非 DTO 结果类型（按 wire 名归类）。
 // daemon 端的 id 参数在服务端带别名（`id` / `taskId` / `queueId` / `groupId` 等价），这里统一用语义名。
 
-import type { RemoteTaskDto } from './agent';
+import type { PowerAction, PowerLowSpeedCondition, RemoteTaskDto } from './agent';
 import type { JsonValue } from './common';
 import type { ComponentKind, ComponentStatusDto } from './plugin';
 import type { ServiceHello } from './rpc';
@@ -11,6 +11,47 @@ import type { CreateTaskRequest, DownloadRequest } from './task';
 
 export interface TaskIdParams {
   taskId: string;
+}
+
+/** `daemon.task.seedLocal`：把守护进程所在机器上已有的文件 / 目录登记为已完成 BT 任务并做种。 */
+export interface DaemonSeedLocalParams {
+  /** 守护进程所在机器上的绝对路径（文件或目录）。 */
+  path: string;
+  /** 已有 .torrent 的绝对路径；省略 = 由守护进程生成。 */
+  torrentPath?: string;
+  /** 生成种子时写入的 announce 地址。 */
+  trackers?: string[];
+  /** true = 不因分享率 / 时长 / 不活跃限制而停止做种。 */
+  unlimited: boolean;
+  /** 生成的种子格式（缺省 `v1`）；给了 `torrentPath` 时忽略。 */
+  version?: SeedTorrentVersion;
+  /** 生成私有种子。 */
+  private?: boolean;
+  /** 分片大小（字节，2 的幂且 >= 16384）；0 / 缺省 = 自动。 */
+  pieceLength?: number;
+  /** 写入种子的 HTTP 源（BEP 19 `url-list`）。 */
+  webSeeds?: string[];
+  /** 写入种子的注释。 */
+  comment?: string;
+  /** 写入 info 字典的来源标记（会改变 info hash）。 */
+  source?: string;
+  /** 以超级做种模式做种。 */
+  superSeeding?: boolean;
+  /** 只在给了 `torrentPath` 时有意义：信任数据完整，跳过哈希校验。 */
+  skipCheck?: boolean;
+  /** 非空 = 同时把生成的 `.torrent` 写到守护进程主机的这个绝对路径。 */
+  torrentOutput?: string;
+  /** true = 只生成种子文件、不建任务（必须给 `torrentOutput`，结果 `taskId` 为空串）。 */
+  createOnly?: boolean;
+}
+
+/** 本机做种生成的种子格式（`DaemonSeedLocalParams.version`）。 */
+export type SeedTorrentVersion = 'v1' | 'v2' | 'hybrid';
+
+/** `daemon.task.torrentShare`：取 BT 任务的磁力链接，可选同时带回 .torrent 字节。 */
+export interface DaemonTorrentShareParams {
+  taskId: string;
+  includeTorrent: boolean;
 }
 
 export interface TaskRenameParams {
@@ -29,6 +70,57 @@ export interface TaskChangeUrlParams {
 export interface TaskSetSegmentsParams {
   taskId: string;
   segments: number;
+}
+
+/** `daemon.task.setPiecePicking`：省略的字段保持不变。 */
+export interface TaskSetPiecePickingParams {
+  taskId: string;
+  sequential?: boolean;
+  firstLastPiecesFirst?: boolean;
+}
+
+/** BT 文件优先级（`BT_FILE_PRIORITY_*`，对齐 qBittorrent）：0 不下载 / 1 普通 / 6 高 / 7 最高。 */
+export const BT_FILE_PRIORITY_SKIP = 0;
+export const BT_FILE_PRIORITY_NORMAL = 1;
+export const BT_FILE_PRIORITY_HIGH = 6;
+export const BT_FILE_PRIORITY_MAXIMUM = 7;
+
+/** `daemon.task.setFilePriorities` 的一项（`BtFilePriorityDto`）。 */
+export interface BtFilePriorityDto {
+  index: number;
+  priority: number;
+}
+
+/** `daemon.task.setFilePriorities`：只改列出的文件，其余不变。 */
+export interface SetTaskFilePrioritiesParams {
+  taskId: string;
+  priorities: BtFilePriorityDto[];
+}
+
+/** `daemon.task.renameBtFile`：`path` 是任务目录内的新相对路径（`/` 分隔）。 */
+export interface RenameBtFileParams {
+  taskId: string;
+  index: number;
+  path: string;
+}
+
+/** `daemon.task.moveStorage`：`saveDir` 是守护进程主机上的绝对路径。 */
+export interface MoveTaskStorageParams {
+  taskId: string;
+  saveDir: string;
+}
+
+/** `daemon.task.setBtLimits`：字节/秒，0 = 不限；缺省字段保持不变。 */
+export interface SetTaskBtLimitsParams {
+  taskId: string;
+  downloadLimitBps?: number;
+  uploadLimitBps?: number;
+}
+
+/** `daemon.task.setSuperSeeding`。 */
+export interface SetTaskSuperSeedingParams {
+  taskId: string;
+  enabled: boolean;
 }
 
 export interface TaskDeleteParams {
@@ -365,8 +457,12 @@ export interface PreferencesPatchResult {
 }
 
 export interface PowerArmParams {
-  /** 全部任务完成后再等待的秒数（0 = 立即）。 */
+  /** 倒计时秒数：没有任务时立即开始，否则全部任务完成后开始（0 = 完成后立即，仅有任务时接受）。 */
   delaySecs: number;
+  /** 缺省 = shutdown。 */
+  action?: PowerAction;
+  /** Replaces completion mode; delaySecs becomes a fixed 30-second cancellable warning. */
+  lowSpeed?: PowerLowSpeedCondition | null;
 }
 
 export interface PowerArmResult {
@@ -503,7 +599,7 @@ export type OpenAssociation = 'torrent' | 'magnet' | 'ed2k';
 export interface CaptureSubmitParams {
   /** 外部下载请求。 */
   request: DownloadRequest;
-  /** true = 直接建任务；缺省 false = 恒排入确认队列。 */
+  /** true = 系统打开的链接：按「免打扰下载」偏好直接建任务，偏好关闭则排入确认队列；缺省 false = 恒排入确认队列。 */
   silent?: boolean;
   association?: OpenAssociation;
 }
@@ -521,6 +617,8 @@ export type CaptureSubmitResult =
 export interface CaptureResolveParams {
   transactionId: string;
   accepted: boolean;
+  /** 显式指定时，即使目录等于捕获表单的预填分类目录也禁止分类路由。 */
+  disableCategoryRoute?: boolean;
   /** 确认时表单产出的建任务参数；省略 = 按捕获原请求建任务。 */
   request?: CreateTaskRequest | null;
 }

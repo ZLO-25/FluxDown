@@ -1,10 +1,17 @@
 import { describe, expect, test } from 'bun:test'
-import type { MarketEntryDto, SettingFieldDto } from '../../../../lib/rpc/protocol'
+import type { MarketEntryDto, PluginDto, SettingFieldDto } from '../../../../lib/rpc/protocol'
 import {
   CHALLENGE_TEXT_LIMIT,
+  MARKET_PAGE_SIZE,
+  PRIVATE_SEARCH_MIN_ENTRIES,
   dataImageChallengeSrc,
   filterMarket,
+  filterPrivate,
   formatBytes,
+  liveDialogPlugins,
+  localizedSettingField,
+  pageOf,
+  privateSearchVisible,
   safeHttpUrl,
   truncateChallengeText,
   validateField,
@@ -75,6 +82,55 @@ describe('validateField', () => {
   })
 })
 
+describe('localizedSettingField', () => {
+  const source = field('string', 'select', {
+    key: 'quality',
+    title: 'Quality',
+    description: 'Select quality',
+    default: 'high',
+    helperScript: 'copy-me',
+    helperLabel: 'Copy setting',
+    options: [{ value: 'high', label: 'High' }, { value: 'low', label: 'Low' }],
+    localizations: {
+      en: { title: 'English title', options: { high: 'English high' } },
+      fr: { description: 'Choisir', options: { low: 'Bas' } },
+      'fr-CA': { title: ' ', helperLabel: 'Aide exact' },
+      zh: { description: '简体回退' },
+      'ZH-HANT': { title: '品質', description: '選擇品質', options: { high: '高' } },
+      'zh-Hans': { title: '简体质量', helperLabel: '简体辅助' },
+      'zh-CN': { helperLabel: '大陆辅助' },
+    },
+  })
+
+  test('uses per-text exact, truncated and English fallback without changing technical values', () => {
+    const localized = localizedSettingField(source, 'fr-CA')
+    expect(localized.title).toBe('English title')
+    expect(localized.description).toBe('Choisir')
+    expect(localized.options.map(({ value, label }) => [value, label])).toEqual([['high', 'English high'], ['low', 'Bas']])
+    expect(localized.key).toBe('quality')
+    expect(localized.default).toBe('high')
+    expect(localized.helperScript).toBe('copy-me')
+    expect(localized.options.map(({ value }) => value)).toEqual(['high', 'low'])
+    expect(localizedSettingField(source, 'fr-CA').helperLabel).toBe('Aide exact')
+  })
+
+  test('supports Chinese script aliases and switching languages without mutating source text', () => {
+    expect(localizedSettingField(source, 'zh_TW').options[0]?.label).toBe('高')
+    expect(localizedSettingField(source, 'zh-Hant-HK').title).toBe('品質')
+    expect(localizedSettingField(source, 'zh-Hans-TW').title).toBe('简体质量')
+    expect(localizedSettingField(source, 'zh').title).toBe('简体质量')
+    expect(localizedSettingField(source, 'zh').description).toBe('简体回退')
+    expect(localizedSettingField(source, 'zh').helperLabel).toBe('简体辅助')
+    expect(localizedSettingField(source, 'zh-CN').title).toBe('简体质量')
+    expect(localizedSettingField(source, 'zh-CN').helperLabel).toBe('大陆辅助')
+    expect(localizedSettingField(source, 'de').title).toBe('English title')
+    expect(localizedSettingField(source, 'de').description).toBe('Select quality')
+    expect(localizedSettingField(source, 'de').options[0]?.label).toBe('English high')
+    expect(source.title).toBe('Quality')
+    expect(source.options[0]?.label).toBe('High')
+  })
+})
+
 describe('filterMarket', () => {
   const entries = [
     entry('video.dl', 'Video', 'grabs videos', 'Ann', ['media']),
@@ -92,6 +148,58 @@ describe('filterMarket', () => {
     expect(ids('media')).toEqual(['video.dl'])
     expect(ids('grabs')).toEqual(['video.dl'])
     expect(ids('nothing')).toEqual([])
+  })
+})
+
+describe('pageOf', () => {
+  const items = Array.from({ length: MARKET_PAGE_SIZE * 2 + 20 }, (_, index) => index)
+  const at = (length: number, limit: number) => {
+    const { visible, remaining } = pageOf(items.slice(0, length), limit)
+    return [visible.length, remaining]
+  }
+
+  test('0 条没有可见项也没有剩余', () => {
+    expect(at(0, MARKET_PAGE_SIZE)).toEqual([0, 0])
+  })
+
+  test('恰好一页：全部可见，剩余 0（按钮隐藏）', () => {
+    expect(at(MARKET_PAGE_SIZE, MARKET_PAGE_SIZE)).toEqual([MARKET_PAGE_SIZE, 0])
+  })
+
+  test('多一条：剩余 1；展开两页后到达最后一条', () => {
+    expect(at(MARKET_PAGE_SIZE + 1, MARKET_PAGE_SIZE)).toEqual([MARKET_PAGE_SIZE, 1])
+    expect(at(MARKET_PAGE_SIZE * 2 + 20, MARKET_PAGE_SIZE * 2)).toEqual([MARKET_PAGE_SIZE * 2, 20])
+    expect(at(MARKET_PAGE_SIZE * 2 + 20, MARKET_PAGE_SIZE * 3)).toEqual([MARKET_PAGE_SIZE * 2 + 20, 0])
+  })
+
+  test('limit 大于总数（目录刷新后变短）不越界；可见的是原顺序前缀', () => {
+    expect(at(3, MARKET_PAGE_SIZE * 4)).toEqual([3, 0])
+    expect(pageOf(items.slice(0, MARKET_PAGE_SIZE + 1), MARKET_PAGE_SIZE).visible.at(-1)).toBe(MARKET_PAGE_SIZE - 1)
+  })
+})
+
+describe('filterPrivate', () => {
+  const make = (count: number) =>
+    Array.from({ length: count }, (_, index) => entry(`p${index}@acme`, `Plugin ${index}`, '', '', []))
+
+  test('搜索框出现的阈值', () => {
+    expect(privateSearchVisible(0)).toBe(false)
+    expect(privateSearchVisible(PRIVATE_SEARCH_MIN_ENTRIES - 1)).toBe(false)
+    expect(privateSearchVisible(PRIVATE_SEARCH_MIN_ENTRIES)).toBe(true)
+  })
+
+  test('搜索框不可见时忽略残留关键字', () => {
+    const few = make(PRIVATE_SEARCH_MIN_ENTRIES - 1)
+    expect(filterPrivate(few, 'nothing-matches')).toHaveLength(few.length)
+  })
+
+  test('可见时同公开市场规则：空查询保留全部、全部被滤掉得到空、长 / CJK 名称可命中', () => {
+    const many = make(120)
+    expect(filterPrivate(many, '')).toHaveLength(120)
+    expect(filterPrivate(many, '  PLUGIN 119').map((item) => item.pluginId)).toEqual(['p119@acme'])
+    expect(filterPrivate(many, 'nothing-matches')).toEqual([])
+    const long = entry('long@acme', `${'很长的名字'.repeat(40)}专属插件`, '', '', [])
+    expect(filterPrivate([...make(PRIVATE_SEARCH_MIN_ENTRIES), long], '专属')).toEqual([long])
   })
 })
 
@@ -135,5 +243,33 @@ describe('formatBytes', () => {
     expect(formatBytes(1536)).toBe('1.5 KB')
     expect(formatBytes(12 * 1024 * 1024 + 300 * 1024)).toBe('12.3 MB')
     expect(formatBytes(1024 ** 3)).toBe('1.0 GB')
+  })
+})
+
+describe('liveDialogPlugins', () => {
+  const plugin = (identity: string, pending: string[] = []) => ({ identity, consentPending: pending, consentPendingHosts: [] }) as unknown as PluginDto
+  const none = { detail: null, settings: null, auth: null, consent: null }
+
+  test('对话框内容取最新快照，卸载后为 null', () => {
+    const v1 = plugin('a@x')
+    const open = { ...none, detail: 'a@x', settings: 'a@x', auth: 'b@x' }
+    expect(liveDialogPlugins([v1, plugin('b@x')], open)).toMatchObject({ detail: v1, settings: v1 })
+    const v2 = plugin('a@x')
+    const next = liveDialogPlugins([v2], open)
+    expect(next.detail).toBe(v2)
+    expect(next.settings).toBe(v2)
+    expect(next.auth).toBeNull()
+  })
+
+  test('授权框在待授权集合清空后为 null，仍有待授权则取最新快照', () => {
+    const open = { ...none, consent: 'a@x' }
+    const pending = plugin('a@x', ['ffmpeg'])
+    expect(liveDialogPlugins([pending], open).consent).toBe(pending)
+    expect(liveDialogPlugins([plugin('a@x')], open).consent).toBeNull()
+    expect(liveDialogPlugins([], open).consent).toBeNull()
+  })
+
+  test('未打开的对话框恒为 null', () => {
+    expect(liveDialogPlugins([plugin('a@x')], none)).toEqual(none)
   })
 })

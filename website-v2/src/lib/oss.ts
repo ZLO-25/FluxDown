@@ -20,8 +20,8 @@ import {
 import { ossStorageKey } from "@/lib/oss-storage";
 
 /**
- * 官网签发的下载链接有效期（秒）。镜像侧有效时长须为同一值（Worker `DOWNLOAD_URL_TTL_SEC`，
- * 或阿里云 CDN「URL 鉴权 → 鉴权 URL 有效时长」）：A 方式的过期时间 = 签发时刻 + 镜像侧有效时长。
+ * 官网签发的下载链接有效期（秒）。镜像侧有效时长须为同一值（ESA 边缘函数变量 `DOWNLOAD_URL_TTL_SEC`，
+ * 见 cdn/esa-dl-cn.js）：A 方式的过期时间 = 签发时刻 + 镜像侧有效时长。
  * 分段下载在过期前发起的请求不受影响，过期后客户端重新请求 `/api/download` 即拿到新链接。
  */
 export const DOWNLOAD_URL_TTL_SEC = 3 * 3600;
@@ -54,18 +54,18 @@ const CDN_BASE = (CN_CDN_BASE ?? "").replace(/\/+$/, "");
 export const cdnConfigured = !!(CDN_BASE && CN_CDN_AUTH_KEY);
 
 /**
- * dl-cn 镜像下载链接（阿里云 CDN URL 鉴权 A 方式：`auth_key=<签发时间>-<rand>-0-<md5>`，
- * md5 串为 `<编码后路径>-<签发时间>-<rand>-0-<密钥>`）。现由 Cloudflare Worker（cdn/oss-proxy.js）
- * 校验，备案后改回阿里云 CDN 也无需改签名；两者都去掉 auth_key 再算缓存键，签名不影响命中率。
- * `.apk` / `.ipa` 由镜像回源时换成桶内 `.bin` 对象。
- * 调用前须保证 `cdnConfigured`。https://help.aliyun.com/zh/cdn/user-guide/type-a-signing
+ * dl-cn 镜像下载链接（阿里云 URL 鉴权 A 方式：`auth_key=<签发时间>-<rand>-<网段>-<md5>`，
+ * md5 串为 `<编码后路径>-<签发时间>-<rand>-<网段>-<密钥>`）。uid 段放访客 IPv4 /24 网段标识
+ * （download-gate.ts::mirrorNetworkId），ESA 边缘函数（cdn/esa-dl-cn.js）校验签名后再按访客真实 IP 比对网段，
+ * 链接离开签发时的网段即 403。缓存键忽略查询串，签名不影响命中率。`.apk` / `.ipa` 由镜像回源时换成桶内
+ * `.bin` 对象。调用前须保证 `cdnConfigured`。https://help.aliyun.com/zh/cdn/user-guide/type-a-signing
  */
-export function cdnDownloadUrl(key: string): string {
+export function cdnDownloadUrl(key: string, network: string): string {
   const path = encodedPath(key);
   const timestamp = Math.floor(Date.now() / 1000);
   const rand = randomBytes(16).toString("hex");
-  const hash = createHash("md5").update(`${path}-${timestamp}-${rand}-0-${CN_CDN_AUTH_KEY}`).digest("hex");
-  return `${CDN_BASE}${path}?auth_key=${timestamp}-${rand}-0-${hash}`;
+  const hash = createHash("md5").update(`${path}-${timestamp}-${rand}-${network}-${CN_CDN_AUTH_KEY}`).digest("hex");
+  return `${CDN_BASE}${path}?auth_key=${timestamp}-${rand}-${network}-${hash}`;
 }
 
 /**

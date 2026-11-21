@@ -25,11 +25,14 @@ function Action({
   className?: string
   children: ReactNode
 }) {
+  // 置灰按钮不触发指针事件：tooltip 挂在外层 span 上，原因仍可见。
   return (
     <Tooltip content={label} side="top">
-      <button type="button" aria-label={label} disabled={disabled} onClick={onClick} className={cn(BTN, className)}>
-        {children}
-      </button>
+      <span className="inline-flex">
+        <button type="button" aria-label={label} disabled={disabled} onClick={onClick} className={cn(BTN, className)}>
+          {children}
+        </button>
+      </span>
     </Tooltip>
   )
 }

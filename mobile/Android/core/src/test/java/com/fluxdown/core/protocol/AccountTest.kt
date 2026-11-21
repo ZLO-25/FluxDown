@@ -65,6 +65,26 @@ class AccountTest {
     }
 
     @Test
+    fun deviceListDecodesCloudShapeAndSkipsUndeletableRows() {
+        val wrapped = SessionDeviceDto.listFromJson(
+            Json.parse(
+                """{"devices":[
+                  {"id":"row1","deviceId":"dev-1","name":"PC","isOnline":false,"isCurrent":false},
+                  {"deviceId":"dev-2","name":"no row id"},
+                  {"id":"row3","name":"no device id"},
+                  {"id":"row4","deviceId":"dev-4","name":"Phone","isCurrent":true}]}""",
+            ),
+        )
+        // 删除用云端行 id 而不是 deviceId；缺任一个的记录无法定位，不能出现在结果里。
+        assertEquals(listOf("row1" to "dev-1", "row4" to "dev-4"), wrapped.map { it.id to it.deviceId })
+        assertTrue(wrapped[1].isCurrent)
+        // agent 也接受裸数组；非对象 / 缺失 = 空。
+        assertEquals(listOf("row1"), SessionDeviceDto.listFromJson(Json.parse("""[{"id":"row1","deviceId":"dev-1"}]""")).map { it.id })
+        assertTrue(SessionDeviceDto.listFromJson(Json.parse("""{"ok":true}""")).isEmpty())
+        assertTrue(SessionDeviceDto.listFromJson(null).isEmpty())
+    }
+
+    @Test
     fun loginResultDecodesEveryStatusLeniently() {
         val ok = AgentLoginResult.fromJson(Json.parse("""{"status":"ok","session":$sessionJson}"""))
         assertTrue(ok is AgentLoginResult.Ok)

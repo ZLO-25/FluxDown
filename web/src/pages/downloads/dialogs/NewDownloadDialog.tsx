@@ -6,37 +6,47 @@
 // - 单条 http(s) 链接先 `daemon.group.resolvePreview` 探测插件多文件清单，命中则进入清单选择建任务组；
 // - 外部捕获（`agent.capture.*`）作为链接行并入表单，提交时经 `agent.capture.resolve` 确认，关闭时未确认的一并忽略。
 
-import { ChevronDown, ChevronRight, FileText, FolderOpen, Plus, X } from 'lucide-react'
+import { ChevronDown, ChevronRight, FileText, FolderOpen, Plus, Sprout, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent } from 'react'
 import { useT } from '../../../i18n'
 import { CUSTOM_CATEGORIES_PREF_KEY, LATER_QUEUE_ID, MAIN_QUEUE_ID, METHOD, RpcError, call, rpc, rpcStore, useAgent, useConfigValues, useConnection, useDaemon } from '../../../lib/rpc'
-import { autoFollowDir, modeDir, pickableCategories, routeBaseDir, routeFollows, routeFromCategories, routeSaveDir } from '../../../lib/categoryRoute'
+import { LAST_CATEGORY_MODE_PREF, autoFollowDir, categoryModeFromPreference, categoryModePreference, eligibleRoute, matchedCategory, modeDir, pickableCategories, routeBaseDir, routeFollows, routeFromCategories, routeSaveDir } from '../../../lib/categoryRoute'
 import type { CategoryPickMode } from '../../../lib/categoryRoute'
 import { categoriesFromPreference } from '../model/categories'
 import { cloudPresenceKnown } from '../../../lib/cloud-presence'
 import { describeUploadError } from '../../../lib/rpcErrorText'
 import { ThreadsRiskCallout } from '../../../lib/ThreadsRiskCallout'
 import type { AgentSnapshot, CloudDevice, JsonValue, LinkDeviceInfo, PendingCaptureDto, QueueDto, ResolvePreviewResponse } from '../../../lib/rpc'
+import { UserAgentPresetControl } from '../../userAgent/UserAgentPresetControl'
 import { Button, Dialog, DialogFooter, FieldError, FieldHint, FieldLabel, Form, FormField, FormRow, Icon, Input, InputWithAction, OptionGroup, OptionRow, Select, Spinner, Switch, Textarea, toast } from '../../../ui'
 import type { MenuEntry } from '../../../ui'
 import { FsPickerDialog } from './FsPickerDialog'
 import { ManifestSelectDialog } from './ManifestSelectDialog'
 import type { ManifestBaseOptions } from './ManifestSelectDialog'
-import { DEFAULT_HASH_ALGORITHM, HASH_ALGORITHMS, MAX_THREADS, PROXY_CHOICES, THREAD_PRESETS, UA_PRESET_CUSTOM, UA_PRESET_DEFAULT, UA_PRESET_KEYS } from './model'
+import { DEFAULT_HASH_ALGORITHM, HASH_ALGORITHMS, MAX_THREADS, PROXY_CHOICES, THREAD_PRESETS } from './model'
 import type { DraftOptions, ProxyChoice, ThreadChoice, UrlEntry } from './model'
-import { appendEntries, buildBatch, buildRequests, captureEntry, checksumSpec, customSegments, detectUaPreset, entryToText, isHttpUrl, isMagnetUrl, manualProxyUrl, parseEntries, parseInput, proxyWire, threadChoiceFromSegments, uaPresetValue } from './model'
-import { applyHints, emptyHints, emptyTracking, hintsEqual } from './aria2c'
+import { appendEntries, buildBatch, buildRequests, captureEntry, capturedReferrer, checksumSpec, customSegments, entryToText, isHttpUrl, isMagnetUrl, manualProxyUrl, parseEntries, parseInput, proxyWire, threadChoiceFromSegments } from './model'
+import { applyHints, emptyHints, emptyTracking, hintsEqual, planFieldFill } from './aria2c'
 import type { FillTracking, RequestHints } from './aria2c'
 import { IMPORT_CHUNK_SIZE, importNotice, runImport } from './importRunner'
 import type { ImportProgress } from './importRunner'
 import { SplitButton } from './SplitButton'
-import { capturesShown, closeNewDownload } from './store'
+import { capturesShown, closeNewDownload, openSeedLocal } from './store'
 import type { NewDownloadSession } from './store'
 import { isTorrentFile, submitTorrentFiles } from './torrents'
 import { SaveDirCombo } from './SaveDirCombo'
 import { CategoryPicker } from './CategoryPicker'
-import { SAVE_DIR_HISTORY_ENABLED_PREF, SAVE_DIR_HISTORY_PREF, readSaveDirHistory, recordSaveDir, saveDirChoices } from '../../../lib/saveDirHistory'
+import {
+  CATEGORY_SAVE_DIR_HISTORY_PREF,
+  SAVE_DIR_HISTORY_ENABLED_PREF,
+  SAVE_DIR_HISTORY_PREF,
+  readCategorySaveDirHistory,
+  readSaveDirHistory,
+  recordCategorySaveDir,
+  recordSaveDir,
+  saveDirChoices,
+} from '../../../lib/saveDirHistory'
 import { accountErrorKey } from '../../settings/sections/account/errorText'
 import { buildRemoteTargets, checkRemoteSaveDir, dispatchRoute, LOCAL_TARGET, linkDispatchParams, pathExample, remoteDispatchParams, resolveTargetValue, summarizeDispatch } from './target'
 import type { RemoteTarget } from './target'
@@ -104,6 +114,8 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
   const historyEnabled = useAgent((snapshot) => snapshot.preferences.values[SAVE_DIR_HISTORY_ENABLED_PREF] !== false, true)
   const historyValue = useAgent((snapshot) => snapshot.preferences.values[SAVE_DIR_HISTORY_PREF], undefined)
   const saveDirHistory = useMemo(() => (historyEnabled ? readSaveDirHistory(historyValue) : null), [historyEnabled, historyValue])
+  const categoryHistoryValue = useAgent((snapshot) => snapshot.preferences.values[CATEGORY_SAVE_DIR_HISTORY_PREF], undefined)
+  const categoryHistory = useMemo(() => readCategorySaveDirHistory(categoryHistoryValue), [categoryHistoryValue])
 
   const [text, setText] = useState(() => session.initialUrls.join('\n'))
   const [captures, setCaptures] = useState<PendingCaptureDto[]>([])
@@ -118,9 +130,10 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
   const [proxyChoice, setProxyChoice] = useState<ProxyChoice>('follow')
   const [customProxy, setCustomProxy] = useState('')
   const [ignoreTls, setIgnoreTls] = useState(false)
-  const [uaPreset, setUaPreset] = useState(UA_PRESET_DEFAULT)
+  
   const [userAgent, setUserAgent] = useState('')
   const [cookie, setCookie] = useState('')
+  const [referrer, setReferrer] = useState('')
   const [hashAlgorithm, setHashAlgorithm] = useState(DEFAULT_HASH_ALGORITHM)
   const [checksum, setChecksum] = useState('')
   const [headers, setHeaders] = useState<HeaderRow[]>([])
@@ -155,14 +168,34 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
     })
     fillTracking.current = result.tracking
     if (result.cookie !== cookie) setCookie(result.cookie)
-    if (result.userAgent !== userAgent) {
-      setUserAgent(result.userAgent)
-      setUaPreset(detectUaPreset(result.userAgent))
-    }
+    if (result.userAgent !== userAgent) setUserAgent(result.userAgent)
     if (result.rows.length !== headers.length || result.rows.some((row, index) => row !== headers[index])) setHeaders(result.rows)
     if (result.filled) setAdvancedOpen(true)
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅在命令头部信息变化时回填，表单当前值取渲染时快照
   }, [parsed.hints])
+
+  // 「来源页」框只有这一份回填记录（`planFieldFill`）：aria2c 命令带 `--referer` / `Referer` 头时用命令的值，
+  // 否则单条外部捕获取捕获的来源页；两者都没有时清掉带入值（批量各捕获由 agent 沿用自己的来源页）。
+  // 带入的值在折叠的「高级」里，展开让用户看得到发出去的内容。
+  const referrerHint = parsed.hints.referrer || capturedReferrer(entries, captures)
+  const lastReferrerHint = useRef('')
+  const referrerFilled = useRef<string | null>(null)
+  useEffect(() => {
+    if (referrerHint === lastReferrerHint.current) return
+    lastReferrerHint.current = referrerHint
+    const plan = planFieldFill(referrer, referrerFilled.current, referrerHint)
+    if (plan.kind === 'forget') {
+      referrerFilled.current = null
+    } else if (plan.kind === 'set') {
+      setReferrer(plan.value)
+      referrerFilled.current = plan.value
+      setAdvancedOpen(true)
+    } else if (plan.kind === 'clear') {
+      setReferrer('')
+      referrerFilled.current = null
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅在捕获来源页变化时处理，表单当前值取渲染时快照
+  }, [referrerHint])
   const count = entries.length
   const batch = count > 1
   const allMagnet = count > 0 && entries.every((entry) => isMagnetUrl(entry.url))
@@ -173,28 +206,61 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
   // ── 分类下拉：Auto 模式下目录框跟随识别出的文件名（规则见 `lib/categoryRoute.ts`）──
   const categoriesPref = useAgent((snapshot) => snapshot.preferences.values[CUSTOM_CATEGORIES_PREF_KEY], undefined)
   const categories = useMemo(() => categoriesFromPreference(categoriesPref), [categoriesPref])
-  const categoryRoute = useMemo(() => routeFromCategories(categories), [categories])
   const categoryOptions = useMemo(() => pickableCategories(categories), [categories])
-  const [categoryMode, setCategoryMode] = useState<CategoryPickMode>({ kind: 'auto' })
-  /** 上一次自动写入目录框的值；用户手改后与之不等，不再覆盖。 */
-  const lastAutoDir = useRef<string | null>(null)
-  const categoryShown = categoryRoute !== null && !target
+  const categoryRoute = useMemo(() => routeFromCategories(categories), [categories])
+  const lastCategoryMode = useAgent((snapshot) => snapshot.preferences.values[LAST_CATEGORY_MODE_PREF], undefined)
+  const [categoryMode, setCategoryMode] = useState<CategoryPickMode>(() =>
+    categoryModeFromPreference(lastCategoryMode, categoriesFromPreference(rpcStore.peek().snapshot?.preferences.values[CUSTOM_CATEGORIES_PREF_KEY])),
+  )
+  const categoryModeInitialized = useRef(false)
+  /** 程序最近一次写入目录框的值（自动跟随 / 切换模式 / 捕获预填）；目录框与之不等即视为用户手改。 */
+  const lastWrittenDir = useRef<string | null>(null)
+  /** 用户直接编辑/浏览选择后明确优先于自动路由，包括目录恰为默认或分类目录。 */
+  const saveDirManuallyChosen = useRef(false)
+  const categoryShown = !target
   const predictedName = rename.trim() !== '' ? rename.trim() : (entries[0]?.fileName ?? '')
   const predictedUrl = entries[0]?.url ?? ''
-  const predictedDir = categoryShown && categoryRoute ? routeSaveDir(categoryRoute, predictedName, predictedUrl) : null
+  useEffect(() => {
+    if (!categoryShown || categoryModeInitialized.current) return
+    categoryModeInitialized.current = true
+    if (categoryMode.kind === 'category' || categoryMode.kind === 'none') {
+      const validMode = categoryMode.kind === 'category' && !categoryOptions.some((category) => category.id === categoryMode.id)
+        ? { kind: 'auto' as const }
+        : categoryMode
+      setCategoryMode(validMode)
+      const next = modeDir(validMode, categoryOptions, context.saveDir, predictedDir)
+      lastWrittenDir.current = next
+      if (validMode.kind === 'category' || validMode.kind === 'none') setSaveDir(next)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- restoration only runs once when local picker becomes visible
+  }, [categoryShown])
+  const predictedDir = categoryRoute ? routeSaveDir(categoryRoute, predictedName, predictedUrl) : null
   useEffect(() => {
     if (!categoryShown || categoryMode.kind !== 'auto') return
-    const next = autoFollowDir(saveDir, context.saveDir, lastAutoDir.current, predictedDir)
+    const next = autoFollowDir(saveDir, context.saveDir, lastWrittenDir.current, predictedDir, saveDirManuallyChosen.current)
     if (next === null) return
-    lastAutoDir.current = next
+    lastWrittenDir.current = next
     if (next !== saveDir) setSaveDir(next)
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅在预测输入 / 模式变化时跟随，目录框当前值取渲染时快照
   }, [categoryShown, categoryMode.kind, predictedDir])
+  useEffect(() => {
+    if (categoryMode.kind !== 'category' || categoryOptions.some((category) => category.id === categoryMode.id)) return
+    setCategoryMode({ kind: 'auto' })
+    saveDirManuallyChosen.current = false
+    const next = modeDir({ kind: 'auto' }, categoryOptions, context.saveDir, predictedDir)
+    lastWrittenDir.current = next
+    setSaveDir(next)
+  }, [categoryMode, categoryOptions, context.saveDir, predictedDir])
   const pickCategory = (mode: CategoryPickMode) => {
+    saveDirManuallyChosen.current = false
     setCategoryMode(mode)
     const next = modeDir(mode, categoryOptions, context.saveDir, predictedDir)
-    lastAutoDir.current = mode.kind === 'auto' ? next : null
+    lastWrittenDir.current = next
     setSaveDir(next)
+  }
+  const chooseSaveDir = (dir: string) => {
+    saveDirManuallyChosen.current = true
+    setSaveDir(dir)
   }
 
   // ── 外部捕获并入表单 ──
@@ -212,7 +278,10 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
       if (current.trim() === '') {
         const dir = fresh.map((capture) => capture.saveDir.trim()).find((value) => value !== '')
         if (dir) {
-          lastAutoDir.current = dir
+          // 非默认 / 分类目录的捕获目录是显式选择；不得再被 Auto 路由覆盖。
+          const followsRoute = categoryRoute !== null && routeFollows(categoryRoute, dir, context.saveDir)
+          saveDirManuallyChosen.current = !followsRoute && dir !== context.saveDir
+          if (followsRoute || dir === context.saveDir) lastWrittenDir.current = dir
           setSaveDir(dir)
         }
       }
@@ -224,7 +293,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
       const kept = prev.filter((capture) => pendingCaptures.some((pending) => pending.transactionId === capture.transactionId))
       return kept.length === prev.length ? prev : kept
     })
-  }, [pendingCaptures])
+  }, [pendingCaptures, categoryRoute, context.saveDir])
 
   // 关闭 / 取消时，仍未确认的捕获一并忽略（agent 不留悬挂事务）。
   useEffect(
@@ -304,15 +373,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
     setThreads(next)
   }
 
-  const changeUaPreset = (key: string) => {
-    setUaPreset(key)
-    if (key !== UA_PRESET_CUSTOM) setUserAgent(uaPresetValue(key))
-  }
-
-  const editUserAgent = (value: string) => {
-    setUserAgent(value)
-    setUaPreset(detectUaPreset(value))
-  }
+  const editUserAgent = (value: string) => setUserAgent(value)
 
   const segments = threads === 'auto' ? 0 : threads === 'custom' ? customSegments(customThreads) : Math.min(Number(threads), MAX_THREADS)
 
@@ -325,13 +386,22 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
     return map
   }
 
-  // 保存目录历史（偏好关闭时为空）中除当前输入以外的目录，交给组合框下拉。
-  const saveDirOptions = saveDirHistory ? saveDirChoices(saveDirHistory, saveDir) : []
+  // 分类记忆键：指定分类 = 该分类；自动 = 命中分类；不分类 / 无分类选择器 = 无。
+  const memoryCategoryId = !categoryShown
+    ? null
+    : categoryMode.kind === 'category'
+      ? categoryMode.id
+      : categoryMode.kind === 'auto'
+        ? (matchedCategory(categoryOptions, predictedDir)?.id ?? null)
+        : null
+  // 保存目录历史（偏好关闭时为空）：该分类记忆在前、全局历史在后，排除当前输入，交给组合框下拉。
+  const saveDirOptions = saveDirHistory ? saveDirChoices(memoryCategoryId ? (categoryHistory[memoryCategoryId] ?? []) : [], saveDirHistory, saveDir) : []
 
   const draftOptions = (later: boolean, queueOverride: string | undefined): DraftOptions => ({
     saveDir: saveDir.trim(),
     segments,
     cookies: cookie.trim(),
+    referrer: referrer.trim(),
     proxyUrl: proxyWire(proxyChoice, manualProxy, customProxy),
     userAgent: userAgent.trim(),
     queueId: queueOverride ?? (later ? LATER_QUEUE_ID : context.queueId),
@@ -353,8 +423,18 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
     if (prefs[SAVE_DIR_HISTORY_ENABLED_PREF] !== false) {
       const next = recordSaveDir(readSaveDirHistory(prefs[SAVE_DIR_HISTORY_PREF]), dir)
       if (next) values[SAVE_DIR_HISTORY_PREF] = next
+      // 分类记忆：有分类键且目录框被手改时，记到该分类名下。
+      if (memoryCategoryId && saveDirManuallyChosen.current) {
+        const nextByCategory = recordCategorySaveDir(readCategorySaveDirHistory(prefs[CATEGORY_SAVE_DIR_HISTORY_PREF]), memoryCategoryId, dir)
+        if (nextByCategory) values[CATEGORY_SAVE_DIR_HISTORY_PREF] = nextByCategory
+      }
     }
     void rpc.agent.preferences.patch({ values, sync: false }).catch(() => undefined)
+  }
+
+  /** 本机提交未被取消后记录分类模式（与 GPUI `run_submission` 同时机）；取消表单 / 下发到其它设备不记。 */
+  const rememberCategoryMode = () => {
+    void rpc.agent.preferences.patch({ values: { [LAST_CATEGORY_MODE_PREF]: categoryModePreference(categoryMode) }, sync: false }).catch(() => undefined)
   }
 
   /** 逐条下发到云账号设备 / 已配对设备；成功的从文本框移除，失败的保留并逐条显示原因。 */
@@ -411,6 +491,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
           {
             url: single.url,
             cookies: options.cookies || undefined,
+            referrer: options.referrer || undefined,
             userAgent: options.userAgent || undefined,
             extraHeaders: Object.keys(options.headers).length > 0 ? options.headers : undefined,
           },
@@ -418,19 +499,24 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
         )
         if (token !== resolveToken.current) return // 用户取消了探测
         if (!preview.error && preview.items.length > 0) {
+          const followed = eligibleRoute(categoryRoute, categoryMode, saveDirManuallyChosen.current, options.saveDir, context.saveDir)
+          // Group creation accepts categoryRoute; retain the form's base directory and routing policy.
           setManifest({
             preview,
             sourceUrl: single.url,
             base: {
-              saveDir: options.saveDir,
+              saveDir: followed ? routeBaseDir(followed, options.saveDir, context.saveDir) : options.saveDir,
+              offeredSaveDir: context.saveDir,
               // 「稍后下载」触发的清单：主按钮仍是「开始下载」，必须落到开始队列而非稍后队列。
               queueId: later ? context.queueId : options.queueId,
               segments: options.segments,
               cookies: options.cookies,
+              referrer: options.referrer,
               userAgent: options.userAgent,
               proxyUrl: options.proxyUrl,
               headers: options.headers,
               ignoreTlsErrors: options.ignoreTlsErrors,
+              categoryRoute: followed ?? undefined,
             },
           })
           setPhase('idle')
@@ -455,7 +541,12 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
         continue
       }
       try {
-        await rpc.agent.capture.resolve({ transactionId: capture.transactionId, accepted: true, request })
+        await rpc.agent.capture.resolve({
+          transactionId: capture.transactionId,
+          accepted: true,
+          disableCategoryRoute: eligibleRoute(categoryRoute, categoryMode, saveDirManuallyChosen.current, options.saveDir, context.saveDir) === null,
+          request,
+        })
         consumed.add(capture.transactionId)
       } catch (error) {
         retained.push({ index, error })
@@ -467,6 +558,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
     }
 
     let noticeText: string | null = null
+    let cancelled = false
     if (plain.length > 0) {
       const batch = buildBatch(
         plain.map((index) => entries[index]),
@@ -477,8 +569,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
       let { common } = batch
       // 分类路由：只对本机提交生效；目录仍是表单初始值 / 分类目录时交给引擎按文件名定落点；
       // 分类下拉选了「不分类」/ 指定分类时用户已显式定目录，不路由。
-      const route = categoryShown && categoryMode.kind === 'auto' ? categoryRoute : null
-      const followed = route !== null && routeFollows(route, options.saveDir, context.saveDir) ? route : null
+      const followed = eligibleRoute(categoryRoute, categoryMode, saveDirManuallyChosen.current, options.saveDir, context.saveDir)
       if (followed) common = { ...common, saveDir: routeBaseDir(followed, options.saveDir, context.saveDir) }
       const controller = new AbortController()
       importAbort.current = controller
@@ -507,6 +598,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
       const total = summary.total.toLocaleString()
       const reason = summary.error ? describeUploadError(new RpcError({ code: -32000, message: '', data: summary.error }), t) : null
       if (summary.kind === 'cancelled') {
+        cancelled = true
         const head = t('importCancelled', { added, total })
         noticeText = reason ? `${head}: ${reason}` : head
         if (retained.length === 0) toast.key('importCancelled', 'success', { added, total })
@@ -517,6 +609,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
         noticeText = reason
       }
     }
+    if (!cancelled) rememberCategoryMode()
 
     if (retained.length === 0) {
       closeNewDownload()
@@ -539,7 +632,10 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
     setBusyFiles(true)
     try {
       const created = await submitTorrentFiles(files, { saveDir: saveDir.trim(), queueId: context.queueId })
-      if (created > 0) closeNewDownload()
+      if (created > 0) {
+        rememberCategoryMode()
+        closeNewDownload()
+      }
     } catch (error) {
       toast.error(describeUploadError(error, t))
     } finally {
@@ -601,22 +697,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
     { value: 'custom' as ThreadChoice, label: t('customThreads') },
   ]
 
-  const uaLabel = (key: string): string => {
-    switch (key) {
-      case 'chrome':
-        return t('userAgentPresetChrome')
-      case 'firefox':
-        return t('userAgentPresetFirefox')
-      case 'edge':
-        return t('userAgentPresetEdge')
-      case 'safari':
-        return t('userAgentPresetSafari')
-      case UA_PRESET_CUSTOM:
-        return t('userAgentPresetCustom')
-      default:
-        return t('queueUaInheritGlobal')
-    }
-  }
+
 
   const showAuth = !batch && !allMagnet
   const startLabel = count > 1 ? t('startBatchDownload', { count }) : t('startDownload')
@@ -747,6 +828,17 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
               <Button variant="ghost" icon={FolderOpen} disabled={busy || target !== null} onClick={() => torrentInput.current?.click()}>
                 {t('openTorrentFile')}
               </Button>
+              <Button
+                variant="ghost"
+                icon={Sprout}
+                disabled={busy || target !== null}
+                onClick={() => {
+                  closeNewDownload()
+                  openSeedLocal()
+                }}
+              >
+                {t('seedLocalTitle')}
+              </Button>
               <Button variant="ghost" icon={FileText} disabled={busy} onClick={() => txtInput.current?.click()}>
                 {t('importTxtFile')}
               </Button>
@@ -811,7 +903,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
               <InputWithAction
                 input={
                   <div className="flex flex-wrap items-center gap-2">
-                    {categoryShown ? <CategoryPicker mode={categoryMode} options={categoryOptions} predicted={predictedDir} onChange={pickCategory} /> : null}
+                    <CategoryPicker mode={categoryMode} options={categoryOptions} predicted={predictedDir} onChange={pickCategory} />
                     <div className="min-w-[14rem] flex-1">
                       <SaveDirCombo
                         id="new-download-save-dir"
@@ -819,7 +911,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
                         placeholder={t('selectSaveDir')}
                         choices={saveDirOptions}
                         label={t('saveDirRecent')}
-                        onChange={setSaveDir}
+                        onChange={chooseSaveDir}
                       />
                     </div>
                   </div>
@@ -922,16 +1014,15 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
                 </FormField>
 
                 <FormField label={t('userAgent')} hint={t('userAgentTaskPlaceholder')}>
-                  <div className="flex flex-col gap-2 min-[560px]:flex-row">
-                    <div className="min-[560px]:w-[140px] min-[560px]:shrink-0">
-                      <Select value={uaPreset} options={UA_PRESET_KEYS.map((key) => ({ value: key, label: uaLabel(key) }))} aria-label={t('userAgent')} onValueChange={changeUaPreset} />
-                    </div>
-                    <Input value={userAgent} placeholder={t('userAgentTaskPlaceholder')} spellCheck={false} aria-label={t('userAgent')} onChange={(event) => editUserAgent(event.target.value)} />
-                  </div>
+                  <UserAgentPresetControl value={userAgent} onChange={editUserAgent} />
                 </FormField>
 
                 <FormField label={t('taskCookie')} htmlFor="new-download-cookie" hint={t('taskCookieDesc')}>
                   <Textarea id="new-download-cookie" rows={3} value={cookie} spellCheck={false} placeholder={t('taskCookiePlaceholder')} onChange={(event) => setCookie(event.target.value)} />
+                </FormField>
+
+                <FormField label={t('taskReferrer')} htmlFor="new-download-referrer" hint={t('taskReferrerDesc')}>
+                  <Input id="new-download-referrer" value={referrer} placeholder={t('taskReferrerPlaceholder')} spellCheck={false} onChange={(event) => setReferrer(event.target.value)} />
                 </FormField>
 
                 <FormField label={t('taskChecksum')} hint={t('taskChecksumDesc')}>
@@ -1005,11 +1096,12 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
           onCancel={() => setManifest(null)}
           onCreated={() => {
             rememberSaveDir(manifest.base.saveDir)
+            rememberCategoryMode()
             closeNewDownload()
           }}
         />
       ) : null}
-      <FsPickerDialog open={pickerOpen} onOpenChange={setPickerOpen} initialPath={saveDir} onSelect={setSaveDir} />
+      <FsPickerDialog open={pickerOpen} onOpenChange={setPickerOpen} initialPath={saveDir} onSelect={chooseSaveDir} />
     </>
   )
 }

@@ -1,18 +1,27 @@
 // 下载页命令：对应 GPUI 的 DownloadsCommand（downloads_port.rs），全部走 agent /rpc。
 // 本地任务 → `daemon.*`；远程任务 → `agent.remote.command`。失败统一 toast。
 // 「打开文件 / 在文件夹中显示」只在连接带 `agent.openTaskFiles` 能力（agent 与浏览器同机）时提供，
-// 其余情况由浏览器下载已完成文件替代。
+// 其余情况由浏览器下载已完成文件替代；「复制文件」另需 `agent.copyTaskFiles`（同机桌面会话），
+// 远程 / NAS 连接不提供（浏览器 Clipboard API 不能写入文件），同样以浏览器下载替代。
 
 import { copyText } from '../../../lib/copy'
 import { t } from '../../../i18n'
-import { CAPABILITY_AGENT_OPEN_TASK_FILES, RpcError, downloadTaskFile, rpc, rpcStore } from '../../../lib/rpc'
+import {
+  CAPABILITY_AGENT_COPY_TASK_FILES,
+  CAPABILITY_AGENT_OPEN_TASK_FILES,
+  RpcError,
+  downloadTaskFile,
+  rpc,
+  rpcStore,
+} from '../../../lib/rpc'
 import type { CreateTaskRequest, RemoteCommandParams } from '../../../lib/rpc'
 import { confirmDialog, toast } from '../../../ui'
 import { toastRpcError } from '../../../lib/rpcToast'
 import { rpcErrorKind, rpcErrorText } from '../../../lib/rpcErrorText'
 import { planTaskCommand } from './batchPlan'
 import { folderAnchorMember } from './groupTree'
-import { PLUGIN_ERROR_PREFIX, shareUrl } from './task'
+import { PLUGIN_ERROR_PREFIX, copyableShareUrl } from './task'
+import { pieceEndsParams, pieceOrderTargets, pieceSequentialParams, superSeedingTargets } from './taskEdit'
 import type { DownloadTaskView } from './task'
 
 async function guarded(work: () => Promise<unknown>): Promise<boolean> {
@@ -119,8 +128,70 @@ export async function resumeIfFailed(taskId: string, wasFailed: boolean): Promis
   return wasFailed ? guarded(() => rpc.daemon.task.resume({ taskId })) : true
 }
 
+/** BT 下载顺序：只对状态不同的任务发 `sequential`；已一致则不下发。 */
+export function setPieceOrder(views: readonly DownloadTaskView[], sequential: boolean): Promise<boolean> {
+  const targets = pieceOrderTargets(views, sequential)
+  if (targets.length === 0) return Promise.resolve(true)
+  return guardedAll(targets.map((view) => () => rpc.daemon.task.setPiecePicking(pieceSequentialParams(view.taskId, sequential))))
+}
+
+/** BT 先下载首尾：每个任务一次调用，只传该字段。失败走统一 toast。 */
+export function setFirstLastPieces(views: readonly DownloadTaskView[], allOn: boolean): Promise<boolean> {
+  return guardedAll(views.map((view) => () => rpc.daemon.task.setPiecePicking(pieceEndsParams(view.taskId, allOn))))
+}
+
+/** BT 强制重新校验：每个任务一次调用；daemon 受理即返回，全部受理后提示已开始（多选取第一个任务名，同 GPUI）。 */
+export async function forceRecheckViews(views: readonly DownloadTaskView[]): Promise<boolean> {
+  const ok = await guardedAll(views.map((view) => () => rpc.daemon.task.recheck({ taskId: view.taskId })))
+  const first = views[0]
+  if (ok && first) toast.info(t('btForceRecheckStarted', { name: first.name }))
+  return ok
+}
+
+/** BT 超级做种：只对状态不同的任务下发 `enabled`；已一致则不下发。 */
+export function setSuperSeeding(views: readonly DownloadTaskView[], enabled: boolean): Promise<boolean> {
+  const targets = superSeedingTargets(views, enabled)
+  return guardedAll(targets.map((view) => () => rpc.daemon.task.setSuperSeeding({ taskId: view.taskId, enabled })))
+}
+
+/** 「移动到…」进行中的任务 id（GPUI `bt_moving`）：同一任务在完成前不再发起第二次移动。 */
+const movingStorage = new Set<string>()
+
+/** 该任务是否有一次「移动到…」尚未结束。 */
+export function isMovingStorage(taskId: string): boolean {
+  return movingStorage.has(taskId)
+}
+
+/**
+ * 移动任务数据到新的保存目录（慢方法，进行中由调用方显示加载态）：BT 走 BT 会话搬移，其余协议由 daemon 转统一编辑的搬移。
+ * 完成后提示新位置；失败走统一错误 toast。目标与当前相同时 daemon 直接返回 ok，这里不另作判断。
+ * 同一任务已有移动在进行时直接返回 false、不下发。
+ */
+export async function moveTaskStorage(taskId: string, saveDir: string): Promise<boolean> {
+  if (movingStorage.has(taskId)) return false
+  movingStorage.add(taskId)
+  try {
+    const ok = await guarded(() => rpc.daemon.task.moveStorage({ taskId, saveDir }))
+    if (ok) toast.success(t('btMoveStorageDone', { path: saveDir }))
+    return ok
+  } finally {
+    movingStorage.delete(taskId)
+  }
+}
+
+/** 立即向 tracker 重新汇报；任务不在运行时 daemon 返回 `taskStateConflict`，走统一错误 toast。 */
+export async function reannounceTask(taskId: string): Promise<boolean> {
+  const ok = await guarded(() => rpc.daemon.task.reannounce({ taskId }))
+  if (ok) toast.success(t('btReannounceDone'))
+  return ok
+}
+
 export function isPluginRetryError(view: DownloadTaskView): boolean {
-  return view.state === 'failed' && view.errorMessage.startsWith(PLUGIN_ERROR_PREFIX)
+  return (
+    view.state === 'failed' &&
+    view.groupId === '' &&
+    view.errorMessage.startsWith(PLUGIN_ERROR_PREFIX)
+  )
 }
 
 export async function confirmIgnorePluginRetry(taskId: string): Promise<boolean> {
@@ -168,10 +239,74 @@ export function redownloadViews(views: readonly DownloadTaskView[]): Promise<boo
 }
 
 export function copyUrls(views: readonly DownloadTaskView[]): void {
-  const urls = views.map(shareUrl).filter((url) => url !== '')
+  const urls = views.map(copyableShareUrl).filter((url) => url !== '')
   if (urls.length === 0) return
   copyText(urls.join('\n'))
   toast.key('urlCopied', 'success')
+}
+
+/**
+ * 「复制下载地址」可见（GPUI `copy_url_visible`）：单选要求有真实链接，且本机 BT 的磁力原文
+ * 交给「复制磁力链接」不重复显示；多选没有「复制磁力链接」，有一项可复制即显示。
+ */
+export function canCopyUrls(views: readonly DownloadTaskView[]): boolean {
+  const [only] = views
+  if (views.length === 1 && only !== undefined) {
+    const url = copyableShareUrl(only)
+    return url !== '' && !(canShareTorrent(views) && url.toLowerCase().startsWith('magnet:'))
+  }
+  return views.some((view) => copyableShareUrl(view) !== '')
+}
+
+/** 「复制磁力链接 / 导出 .torrent」：单选的本地 BT 任务（任意状态）。 */
+export const canShareTorrent = (views: readonly DownloadTaskView[]): boolean =>
+  views.length === 1 && views.every((view) => view.source === 'local' && view.protocol === 'bt')
+
+export async function copyMagnet(view: DownloadTaskView): Promise<void> {
+  try {
+    const share = await rpc.daemon.task.torrentShare({ taskId: view.taskId, includeTorrent: false })
+    copyText(share.magnet)
+    toast.key('btMagnetCopied', 'success')
+  } catch (error) {
+    toastRpcError(error)
+  }
+}
+
+/** 文件名去掉路径分隔符与保留字符，空名回退 `torrent`。 */
+export function torrentFileName(name: string): string {
+  // eslint-disable-next-line no-control-regex
+  const clean = name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').trim().replace(/^\.+/, '')
+  const base = clean === '' ? 'torrent' : clean
+  return base.toLowerCase().endsWith('.torrent') ? base : `${base}.torrent`
+}
+
+function decodeBase64(b64: string): Uint8Array<ArrayBuffer> {
+  const binary = atob(b64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+export async function exportTorrent(view: DownloadTaskView): Promise<void> {
+  try {
+    const share = await rpc.daemon.task.torrentShare({ taskId: view.taskId, includeTorrent: true })
+    if (!share.torrentB64) {
+      toast.key('btNoTorrentFile', 'error')
+      return
+    }
+    const url = URL.createObjectURL(new Blob([decodeBase64(share.torrentB64)], { type: 'application/x-bittorrent' }))
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = torrentFileName(share.name)
+    anchor.setAttribute('data-fluxdown-skip', '1')
+    document.body.append(anchor)
+    anchor.click()
+    anchor.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 10_000)
+    toast.key('btTorrentExported', 'success')
+  } catch (error) {
+    toastRpcError(error)
+  }
 }
 
 /** 只有本地已完成且文件仍在磁盘上的任务有可下载的最终文件。 */
@@ -210,6 +345,32 @@ export async function openTaskFile(taskId: string): Promise<void> {
 }
 
 export const revealTaskFile = (taskId: string) => guarded(() => rpc.agent.platform.revealTask({ taskId }))
+
+/**
+ * 「复制文件」：可多选，全部本地已完成且文件仍在（对齐 GPUI `TaskMenuFacts::has_product_on_disk`），
+ * 且本连接带 `agent.copyTaskFiles`——agent 所在主机就是浏览器所在机器、有桌面剪贴板。
+ */
+export const canCopyTaskFiles = (views: readonly DownloadTaskView[]): boolean =>
+  views.length > 0 &&
+  (rpcStore.peek().hello?.capabilities.includes(CAPABILITY_AGENT_COPY_TASK_FILES) ?? false) &&
+  views.every(isDownloadable)
+
+/** 产物以文件写入主机剪贴板；文件已不在时立即重扫（同 `openTaskFile`），失败文案对齐 GPUI `task_copy.rs`。 */
+export async function copyTaskFiles(views: readonly DownloadTaskView[]): Promise<void> {
+  try {
+    await rpc.agent.platform.copyTaskFiles({ taskIds: views.map((view) => view.taskId) })
+    toast.success(t('fileCopiedToClipboard'))
+  } catch (error) {
+    if (error instanceof RpcError && error.is('notFound')) {
+      rpc.daemon.task.rescan().catch(() => {})
+      toast.error(t('copyFileErrNotFound'))
+    } else if (error instanceof RpcError && error.is('unsupported')) {
+      toast.error(t('copyFileErrUnsupported'))
+    } else {
+      toast.error(`${t('copyFileFailed')} ${rpcErrorText(error, t)}`)
+    }
+  }
+}
 
 /** 已损坏文件名文案：前 3 个，超出部分折叠为「等 N 个」（与 GPUI 同规则）。 */
 function damagedFilesText(files: readonly string[]): string {
@@ -250,6 +411,26 @@ export async function verifyTaskIntegrity(view: DownloadTaskView): Promise<void>
   }
 }
 
+/**
+ * 计算已完成任务的文件哈希。成功不提示（行随 TaskChanged 更新）；失败按冲突原因提示，
+ * `notify = false`（详情打开即算）不提示，行内回落为「计算」按钮。
+ */
+export async function computeTaskFileHash(view: DownloadTaskView, algorithm: string, notify = true): Promise<void> {
+  const name = view.name
+  try {
+    await rpc.daemon.task.hash(view.taskId, algorithm)
+  } catch (error) {
+    if (!notify) return
+    if (error instanceof RpcError && error.is('conflict') && error.reason === 'taskStateConflict') {
+      toast.error(t('fileHashChanged', { name }))
+    } else if (error instanceof RpcError && error.is('conflict') && !error.reason) {
+      toast.warning(t('fileHashBusy', { name }))
+    } else {
+      toast.error(t('fileHashFailed', { name, error: rpcErrorText(error, t) }))
+    }
+  }
+}
+
 // ── 任务组 ──
 
 export const pauseGroup = (groupId: string) => guarded(() => rpc.daemon.group.pause({ groupId }))
@@ -258,6 +439,11 @@ export const resumeGroup = (groupId: string) => guarded(() => rpc.daemon.group.r
 /** 组内失败成员逐个恢复。 */
 export function retryFailedInGroup(views: readonly DownloadTaskView[], groupId: string): Promise<boolean> {
   return resumeViews(views.filter((view) => view.source === 'local' && view.groupId === groupId && view.state === 'failed'))
+}
+
+/** 全局失败重试仅接受当前本机失败任务；不影响筛选状态或远端任务。 */
+export function retryFailedViews(views: readonly DownloadTaskView[]): Promise<boolean> {
+  return resumeViews(views.filter((view) => view.source === 'local' && view.state === 'failed'))
 }
 
 export const deleteGroup = (groupId: string, deleteFiles: boolean) =>

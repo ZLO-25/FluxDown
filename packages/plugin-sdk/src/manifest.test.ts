@@ -9,6 +9,7 @@ import {
   validatePageScriptFiles,
   validateViewIcon,
   validateSniffPack,
+  validateArchiveRulesPack,
   VALID_PERMISSIONS,
   type PluginRisk,
 } from "./manifest";
@@ -79,8 +80,8 @@ describe("misc rules", () => {
     const good = { ...base, settings: [{ key: "k", title: "K", type: "number", min: 1, max: 5, default: "3" }] };
     expect(validateManifest(good, new Set()).ok).toBe(true);
   });
-  test("nine permissions", () => {
-    expect(VALID_PERMISSIONS).toHaveLength(9);
+  test("ten permissions", () => {
+    expect(VALID_PERMISSIONS).toHaveLength(10);
   });
   test("ipv6 network hosts", () => {
     const m = (host: string) => ({
@@ -178,6 +179,29 @@ describe("validatePackage", () => {
     expect(validatePackage(manifest, bad).errors).toEqual(["sniffRules format 须为 fluxdown-sniff-pack", "view 'v' icon 不是 SVG 文档"]);
   });
 
+  test("checks signed archive rules envelope syntax and package contents", () => {
+    const payload = JSON.stringify({
+      format: "fluxdown-archive-rules",
+      schemaVersion: 1,
+      sequence: 1,
+      rules: [{ id: "series", folderName: "Series", match: { extensions: ["mkv"] } }],
+    });
+    const seed = JSON.stringify({ payload, signature: "a".repeat(128) });
+    expect(validateArchiveRulesPack(seed).ok).toBe(true);
+    const manifest = {
+      ...base,
+      permissions: ["archive"],
+      contributes: {
+        archiveRules: {
+          entry: "rules.json",
+          publicKey: "a".repeat(64),
+        },
+      },
+    };
+    expect(validatePackage(manifest, files({ "main.js": "", "rules.json": seed }))).toEqual({ ok: true, errors: [] });
+    expect(validatePackage(manifest, files({ "main.js": "", "rules.json": "{}" })).ok).toBe(false);
+  });
+
   test("backslash paths resolve to the forward-slash package entry", () => {
     const manifest = { ...base, contributes: { views: [{ id: "v", title: "V", location: "activity", icon: "i\\v.svg" }] } };
     expect(validatePackage(manifest, files({ "main.js": "", "i/v.svg": "<html/>" })).errors).toEqual(["view 'v' icon 不是 SVG 文档"]);
@@ -192,16 +216,22 @@ describe("validatePackage", () => {
 describe("reviewOf", () => {
   test("collects every URL scope a reviewer approves, sorted and de-duplicated", () => {
     const review = reviewOf({
-      permissions: ["intercept", "pageScripts"],
+      permissions: ["intercept", "pageScripts", "archive"],
+      main: { imageHosts: ["img.example.com", "same.example.com"] },
       resolvers: [{ match: { urls: ["*://b.example/*"] } }],
       hooks: { match: { urls: ["*://a.example/*", "*://b.example/*"] } },
       interceptors: { match: { urls: ["*://c.example/*"] } },
-      contributes: { pageScripts: [{ matches: ["https://z.example/*"] }, { matches: ["https://y.example/*"] }] },
+      contributes: {
+        pageScripts: [{ matches: ["https://z.example/*"] }, { matches: ["https://y.example/*"] }],
+        views: [{ desktop: { networkHosts: ["same.example.com", "ui.example.com"] } }],
+        archive: "handlers/archive.js",
+      },
     });
     expect(review).toEqual({
-      permissions: ["intercept", "pageScripts"],
+      permissions: ["intercept", "pageScripts", "archive"],
       risk: "full",
-      networkHosts: [],
+      archiveEntry: "handlers/archive.js",
+      networkHosts: ["img.example.com", "same.example.com", "ui.example.com"],
       downloadUrls: ["*://a.example/*", "*://b.example/*", "*://c.example/*"],
       pageScriptMatches: ["https://y.example/*", "https://z.example/*"],
     });

@@ -39,6 +39,7 @@ import com.fluxdown.core.model.SelectionKind
 import com.fluxdown.core.model.SelectionOutcome
 import com.fluxdown.core.model.SelectionRequest
 import com.fluxdown.core.model.Task
+import com.fluxdown.core.model.cancelDeletesTask
 import com.fluxdown.core.model.TaskProtocol
 import com.fluxdown.core.store.HostStore
 import com.fluxdown.fluxui.controls.ButtonVariant
@@ -81,7 +82,8 @@ private class SheetMemory {
  * X1 BT 文件 / X2 HLS 画质 / X3 插件变体：引擎发起的选择请求。
  *
  * - [request] 为状态里最早的待处理请求（null = 没有）；请求从状态消失即关闭（含其它设备已答复）。
- * - 倒计时按 `deadlineUnixMs` 与当前时间逐帧重算（不累减），到 0 以 `defaultChoice` 答复。
+ * - 倒计时按 `deadlineUnixMs` 与当前时间逐帧重算（不累减），到 0 以 `defaultChoice` 答复；
+ *   无截止（[SelectionRequest.hasDeadline] 为 false）时不显示倒计时、不自动答复。
  * - X1 / X3 可划走（= [SelectionOutcome.Cancelled]），X2 不可划走。
  */
 @Composable
@@ -109,15 +111,17 @@ fun SelectionRequestSheet(request: SelectionRequest?) {
         val task by remember { derivedStateOf { host.value.task(shown.taskId) } }
         val countdown = rememberCountdown(shown, active = request != null)
 
-        // 到 0：按默认项答复
-        LaunchedEffect(shown.requestId) {
-            snapshotFlow { countdown.seconds }.first { it <= 0 }
-            resolver.resolve(
-                shown,
-                shown.defaultChoice,
-                context.str(R.string.mobileSelectionAutoApplied),
-                userInitiated = false,
-            )
+        // 到 0：按默认项答复（无截止的请求只等用户）
+        if (shown.hasDeadline) {
+            LaunchedEffect(shown.requestId) {
+                snapshotFlow { countdown.seconds }.first { it <= 0 }
+                resolver.resolve(
+                    shown,
+                    shown.defaultChoice,
+                    context.str(R.string.mobileSelectionAutoApplied),
+                    userInitiated = false,
+                )
+            }
         }
 
         val ui = SelectionUi(shown, countdown, resolver, taskOf = { task }, visible = request != null)
@@ -230,6 +234,34 @@ internal class SelectionResolver(
         resolve(request, SelectionOutcome.Cancelled, context.str(R.string.mobileSelectionCancelled), userInitiated = true)
     }
 
+    /**
+     * 「取消」按钮：BT（[SelectionKind.cancelDeletesTask]）删除任务及文件，主机随之撤回待选请求、Sheet 自行关闭；
+     * 其余类型同 [cancel]。划走不走这里（划走 = 任务保持暂停）。
+     */
+    fun cancelButton(request: SelectionRequest) {
+        if (!request.kind.cancelDeletesTask) return cancel(request)
+        if (store.state.value.isReadOnly) {
+            haptics.reject()
+            overlays.toast(context.str(R.string.localServiceDisconnected), FluxToastKind.Error, FluxIcons.WifiOff)
+            return
+        }
+        if (!inFlight.add(request.requestId)) return
+        ours += request.requestId // 先登记：SelectionResolved 可能先于本协程恢复到达
+        scope.launch {
+            try {
+                session().delete(request.taskId, deleteFiles = true)
+                haptics.confirm()
+                overlays.toast(context.str(R.string.mobileTaskFileDeleted), FluxToastKind.Success, FluxIcons.CircleCheck)
+            } catch (e: HostException) {
+                ours -= request.requestId
+                haptics.reject()
+                overlays.toast(errorText(e), FluxToastKind.Error)
+            } finally {
+                inFlight.remove(request.requestId)
+            }
+        }
+    }
+
     /** 已改动选择后划走：先确认。 */
     fun confirmDiscard(request: SelectionRequest) {
         overlays.showDialog(
@@ -260,6 +292,9 @@ internal class Countdown(
     val seconds: Int by secondsState
     val warn: Boolean get() = seconds in 0..5
 
+    /** 有截止时刻；无截止时页脚不显示倒计时。 */
+    val enabled: Boolean get() = deadlineMs != SelectionRequest.NO_DEADLINE
+
     /** 环的剩余比例（1 = 满环）；在绘制阶段读取，逐帧重算。 */
     fun fraction(): Float = ((deadlineMs - now.value).toFloat() / totalMs).coerceIn(0f, 1f)
 }
@@ -282,7 +317,7 @@ internal fun rememberCountdown(key: Any, deadlineUnixMs: Long, active: Boolean):
         derivedStateOf { ceil((deadlineUnixMs - now.longValue) / 1000.0).toInt().coerceAtLeast(0) }
     }
     LaunchedEffect(key, active, reduce) {
-        if (!active) return@LaunchedEffect
+        if (!active || deadlineUnixMs == SelectionRequest.NO_DEADLINE) return@LaunchedEffect
         while (true) {
             val t = System.currentTimeMillis()
             now.longValue = t
@@ -354,7 +389,7 @@ internal fun CountdownLine(countdown: Countdown, labelRes: Int = R.string.select
 internal fun SelectionFooter(countdown: Countdown, actions: @Composable RowScope.() -> Unit) {
     FluxSheetFooter {
         Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            CountdownLine(countdown)
+            if (countdown.enabled) CountdownLine(countdown)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                 actions()
             }

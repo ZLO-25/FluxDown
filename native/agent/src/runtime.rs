@@ -24,11 +24,22 @@ use crate::supervisor::DaemonSupervisor;
 
 pub type AgentResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+/// agent tokio runtime 的 worker 数。agent 只做网关转发、云同步与系统外壳这类 IO 等待型工作，
+/// 下载数据面在 daemon；默认按 CPU 核数开 worker 时，每个 worker 各自的分配器线程堆在空闲时
+/// 也常驻（10 核机实测 12 → 4 线程省约 2MB），2 个足够且在单核机上不超订。
+const AGENT_WORKER_THREADS: usize = 2;
+
+/// agent 进程的多线程 runtime（桌面托盘与 `--server` 共用同一配置）。
+pub(crate) fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(AGENT_WORKER_THREADS)
+        .enable_all()
+        .build()
+}
+
 /// 在当前线程构建 tokio runtime 并运行 agent 直到退出；SIGTERM / Ctrl-C 只退出 agent。
 pub fn run_blocking(host: ShellHost) -> AgentResult {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let runtime = build_runtime()?;
     runtime.block_on(async move {
         let cancel = CancellationToken::new();
         let signal_cancel = cancel.clone();
@@ -258,21 +269,32 @@ async fn run_agent(
     // 提示音只在桌面宿主播放：headless server 没有「本机用户」，不发声。
     let (sound_tx, sound_task) =
         crate::sound::start(events.clone(), cancel.clone(), server.is_none());
+    // 失败通知同样只在桌面宿主发：headless server 没有「本机用户」，也没有对应设置项。
+    let (failure_tx, failure_rx) = if server.is_none() {
+        let (tx, rx) = crate::failure_notice::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let event_task = spawn_daemon_projection(
         daemon_events,
         events.clone(),
         notice_tx,
         sound_tx,
+        failure_tx,
         cancel.clone(),
     );
     let notifier = Arc::new(crate::notification::Notifier::new(
         paths.agent_data_dir.clone(),
     ));
-    let effects_task = tokio::spawn(
+    let effects =
         crate::background_effects::BackgroundEffects::new(events.clone(), notifier.clone())
-            .with_completion_sound(server.is_none())
-            .run(cancel.clone()),
-    );
+            .with_completion_sound(server.is_none());
+    let effects = match failure_rx {
+        Some(failure_rx) => effects.with_failure_notices(failure_rx),
+        None => effects,
+    };
+    let effects_task = tokio::spawn(effects.run(cancel.clone()));
 
     let shared_state = Arc::new(tokio::sync::Mutex::new(state));
     // 局域网直连（L1）：先建服务，legacy 迁移完成后由 readiness 任务 `start`；
@@ -346,6 +368,7 @@ async fn run_agent(
         remote_task,
         device_meta_task,
         cdn_task,
+        bt_guard_task,
         notify_task,
     } = start_cloud_services(
         fluxcloud_base_url(
@@ -367,7 +390,15 @@ async fn run_agent(
     ));
     let blobs = Arc::new(crate::capture::DaemonBlobClient::new(&daemon_config)?);
     // 已装插件的市场撤回：低频触发 daemon 拉索引（桌面与 server 宿主；embedded 不接入）。
-    crate::plugin_revocation::spawn(daemon.clone(), cancel.clone());
+    crate::plugin_revocation::spawn(
+        daemon.clone(),
+        Arc::new(crate::private_plugin::PrivatePluginService::new(
+            Arc::new(cloud_api.clone()),
+            daemon.clone(),
+            blobs.clone(),
+        )),
+        cancel.clone(),
+    );
     let nmh_task = if server.is_some() {
         // server 模式没有浏览器扩展中继：不启动 NMH IPC 也不注册 native messaging host；
         // 占位任务永不完成，退出时 abort。
@@ -435,46 +466,64 @@ async fn run_agent(
         },
     ));
     update.start(cancel.clone(), true);
+    if server.is_none() {
+        update.start_silent_updates(shell.clone(), cancel.clone());
+    }
     let cloud = Arc::new(cloud_api);
-    let gateway_service = Arc::new(
-        GatewayService::new(
-            daemon.clone(),
-            events.clone(),
-            auth,
-            cloud,
-            sync,
-            remote,
-            notify,
-            capture.clone(),
-            blobs.clone(),
-            diagnostics.clone(),
-            update,
-            shared_state,
-            store.clone(),
-            api_switches,
-            api_token.clone(),
-            GatewayShell {
-                shell: shell.clone(),
-                power: power.clone(),
-                lifecycle: lifecycle.clone(),
-                notifier,
-            },
-        )
-        .with_server_mode(server.is_some())
-        .with_link(link.clone()),
-    );
+    let gateway = GatewayService::new(
+        daemon.clone(),
+        events.clone(),
+        auth,
+        cloud,
+        sync.clone(),
+        remote,
+        notify,
+        capture.clone(),
+        blobs.clone(),
+        diagnostics.clone(),
+        update,
+        shared_state,
+        store.clone(),
+        api_switches,
+        api_token.clone(),
+        GatewayShell {
+            shell: shell.clone(),
+            power: power.clone(),
+            lifecycle: lifecycle.clone(),
+            notifier: notifier.clone(),
+        },
+    )
+    .with_server_mode(server.is_some())
+    .with_link(link.clone());
+    let gateway_service = Arc::new(gateway);
     let shell_task = tokio::spawn(crate::shell::run_controller(
         ShellServices {
-            state: shell,
+            state: shell.clone(),
             lifecycle,
             power,
             daemon: daemon.clone(),
             events: events.clone(),
             gateway: gateway_service.clone(),
+            agent_data_dir: paths.agent_data_dir.clone(),
         },
         host,
         cancel.clone(),
     ));
+    #[cfg(feature = "desktop")]
+    if server.is_none() {
+        // 应用图标：启动对账 + 跟随偏好变化（托盘由外壳控制器读同一偏好）；旧 Flutter 选择在此一次性迁移。
+        tokio::spawn(
+            crate::app_icon::AppIconService::new(
+                &paths.agent_data_dir,
+                paths.daemon_data_dir.clone(),
+                sync,
+                events.clone(),
+                notifier,
+                shell,
+            )
+            .run(cancel.clone()),
+        );
+    }
     #[cfg(feature = "desktop")]
     if server.is_none() {
         crate::clipboard_watch::spawn(events.clone(), gateway_service.clone(), cancel.clone());
@@ -563,6 +612,7 @@ async fn run_agent(
     for (task, handle) in [
         ("daemon event projection", event_task),
         ("CDN", cdn_task),
+        ("BT guard", bt_guard_task),
         ("cloud notify", notify_task),
         ("cloud sync", sync_task),
         ("remote tasks", remote_task),
@@ -740,6 +790,7 @@ pub(crate) fn spawn_daemon_projection(
     events: AgentEventHub,
     notices: crate::cloud_notify::NoticeSender,
     sounds: Option<crate::sound::SoundSender>,
+    failures: Option<crate::failure_notice::FailureSender>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -758,7 +809,7 @@ pub(crate) fn spawn_daemon_projection(
                         }
                         DaemonClientEvent::Event(frame) => {
                             if let ServiceEvent::Daemon(event) = frame.event {
-                                crate::cloud_notify::route_daemon_event(&events, &notices, sounds.as_ref(), event);
+                                crate::cloud_notify::route_daemon_event(&events, &notices, sounds.as_ref(), failures.as_ref(), event);
                             }
                         }
                         DaemonClientEvent::Stale => {
@@ -810,6 +861,7 @@ pub(crate) struct CloudServices {
     pub(crate) remote_task: tokio::task::JoinHandle<()>,
     pub(crate) device_meta_task: tokio::task::JoinHandle<()>,
     pub(crate) cdn_task: tokio::task::JoinHandle<()>,
+    pub(crate) bt_guard_task: tokio::task::JoinHandle<()>,
     pub(crate) notify_task: tokio::task::JoinHandle<()>,
 }
 
@@ -847,16 +899,15 @@ pub(crate) async fn start_cloud_services(
         cancel.clone(),
     ));
     let notify_task = tokio::spawn(notify.clone().run(notices));
-    let remote = Arc::new(
-        crate::remote::RemoteTaskService::new(
-            api.clone(),
-            daemon.clone(),
-            events.clone(),
-            state.clone(),
-            store.clone(),
-        )
-        .with_notify_feed(notify.feed()),
-    );
+    let remote = crate::remote::RemoteTaskService::new(
+        api.clone(),
+        daemon.clone(),
+        events.clone(),
+        state.clone(),
+        store.clone(),
+    )
+    .with_notify_feed(notify.feed());
+    let remote = Arc::new(remote);
     let remote_task = tokio::spawn(remote.clone().run(cancel.clone()));
     let device_meta_task = tokio::spawn(
         Arc::new(crate::device_meta::DeviceMetaService::new(
@@ -869,6 +920,10 @@ pub(crate) async fn start_cloud_services(
         crate::cdn_worker::CdnWorker::new(api.clone(), daemon.as_ref().clone(), events.clone())
             .run(cancel.clone()),
     );
+    let bt_guard_task = tokio::spawn(
+        crate::bt_guard::BtGuardWorker::new(api.clone(), daemon, events.clone(), store.data_dir())
+            .run(cancel.clone()),
+    );
     Ok(CloudServices {
         auth,
         api,
@@ -879,6 +934,7 @@ pub(crate) async fn start_cloud_services(
         remote_task,
         device_meta_task,
         cdn_task,
+        bt_guard_task,
         notify_task,
     })
 }
@@ -1041,7 +1097,7 @@ async fn bind_with_fallback(
     address: std::net::SocketAddr,
     fallback: bool,
 ) -> std::io::Result<TcpListener> {
-    let error = match TcpListener::bind(address).await {
+    let error = match bind_gateway_socket(address) {
         Ok(listener) => return Ok(listener),
         Err(error) => error,
     };
@@ -1060,16 +1116,68 @@ async fn bind_with_fallback(
         error = %error,
         "UI gateway port is in use or reserved by the system; falling back to an OS-assigned port"
     );
-    TcpListener::bind(std::net::SocketAddr::new(address.ip(), 0))
-        .await
-        .map_err(|fallback_error| {
-            std::io::Error::new(
-                fallback_error.kind(),
-                format!(
-                    "could not bind the UI gateway on {address} ({error}) nor on an OS-assigned port: {fallback_error}"
-                ),
-            )
-        })
+    bind_gateway_socket(std::net::SocketAddr::new(address.ip(), 0)).map_err(|fallback_error| {
+        std::io::Error::new(
+            fallback_error.kind(),
+            format!(
+                "could not bind the UI gateway on {address} ({error}) nor on an OS-assigned port: {fallback_error}"
+            ),
+        )
+    })
+}
+
+/// 绑定 UI Gateway 监听 socket。IPv6 通配地址（`[::]`）显式关闭 `IPV6_V6ONLY`，同一 socket
+/// 同时接 IPv4 与 IPv6（Windows 默认只接 IPv6，Linux 可被 `bindv6only` 改掉，不能靠系统默认）；
+/// 本机不支持 IPv6 时退回同端口的 `0.0.0.0`。占用 / 权限错误原样返回，IPv4 同样会失败。
+pub(crate) fn bind_gateway_socket(address: std::net::SocketAddr) -> std::io::Result<TcpListener> {
+    let std::net::IpAddr::V6(ip) = address.ip() else {
+        return bind_socket(address, false);
+    };
+    if !ip.is_unspecified() {
+        return bind_socket(address, false);
+    }
+    let error = match bind_socket(address, true) {
+        Ok(listener) => return Ok(listener),
+        Err(error) => error,
+    };
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+    ) {
+        return Err(error);
+    }
+    let ipv4 = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), address.port());
+    tracing::warn!(
+        %address,
+        error = %error,
+        fallback = %ipv4,
+        "IPv6 is unavailable; the UI gateway listens on IPv4 only"
+    );
+    bind_socket(ipv4, false).map_err(|fallback_error| {
+        std::io::Error::new(
+            fallback_error.kind(),
+            format!("{address}: {error}; {ipv4}: {fallback_error}"),
+        )
+    })
+}
+
+/// 与 `TcpListener::bind` 同语义（Unix `SO_REUSEADDR`、backlog 1024），`dual_stack` 时关闭
+/// `IPV6_V6ONLY`。
+fn bind_socket(address: std::net::SocketAddr, dual_stack: bool) -> std::io::Result<TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(address),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    if dual_stack {
+        socket.set_only_v6(false)?;
+    }
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&address.into())?;
+    socket.listen(1024)?;
+    TcpListener::from_std(socket.into())
 }
 
 /// UI Gateway 监听地址：`FLUXDOWN_AGENT_BIND` 覆盖时必须是回环；否则按持久化的
@@ -1267,7 +1375,7 @@ pub(crate) fn daemon_socket_address(
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_gateway_listener, gateway_bind_address};
+    use super::{bind_gateway_listener, bind_gateway_socket, gateway_bind_address};
     use crate::state::AgentState;
 
     #[test]
@@ -1426,6 +1534,28 @@ mod tests {
             }
         }
         drop(occupied);
+    }
+
+    /// server 默认 `[::]`：同一监听同时接 IPv4 与 IPv6（飞牛 FN Connect 经 `[::1]` 转发、IPv6
+    /// DDNS 直连）；本机无 IPv6 时退回 `0.0.0.0`，IPv4 仍可用。
+    #[tokio::test]
+    async fn ipv6_wildcard_binding_accepts_ipv4_and_ipv6_clients() {
+        let listener =
+            bind_gateway_socket("[::]:0".parse().expect("wildcard")).expect("dual-stack bind");
+        let bound = listener.local_addr().expect("bound address");
+        let ipv4 = std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), bound.port());
+        tokio::net::TcpStream::connect(ipv4)
+            .await
+            .expect("IPv4 client reaches the IPv6 wildcard listener");
+        if bound.is_ipv6() {
+            let ipv6 =
+                std::net::SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), bound.port());
+            tokio::net::TcpStream::connect(ipv6)
+                .await
+                .expect("IPv6 client reaches the wildcard listener");
+        } else {
+            assert!(bound.ip().is_unspecified(), "{bound}");
+        }
     }
 
     #[tokio::test]

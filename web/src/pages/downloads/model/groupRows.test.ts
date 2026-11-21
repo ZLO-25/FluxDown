@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import type { GroupDto, TaskDto } from '../../../lib/rpc'
 import { CategoryIndex, builtinDefaults } from './categories'
 import { SELECTION_ALL } from './filters'
-import { buildVisibleRows, dirCollapseKey, dominantCategory, groupsMatchingQuery, selectGroupOnClick } from './groupRows'
+import { buildVisibleRows, dirCollapseKey, dominantCategory, groupRowsByDirectory, groupsMatchingQuery, keysInVisualSpan, selectGroupOnClick } from './groupRows'
 import type { BucketInfo, GroupFolderRow, VisibleRow, VisibleRowsInput } from './groupRows'
 import { RowEngine } from './rowEngine'
 import type { TaskRow } from './rowEngine'
@@ -81,10 +81,36 @@ const describeRow = (item: VisibleRow): string => {
       return `dir:${item.path}`
     case 'bucket':
       return `# ${item.label}`
+    case 'directory':
+      return `directory:${item.key}`
   }
 }
 
 const keys = (rows: readonly VisibleRow[]) => rows.map(describeRow)
+
+describe('directory row integration', () => {
+  test('directory headings wrap top-level tasks and collapse descendants without changing item identity', () => {
+    const visible = build([row('b', { saveDir: '/d/B' }), row('a', { saveDir: '/d/A' })], []).rows
+    const items = [
+      { path: '/d/B', root: '/d', scope: '', scope_label: '', count: 1 },
+      { path: '/d/A', root: '/d', scope: '', scope_label: '', count: 1 },
+    ]
+    const expanded = groupRowsByDirectory(visible, items, NONE)
+    const headers = expanded.filter((item) => item.type === 'directory')
+    expect(headers.map((item) => item.type === 'directory' ? item.path : '')).toEqual(['/d', '/d/A', '/d/B'])
+    expect(expanded.filter((item) => item.type === 'task').map((item) => item.key)).toEqual(['l:a', 'l:b'])
+    const source = visible.find((item) => item.type === 'task' && item.key === 'l:a')
+    if (!source || source.type !== 'task') throw new Error('missing source task')
+    source.view = { ...source.view, downloadedBytes: 42 }
+    const displayed = expanded.find((item) => item.type === 'task' && item.key === source.key)
+    if (!displayed || displayed.type !== 'task') throw new Error('missing displayed task')
+    expect(displayed.view.downloadedBytes).toBe(42)
+    const header = headers[0]
+    if (!header || header.type !== 'directory') throw new Error('missing directory header')
+    const collapsed = groupRowsByDirectory(visible, items, new Set([header.key]))
+    expect(collapsed).toEqual([{ ...header, collapsed: true }])
+  })
+})
 
 describe('merge position', () => {
   test('group proxy lands at the partition point of the top-level order; orphan / remote stay top-level', () => {
@@ -237,6 +263,22 @@ describe('group click selection', () => {
     expect(add).toMatchObject({ multiSelect: true, focusedGroup: null })
     const remove = selectGroupOnClick(state(['l:x', 'l:a', 'l:b']), 'g', members, sequence, { shift: false, secondary: true })
     expect([...remove.selected]).toEqual(['l:x'])
+  })
+
+  test('drag span keeps tasks in row order and expands a group row inside the span', () => {
+    const group = {
+      type: 'group',
+      orderedKeys: () => ['l:a', 'l:b'],
+    } as unknown as GroupFolderRow
+    const rows: VisibleRow[] = [
+      { type: 'task', key: 'l:x', view: {} as DownloadTaskView },
+      { type: 'bucket', key: 's', label: 'S', count: 1, collapsed: false },
+      group,
+      { type: 'member', key: 'l:b', row: { type: 'task', key: 'l:b', view: {} as DownloadTaskView }, depth: 1 },
+      { type: 'task', key: 'l:y', view: {} as DownloadTaskView },
+    ]
+    expect(keysInVisualSpan(rows, 4, 0)).toEqual(['l:x', 'l:a', 'l:b', 'l:y'])
+    expect(keysInVisualSpan(rows, 3, 3)).toEqual(['l:b'])
   })
 
   test('shift click ranges from the anchor to the last member over the visible sequence', () => {

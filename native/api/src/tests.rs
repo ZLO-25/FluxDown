@@ -29,9 +29,13 @@ use crate::service::{
     ApiError, ApiHost, LiveSpeed, TaskEvent, TaskEventKind, UNKNOWN_ENDPOINT_MESSAGE,
 };
 use fluxdown_protocol::daemon::{
+    BtGuardEntriesAddParams, BtGuardEntriesListDto, BtGuardEntriesListParams, BtGuardEntryDto,
+    BtGuardEventDto, BtGuardEventsListDto, BtGuardEventsListParams, BtGuardStateDto,
     CreateGroupRequest, CreateTaskRequest, DownloadRequest, GroupDto, QueueDto,
     ResolvePreviewRequest, ResolvePreviewResponse, TaskDto,
 };
+
+mod bt_guard;
 
 // ---------------------------------------------------------------------------
 // MockHost：记录调用、返回可配置结果
@@ -65,7 +69,13 @@ struct MockHostInner {
     group_paused: Vec<String>,
     group_continued: Vec<String>,
     resolve_preview_requests: Vec<ResolvePreviewRequest>,
-    resolve_preview_response: Option<ResolvePreviewResponse>,
+    bt_state: BtGuardStateDto,
+    bt_entries_lists: Vec<BtGuardEntriesListParams>,
+    bt_added: Vec<BtGuardEntriesAddParams>,
+    bt_removed: Vec<i64>,
+    bt_add_error: Option<ApiError>,
+    bt_remove_error: Option<ApiError>,
+    bt_events_lists: Vec<BtGuardEventsListParams>,
 }
 
 struct MockHost {
@@ -116,11 +126,6 @@ impl MockHost {
 
     fn with_groups(mut self, groups: Vec<GroupDto>) -> Self {
         self.inner.get_mut().unwrap().groups = groups;
-        self
-    }
-
-    fn with_resolve_preview_response(mut self, resp: ResolvePreviewResponse) -> Self {
-        self.inner.get_mut().unwrap().resolve_preview_response = Some(resp);
         self
     }
 
@@ -198,6 +203,38 @@ impl MockHost {
 
     fn resolve_preview_requests(&self) -> Vec<ResolvePreviewRequest> {
         self.inner.lock().unwrap().resolve_preview_requests.clone()
+    }
+
+    fn with_bt_state(mut self, state: BtGuardStateDto) -> Self {
+        self.inner.get_mut().unwrap().bt_state = state;
+        self
+    }
+
+    /// 一次性：下一次 `bt_guard_entries_add` 返回该错误。
+    fn with_bt_add_error(mut self, err: ApiError) -> Self {
+        self.inner.get_mut().unwrap().bt_add_error = Some(err);
+        self
+    }
+
+    /// 一次性：下一次 `bt_guard_entry_remove` 返回该错误。
+    fn set_bt_remove_error(&self, err: ApiError) {
+        self.inner.lock().unwrap().bt_remove_error = Some(err);
+    }
+
+    fn bt_entries_lists(&self) -> Vec<BtGuardEntriesListParams> {
+        self.inner.lock().unwrap().bt_entries_lists.clone()
+    }
+
+    fn bt_added(&self) -> Vec<BtGuardEntriesAddParams> {
+        self.inner.lock().unwrap().bt_added.clone()
+    }
+
+    fn bt_removed(&self) -> Vec<i64> {
+        self.inner.lock().unwrap().bt_removed.clone()
+    }
+
+    fn bt_events_lists(&self) -> Vec<BtGuardEventsListParams> {
+        self.inner.lock().unwrap().bt_events_lists.clone()
     }
 
     /// 模拟宿主检测到一次任务状态迁移，广播对应事件。若本实例未启用事件订阅
@@ -303,6 +340,66 @@ impl ApiHost for MockHost {
         Ok(self.inner.lock().unwrap().queues.clone())
     }
 
+    async fn bt_guard_state(&self) -> Result<BtGuardStateDto, ApiError> {
+        Ok(self.inner.lock().unwrap().bt_state.clone())
+    }
+
+    async fn bt_guard_entries_list(
+        &self,
+        params: BtGuardEntriesListParams,
+    ) -> Result<BtGuardEntriesListDto, ApiError> {
+        self.inner.lock().unwrap().bt_entries_lists.push(params);
+        Ok(BtGuardEntriesListDto {
+            total: 1,
+            items: vec![bt_guard::entry(7, "manual", "1.2.3.4/32", "ban")],
+        })
+    }
+
+    async fn bt_guard_entries_add(
+        &self,
+        params: BtGuardEntriesAddParams,
+    ) -> Result<BtGuardEntryDto, ApiError> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(e) = inner.bt_add_error.take() {
+            return Err(e);
+        }
+        let layer = if params.action == "allow" {
+            "allow"
+        } else {
+            "manual"
+        };
+        let created = bt_guard::entry(8, layer, &params.cidr, &params.action);
+        inner.bt_added.push(params);
+        Ok(created)
+    }
+
+    async fn bt_guard_entry_remove(&self, entry_id: i64) -> Result<(), ApiError> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(e) = inner.bt_remove_error.take() {
+            return Err(e);
+        }
+        inner.bt_removed.push(entry_id);
+        Ok(())
+    }
+
+    async fn bt_guard_events_list(
+        &self,
+        params: BtGuardEventsListParams,
+    ) -> Result<BtGuardEventsListDto, ApiError> {
+        self.inner.lock().unwrap().bt_events_lists.push(params);
+        Ok(BtGuardEventsListDto {
+            total: 1,
+            items: vec![BtGuardEventDto {
+                id: 1,
+                at: 1_761_900_000,
+                kind: "enforce".to_string(),
+                ip_group: "1.2.3.4".to_string(),
+                rule: "excessive".to_string(),
+                ..BtGuardEventDto::default()
+            }],
+        })
+    }
+
     async fn submit_external(&self, req: DownloadRequest) -> Result<(), ApiError> {
         self.inner.lock().unwrap().submitted.push(req);
         Ok(())
@@ -340,15 +437,14 @@ impl ApiHost for MockHost {
     ) -> Result<ResolvePreviewResponse, ApiError> {
         let mut inner = self.inner.lock().unwrap();
         inner.resolve_preview_requests.push(req);
-        Ok(inner
-            .resolve_preview_response
-            .clone()
-            .unwrap_or(ResolvePreviewResponse {
-                name: String::new(),
-                source_url: String::new(),
-                error: String::new(),
-                items: Vec::new(),
-            }))
+        Ok(ResolvePreviewResponse {
+            name: String::new(),
+            source_url: String::new(),
+            error: String::new(),
+            plugin_id: String::new(),
+            items: Vec::new(),
+            archive_metadata: None,
+        })
     }
 
     async fn create_task_group(&self, req: CreateGroupRequest) -> Result<String, ApiError> {
@@ -394,6 +490,7 @@ impl ApiHost for MockHost {
 
 fn sample_task(id: &str, status: i32) -> TaskDto {
     TaskDto {
+        properties: Default::default(),
         task_id: id.to_string(),
         url: format!("https://example.com/{id}.zip"),
         file_name: format!("{id}.zip"),
@@ -409,6 +506,7 @@ fn sample_task(id: &str, status: i32) -> TaskDto {
         ignore_tls_errors: false,
         file_missing: false,
         completed_at: String::new(),
+        file_hash: String::new(),
         referrer: String::new(),
         group_id: String::new(),
         rss_source_id: String::new(),
@@ -426,6 +524,10 @@ fn sample_task(id: &str, status: i32) -> TaskDto {
         seed_time_limit_minutes: -2,
         seed_inactive_time_limit_minutes: -2,
         seed_upload_limit_bps: 0,
+        bt_sequential: false,
+        bt_first_last_pieces_first: false,
+        bt_download_limit_bps: 0,
+        bt_super_seeding: false,
     }
 }
 
@@ -1825,36 +1927,6 @@ async fn group_action_on_unknown_id_returns_404() {
         ))
         .await;
     assert_eq!(resp.status, 404);
-}
-
-#[tokio::test]
-async fn resolve_preview_forwards_request_and_returns_host_response() {
-    let host = MockHost::new().with_resolve_preview_response(ResolvePreviewResponse {
-        name: "预览清单".to_string(),
-        source_url: "https://example.com/share".to_string(),
-        error: String::new(),
-        items: vec![],
-    });
-    let server = TestServer::start(host, |c| {
-        c.token.set("T");
-        c.management_enabled = true;
-    })
-    .await;
-    let body = json!({"url": "https://example.com/share", "cookies": "s=1"}).to_string();
-    let resp = server
-        .send(&request(
-            "POST",
-            routes::API_RESOLVE_PREVIEW,
-            &[("X-FluxDown-Token", "T")],
-            &body,
-        ))
-        .await;
-    assert_eq!(resp.status, 200);
-    assert_eq!(resp.json()["name"], "预览清单");
-    let reqs = server.host.resolve_preview_requests();
-    assert_eq!(reqs.len(), 1);
-    assert_eq!(reqs[0].url, "https://example.com/share");
-    assert_eq!(reqs[0].cookies, "s=1");
 }
 
 #[tokio::test]

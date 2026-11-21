@@ -257,12 +257,6 @@ impl TableSync {
         &self.epoch
     }
 
-    /// 已载入行数（任务 + 队列位置），供加载态显示进度。
-    #[must_use]
-    pub fn loaded_rows(&self) -> usize {
-        self.tasks.rows.len() + self.queue.rows.len()
-    }
-
     /// 下一个要发的页请求；全部载入完毕返回 `None`。任务表先于队列位置表。
     #[must_use]
     pub fn next_request(&mut self) -> Option<TablePageParams> {
@@ -354,6 +348,7 @@ mod tests {
 
     fn task(id: &str, status: i32) -> TaskDto {
         TaskDto {
+            properties: Default::default(),
             task_id: id.to_owned(),
             url: format!("https://example.com/{id}.bin"),
             file_name: format!("{id}.bin"),
@@ -369,6 +364,7 @@ mod tests {
             ignore_tls_errors: false,
             file_missing: false,
             completed_at: String::new(),
+            file_hash: String::new(),
             referrer: String::new(),
             group_id: String::new(),
             rss_source_id: String::new(),
@@ -386,6 +382,10 @@ mod tests {
             seed_time_limit_minutes: -2,
             seed_inactive_time_limit_minutes: -2,
             seed_upload_limit_bps: 0,
+            bt_sequential: false,
+            bt_first_last_pieces_first: false,
+            bt_download_limit_bps: 0,
+            bt_super_seeding: false,
         }
     }
 

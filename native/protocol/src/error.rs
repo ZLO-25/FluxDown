@@ -103,6 +103,10 @@ pub enum ErrorReason {
     TaskDeviceMismatch,
     /// 保存目录在目标设备上不可用（路径风格不符 / 非绝对路径 / 无法创建）。
     SaveDirUnavailable,
+    /// 删除任务：文件正被其他程序占用，无法删除；任务记录已保留。
+    TaskFilesInUse,
+    /// 删除任务：任务文件无法删除（权限 / 磁盘 / 清理超时等）；任务记录已保留。
+    TaskFilesNotDeleted,
     /// 局域网配对：配对码错误或已过期。
     PairingCodeInvalid,
     /// 局域网配对：配对会话不存在或已过期。
@@ -167,6 +171,8 @@ pub enum ErrorReason {
     PlanNotUpgrade,
     /// 套餐购买：已持有同档或更高档套餐（买断制只升不降）。
     PlanTierNotHigher,
+    /// 套餐购买：已有另一张生效中的周期会员卡。
+    SubscriptionConflict,
     /// 推介：邀请码无效（不存在 / 功能未开启）。
     ReferralCodeInvalid,
     /// 推介：不能使用自己的邀请码。

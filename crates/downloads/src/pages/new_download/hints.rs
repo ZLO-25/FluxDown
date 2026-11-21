@@ -3,7 +3,8 @@
 //!
 //! 只在字段为空、或仍是上次自动回填的值（用户没碰过，命令编辑中随之更新）时才写，
 //! 用户填过的内容绝不覆盖；命令里不再带该项时只清掉我们回填过的值。`Referer`
-//! 没有专门字段，作为名为 `Referer` 的自定义请求头。判定规则见
+//! 回填「来源页」专门字段，与捕获的来源页共用一份回填记录（见
+//! `NewDownloadView::sync_referrer`），不在此处理，也不作自定义请求头。判定规则见
 //! [`crate::model::aria2c::plan_field_fill`]。
 
 use gpui::{AppContext as _, Context, Window};
@@ -73,14 +74,14 @@ impl NewDownloadView {
             FieldFill::Forget => self.hint_fill.user_agent = None,
             FieldFill::Set(value) => {
                 // `set_value` 不发 Change：预设下拉要手动对齐。
-                self.ua_preset = detect_ua_preset(&value);
+                self.ua_preset = detect_ua_preset(&value).to_owned();
                 self.user_agent
                     .update(cx, |input, cx| input.set_value(value.clone(), window, cx));
                 self.hint_fill.user_agent = Some(value);
                 touched = true;
             }
             FieldFill::Clear => {
-                self.ua_preset = UA_PRESET_DEFAULT;
+                self.ua_preset = UA_PRESET_DEFAULT.to_owned();
                 self.user_agent
                     .update(cx, |input, cx| input.set_value("", window, cx));
                 self.hint_fill.user_agent = None;

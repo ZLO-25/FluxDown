@@ -3,7 +3,7 @@ title: Manifest 参考
 description: manifest.json 全部字段及校验规则、设置项 widget 矩阵、URL pattern 规则，以及安装与加载时的检查方式。
 section: plugins
 order: 10
-sourceHash: "af2f46fd3b3a"
+sourceHash: "d28b2970cb47"
 ---
 
 `manifest.json` 位于插件包根部，声明插件是什么、带有哪些入口脚本、向界面贡献什么，以及需要哪些能力。所有键名使用 camelCase。**未知键会被拒绝**——写错字段名会让整份 manifest 校验失败，而不是被静默忽略。
@@ -32,13 +32,14 @@ sourceHash: "af2f46fd3b3a"
   "main": { "entry": "main.js", "events": ["onDone"], "background": false },
   "contributes": {
     "views": [{ "id": "dashboard", "title": "看板", "location": "activity" }],
-    "commands": [{ "id": "refresh", "title": "刷新", "palette": true }]
+    "commands": [{ "id": "refresh", "title": "刷新", "palette": true }],
+    "archive": "archive.js"
   },
   "settings": [
     { "key": "quality", "title": "偏好画质", "type": "string", "widget": "select",
       "options": [ { "value": "hd", "label": "高清" }, { "value": "sd", "label": "标清" } ], "default": "hd" }
   ],
-  "permissions": []
+  "permissions": ["archive"]
 }
 ```
 
@@ -61,7 +62,7 @@ sourceHash: "af2f46fd3b3a"
 | `interceptors` | 否 | object | 任务拦截器（请求改写、分片过滤、后处理）。见 [`interceptors`](#interceptors)。 |
 | `auth` | 否 | object | 平台登录入口。见 [`auth`](#auth)。 |
 | `main` | 否 | object | 常驻脚本，承载可移植视图、命令与后台逻辑。见 [`main`](#main)。 |
-| `contributes` | 否 | object | 视图、命令、浏览器嗅探规则与页面脚本。见 [`contributes`](#contributes)。 |
+| `contributes` | 否 | object | 视图、命令、归档分类、浏览器嗅探规则与页面脚本。见 [`contributes`](#contributes)。 |
 | `permissions` | 否 | array | 能力授权，未知值一律拒绝。见 [`permissions`](#permissions)。 |
 | `settings` | 否 | array | 声明式设置项。见 [`settings[]`](#settings)。 |
 
@@ -205,7 +206,10 @@ hooks 在下载生命周期事件发生时运行你的代码。
 |---|---|---|
 | `entry` | 是 | classic 脚本（不是 ES module），包内安全相对路径，扩展名 `.js`，文件必须存在。 |
 | `events` | 否 | 投递给脚本的事件，每项须是 `onStart`、`onError`、`onDone`、`onMetaProbed`、`onCancel` 之一。 |
+| `imageHosts` | 否 | 默认 `[]`。`main` 可通过 `ctx.images` / `flux.images` 加载的远程图片主机，须为小写 DNS 主机名或 IP 字面量；最多 64 项且不得重复，主机格式同 `desktop.networkHosts`。会纳入网络授权。 |
 | `background` | 否 | 布尔值。`true` 表示脚本随 daemon 常驻，需要 `background` 权限。 |
+
+远程图片由宿主代为请求，界面本身不会直接访问网络。请在 `main.imageHosts` 中声明所有图片来源主机；未声明主机的请求会被拒绝。旧 manifest 可省略此字段（等同于 `[]`）。详见[API 参考](/docs/zh/plugins/api-reference/)。
 
 `main` 是插件的常驻部分：可移植视图、命令与后台逻辑都在 daemon 内的这个脚本里运行。见[可移植界面指南](/docs/zh/plugins/ui-guide/)。
 
@@ -219,12 +223,33 @@ hooks 在下载生命周期事件发生时运行你的代码。
                 "portable": true, "icon": "icons/dashboard.svg" }],
     "commands": [{ "id": "refresh", "title": "刷新", "palette": true, "taskMenu": false }],
     "sniffRules": "rules.json",
-    "pageScripts": [{ "id": "hello", "title": "你好", "matches": ["https://*.example.com/*"], "js": ["page/hello.js"] }]
+    "pageScripts": [{ "id": "hello", "title": "你好", "matches": ["https://*.example.com/*"], "js": ["page/hello.js"] }],
+    "archive": "archive.js"
   }
 }
 ```
 
-`views` / `commands` 为空数组等同于不声明。
+`views` / `commands` 为空数组等同于不声明。`archive` 提供本地目录路由，不改文件名，也不接管保存根目录。
+
+### `archive`
+
+`contributes.archive` 指向包内 `.js` 文件，且必须声明 `permissions: ["archive"]`。使用新阶段/内容上下文时，`minAppVersion` 应设为 `0.6.5`（匹配开发宿主；不代表该版本已发布）。
+
+任务跟随获准的默认目录路由时，宿主调用 `globalThis.archive(ctx)`。`ctx` 包含 `fileName`、可选来源 `metadata`、`isGroup`、`phase: "start" | "complete"`、固定 UTC `createdDate`（`YYYY-MM-DD`，无效旧时间戳为 `""`）、可选的宿主观察内容 `detectedType: { kind, mime, extension }`，以及可选的 `categoryRouting`。`categoryRouting: true` 表示支持按分类路由；旧宿主会省略它，插件必须在缺失时明确拒绝分类路由。`kind` 使用小写 snake_case 文件格式词汇：`archive`、`audio`、`compressed`、`database`、`diagram`、`disk`、`document`、`ebook`、`executable`、`font`、`formula`、`geospatial`、`image`、`metadata`、`model`、`other`、`package`、`playlist`、`presentation`、`rom`、`spreadsheet`、`subtitle`、`video`。`metadata` 是来源提供的信息，不是内容识别。回调不会收到文件字节、路径、URL、请求头或凭据；服务器提供的 MIME 不作内容证据。
+
+符合条件的文件在开始时评估，并在完成时针对最终处理产物重新评估，即使开始时已选择目录。成功的完成结果可替换缓存的开始目录；`null`、非法结果或错误保留此前有效选择。插件可在普通文件的开始阶段返回 `null`，到完成阶段根据 `detectedType` 决定。任务组只在开始时对根路由（`isGroup: true`），不读取内容且没有 `detectedType`。
+
+分类结果仅接受于已完成的非组文件。宿主会拒绝开始阶段和任务组的 `{ category }`；组路由仍支持 `{ directories }` 和旧格式 `{ folderName }`。
+
+返回 `null` / `undefined`、`{ category: "audio" }` 或 `{ directories: ["视频", "哔哩哔哩"] }`（在获准的默认目录下使用安全目录分量，最多 8 层，拼接路径最多 180 UTF-8 字节）。`category` 是稳定的内置标识符之一：`video`、`audio`、`document`、`image`、`program`、`archive`、`other`；它与 `directories`、`folderName` 互斥。宿主根据提交时的分类配置快照，将其解析为可见分类配置的保存目录。分类改名不改变其稳定标识符（`builtinType`）；分类缺失、隐藏或没有保存目录时宿主会拒绝移动，不会猜测自定义分类。旧格式 `{ folderName: "The Expanse" }` 仍保留原分类子目录语义。显式目录会绕过自动分类解析。用户明确指定保存目录时绕过回调。eD2K 不移动。BT 任务仅在首次完成且恰有一个实际选中的非 padding 文件时归档，包括多文件种子里的单文件选择；回调沿用原有契约，收到实际文件名和内容事实。宿主经 BT 存储迁移移动整个任务根目录并恢复做种；多选、错误、冲突及显式目录均不移动。不预测初始归档位置，之后改选或重启不会重试。异步搬移可能短暂保留原位置，后续位置变更事件更新；不新增侧栏分类。非法输出不会导致下载失败。完整行为见[API 参考](/docs/zh/plugins/api-reference/#archivectx)。
+
+### `archiveRules`
+
+`contributes.archiveRules` 声明有界 JSON 分类规则包，并使用发布者固定的 Ed25519 公钥验证。`entry` 是安全的包内相对 `.json` 路径；安装时会校验签名种子文件。`publicKey` 为 64 位十六进制字符串。可选 `updateUrl` 必须是无凭据、无片段的公网 HTTPS URL，其主机名会加入授权网络主机列表。启用自动更新后每日检查，也可显式或手动触发更新。获取或验证失败时保留最后一份已验证规则。规则只用于分类未来符合条件的文件，不会重新分类历史文件。
+
+支持该键和权限之前的旧版宿主会把它们当作无效 manifest 拒绝（未知键、未知权限），所以请把 `minAppVersion` 设为下一个版本或更高。
+
+入口是 `globalThis.archive = (ctx) => result`，其中 `ctx = { fileName }`。它返回 `{ folderName: string }`，或用 `null` / `undefined` 表示不使用子文件夹，可以是同步或异步函数。仅当任务使用分类路由、且路由选中了某个分类目录（命中且带目录的分类规则，或“其他”兜底目录）时才会调用；选定的文件夹之后会被复用，文件名永远不会被改变。脚本里只有 `flux.settings`、`flux.logger` 和 `console`。完整行为（调用时机、多个插件、`folderName` 规则、失败处理、限制）见 [API 参考](/docs/zh/plugins/api-reference/#archivectx)。
 
 ### `views[]`
 
@@ -234,7 +259,7 @@ hooks 在下载生命周期事件发生时运行你的代码。
 |---|---|---|
 | `id` | 是 | 匹配 `^[a-z][a-z0-9-]{0,31}$`，在视图间唯一。 |
 | `title` | 是 | 1–40 个字符。 |
-| `location` | 是 | `activity`、`settings`、`taskDetail` 或 `window`；`settings` 至多一个视图使用。 |
+| `location` | 是 | `activity`、`settings`、`taskDetail`、`window` 或 `auth`；`settings` 至多一个视图使用，`auth` 也至多一个。`auth` 视图要求顶层声明 `auth`（`auth.entry`，后者又要求 `auth` 权限），否则 manifest 报错 `location 为 auth 的 view 要求声明 auth`。它会替换桌面端（GPUI）与 Web 端插件**登录**对话框的内容（Web 端只显示可移植实现）；移动端不渲染它，仍用默认登录流程。见[自定义登录界面](/docs/zh/plugins/auth-guide/#自定义登录界面)。不认识该 location 的旧版本应用会拒绝加载此插件，请把 `minAppVersion` 设为下一个版本或更高。 |
 | `desktop` | 否 | 桌面原生实现，见下。**没有** `desktop` 的视图是可移植视图，要求声明 `main`。 |
 | `portable` | 否 | 布尔值，默认 `false`。仅允许与 `desktop` 同时声明。`true` 表示 `main` 也通过 `flux.ui.view` 实现了该视图，让不能运行桌面脚本的客户端也能显示；要求声明 `main`。 |
 | `icon` | 否 | `.svg` 文件的包内相对路径（任何 `location` 都允许，目前仅活动栏 `activity` 使用）。至多 16 KiB（16384 字节），合法 UTF-8，且是 SVG 文档（以 `<svg` 或 `<?xml` 开头并包含 `<svg`）。宿主把它当作**单色蒙版**按主题色着色，只使用 alpha 通道，因此建议 24×24 的 `viewBox`，并使用 `stroke="currentColor"` 或 `fill="currentColor"`（lucide 风格）；彩色会被压成单色。不声明则使用默认图标。 |
@@ -365,6 +390,7 @@ hooks 在下载生命周期事件发生时运行你的代码。
 | `desktop` | 允许桌面脚本（`contributes.views[].desktop`）在桌面进程内以完全信任运行。 |
 | `background` | 允许 `main` 随 daemon 常驻（`main.background`）。 |
 | `intercept` | 允许声明 `interceptors`，在任务运行时读取并修改其请求、分片、画质与完成后的文件。 |
+| `archive` | 声明 `contributes.archive`：根据文件名在任务的分类文件夹内选择一个子文件夹。它可以读取插件设置并写入插件日志，不能访问文件、网络、任务或进程（风险较高）。 |
 
 未知值会让整份 manifest 失败。风险等级、授权与审计见[权限、授权与审计](/docs/zh/plugins/permissions/)；各权限背后的接口见 [API 参考](/docs/zh/plugins/api-reference/)。
 
@@ -377,6 +403,7 @@ hooks 在下载生命周期事件发生时运行你的代码。
 | 任一 `views[].desktop` | `desktop` |
 | `contributes.sniffRules` | `browserRules` |
 | `contributes.pageScripts`（非空） | `pageScripts` |
+| `contributes.archive` | `archive` |
 
 （`tasks`、`ffmpeg`、`ytdlp` 在调用接口时才检查，manifest 校验不要求。）
 
@@ -402,7 +429,7 @@ hooks 在下载生命周期事件发生时运行你的代码。
 | `key` | 是 | 插件内唯一，不能为空。脚本里用 `flux.settings.<key>` 读回。 |
 | `title` | 是 | 表单标签。 |
 | `description` | 否 | 字段下方的说明文字。 |
-| `type` | 是 | `string`、`number` 或 `boolean`。 |
+| `localizations` | 否 | 按客户端 UI 语言选择的显示文案翻译，见[设置文案本地化](#设置文案本地化)。 |
 | `widget` | 否 | 缺省按 type 推导：string→`text`，number→`number`，boolean→`toggle`。 |
 | `options` | 仅 select | 非空的 `{ "value", "label" }` 列表。 |
 | `default` | 否 | **一律写成字符串**，number 也是（`"3"`），boolean 只能是 `"true"` / `"false"`。select 的 default 必须是某个 option 的 value；number 的 default 必须能解析为有限数且落在 `min` / `max` 区间内。 |
@@ -411,6 +438,24 @@ hooks 在下载生命周期事件发生时运行你的代码。
 | `pattern` | 仅 string | **JavaScript RegExp** 语法（不是 Rust regex），保存时对值做校验。安装时会编译一次，不合法的 pattern 会导致安装被拒绝。 |
 | `helperScript` | 仅 string | 一段脚本，宿主会在该字段旁渲染一个**复制**按钮。宿主只把脚本文本复制到剪贴板，**绝不执行**。用户把它粘贴到目标站点的浏览器开发者工具 Console 中运行（典型用途：读取 `document.cookie` 并把登录 Cookie 复制回该字段）。须非空、不超过 4 KB。 |
 | `helperLabel` | 与 `helperScript` 同时出现 | 按钮文案，不超过 60 个字符。只能与 `helperScript` 一起使用；省略时用通用文案「复制获取脚本」。 |
+
+#### 设置文案本地化
+
+设置项可选添加 `localizations` 对象。语言键使用连字符分隔；每个语言值可翻译 `title`、`description`、`helperLabel`，以及以现有选项 **value** 为键的选项标签。翻译不会改变设置 key、选项 value、默认值或校验规则。
+
+```json
+"localizations": {
+  "en": { "title": "Preferred quality", "options": { "hd": "High definition" } },
+  "zh-Hans": { "title": "偏好画质", "options": { "hd": "高清" } }
+}
+```
+
+客户端使用自己的 UI 语言，与 daemon 语言无关。每段文案依次尝试最具体语言、逐级截短的语言标签、`en`，最后回退到 manifest 原文；空白翻译会跳过。没有本地化的旧 manifest 仍有效，并显示原文。自定义视图继续使用 `ctx.locale`；语言切换时该值会热更新，应在 `render` 内重新读取，而不要在 `init` 中缓存本地化文案。桌面脚本可使用实时 getter `fluxdown.locale()`。客户端语言变化时应更新自定义视图。
+
+语言键忽略大小写：首段为 2–8 个英文字母，其后可用 `-` 连接 1–8 位字母或数字的子标签；忽略大小写后重复的语言键会被拒绝。每项最多 64 种语言，每段译文最多 4096 个 Unicode 字符。未知字段、未知选项 value，以及未声明 `helperScript` 的 `helperLabel` 翻译都会被拒绝。
+
+支持中文语言别名：`zh` 可匹配 `zh-Hans` / `zh-CN`，`zh-HK` / `zh-MO` 可匹配 `zh-Hant` / `zh-TW`；显式 `Hans` / `Hant` 优先于冲突的地区。若原文不是英文，也应给原文语言提供翻译，避免英文回退优先于原文。切换语言只更新标签，不清空未保存的设置值。可移植视图只更新该会话的 `ctx.locale` 并以原有状态重新渲染，不会重跑 `init` 或触发输入事件。
+
 
 ### widget × type 合法矩阵
 
@@ -448,15 +493,15 @@ manifest 在安装时和每次加载时都会校验。校验失败的插件不�
 
 ### 检查顺序
 
-identity 格式 → `name` 非空 → `version` 格式 → `minAppVersion` 格式 → `icon` 路径安全 → resolver 至多一个 → resolver 的 `entry` 路径、`match.urls` 非空、`timeoutMs ≠ 0`、`memoryLimitMb ≠ 0` → subscription 至多一个 → `providerId` 格式且不是 `rss`、`entry` 路径、`timeoutMs ≠ 0` → hooks 的 `entry` 路径、`events` 非空且合法、`match.urls`（如有）非空 → auth 的 `entry` 路径、含 `auth` 权限、`timeoutMs ≠ 0` → `main`（路径、`.js`、`events` 合法、`background` 权限）→ `contributes`（视图与命令的数量上限和 id、`settings` 位置至多一个、`portable` 只能与 `desktop` 同时声明、可移植视图与命令要求 `main`、desktop 的入口 / 尺寸 / 主机规则、`desktop` 权限、视图 `icon` 的路径 / `.svg` 扩展名、`sniffRules` 的路径 / 扩展名 / `browserRules` 权限，然后是 `pageScripts`：至多 16 条 → `pageScripts` 权限 → 逐条脚本：`id` 格式与唯一性、`title` 长度、`matches` 数量与模式、`excludeMatches` 数量与模式、`js` 数量、安全的 `.js` 路径、不重复）→ `settings`（key 唯一、逐字段规则与 widget × type 矩阵）→ `permissions` 全为已知值。
+identity 格式 → `name` 非空 → `version` 格式 → `minAppVersion` 格式 → `icon` 路径安全 → resolver 至多一个 → resolver 的 `entry` 路径、`match.urls` 非空、`timeoutMs ≠ 0`、`memoryLimitMb ≠ 0` → subscription 至多一个 → `providerId` 格式且不是 `rss`、`entry` 路径、`timeoutMs ≠ 0` → hooks 的 `entry` 路径、`events` 非空且合法、`match.urls`（如有）非空 → auth 的 `entry` 路径、含 `auth` 权限、`timeoutMs ≠ 0` → `main`（路径、`.js`、`events` 合法、`background` 权限）→ `contributes`（视图与命令的数量上限和 id、`settings` 位置至多一个、`portable` 只能与 `desktop` 同时声明、可移植视图与命令要求 `main`、desktop 的入口 / 尺寸 / 主机规则、`desktop` 权限、视图 `icon` 的路径 / `.svg` 扩展名、`sniffRules` 的路径 / 扩展名 / `browserRules` 权限、`archive` 的包内相对路径 / `.js` 扩展名 / `archive` 权限，然后是 `pageScripts`：至多 16 条 → `pageScripts` 权限 → 逐条脚本：`id` 格式与唯一性、`title` 长度、`matches` 数量与模式、`excludeMatches` 数量与模式、`js` 数量、安全的 `.js` 路径、不重复）→ `settings`（key 唯一、逐字段规则与 widget × type 矩阵）→ `permissions` 全为已知值。
 
 ### 必须存在的文件
 
-安装与加载时，包内必须有每个已声明的入口脚本（`resolvers[0].entry`、`hooks.entry`、`auth.entry`、`subscriptions[0].entry`、`main.entry`）、每个 `desktop.entry`、每个视图 `icon`（还要通过上文的图标内容检查）、`sniffRules` 指向的文件（后者还要通过上文的内容检查），以及页面脚本 `js` 列出的每个文件（每个不超过 256 KiB 且为合法 UTF-8，同一条脚本拼接后不超过 384 KiB）。缺失时的错误是「包内缺少文件 '<路径>'」；入口脚本存在但无法按 UTF-8 文本读取时，错误是「读取入口文件 '<路径>' 失败: …」。开发模式插件同样适用：插件会被列为**加载失败**，而不是等到第一次调用时才出错。
+安装与加载时，包内必须有每个已声明的入口脚本（`resolvers[0].entry`、`hooks.entry`、`auth.entry`、`subscriptions[0].entry`、`main.entry`、`contributes.archive`）、每个 `desktop.entry`、每个视图 `icon`（还要通过上文的图标内容检查）、`sniffRules` 指向的文件（后者还要通过上文的内容检查），以及页面脚本 `js` 列出的每个文件（每个不超过 256 KiB 且为合法 UTF-8，同一条脚本拼接后不超过 384 KiB）。缺失时的错误是「包内缺少文件 '<路径>'」；入口脚本存在但无法按 UTF-8 文本读取时，错误是「读取入口文件 '<路径>' 失败: …」。开发模式插件同样适用：插件会被列为**加载失败**，而不是等到第一次调用时才出错。
 
 ### 安装时的编译检查
 
-语法错误会在安装时当场拒绝，而不是等到第一次下载才发现。编译检查覆盖 **resolver、hooks、auth、subscription** 四类入口脚本（按声明的种类，最多四个），**不**包括 `main`（按需编译）和桌面脚本（引擎从不编译）。每个 `settings[].pattern` 也会在安装时按 JavaScript RegExp 编译一次，不合法则拒绝安装。
+语法错误会在安装时当场拒绝，而不是等到第一次下载才发现。编译检查覆盖 **resolver、hooks、interceptors、auth、订阅和 archive** 入口脚本（按声明的种类，最多六个）。每个脚本会在一个没有 `flux` 和 `console` 的空白上下文里求值一次，所以顶层代码不能调用它们。**不**包括 `main`（按需编译）和桌面脚本（引擎从不编译）。每个 `settings[].pattern` 也会在安装时按 JavaScript RegExp 编译一次，不合法则拒绝安装。
 
 安装失败不会留下任何改动：首次安装不会留下目录，更新则恢复到旧版本。
 

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fluxdown_protocol::{CloudEndpointDto, method};
+use fluxdown_ui_components::BusyHold;
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -50,6 +51,13 @@ pub struct AccountView {
     devices_refreshing: bool,
     /// 已配对设备「刷新」在途。
     linked_refreshing: bool,
+    /// 三个刷新按钮的最短可见保持（本地调用常在一帧内返回，菊花否则不可见）；仅由用户点击启动。
+    cloud_hold: BusyHold,
+    devices_hold: BusyHold,
+    linked_hold: BusyHold,
+    /// 「立即同步」在途。
+    sync_now_busy: bool,
+    sync_now_hold: BusyHold,
     /// 「退出登录」在途：按钮置灰并拒绝重入。
     signing_out: bool,
     /// 上次观察到的登录态，用于在切换时清掉旧错误。
@@ -103,6 +111,11 @@ impl AccountView {
             cloud_refreshing: false,
             devices_refreshing: false,
             linked_refreshing: false,
+            cloud_hold: BusyHold::default(),
+            devices_hold: BusyHold::default(),
+            linked_hold: BusyHold::default(),
+            sync_now_busy: false,
+            sync_now_hold: BusyHold::default(),
             signing_out: false,
             had_session,
             _endpoint_subscription,
@@ -209,6 +222,39 @@ impl AccountView {
         .detach();
     }
 
+    /// 「立即同步」：在途期间按钮转菊花并拒绝重入；最短可见时长由 [`BusyHold`] 保证。
+    pub(crate) fn sync_now(&mut self, cx: &mut Context<Self>) {
+        if self.sync_now_busy {
+            return;
+        }
+        let future = self.port(cx).execute(AccountCommand::Sync {
+            method: method::AGENT_SYNC_NOW,
+            params: serde_json::json!({}),
+        });
+        self.sync_now_busy = true;
+        self.sync_now_hold.start(cx);
+        self.last_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = future.await;
+            let Ok(()) = this.update(cx, |this, cx| {
+                this.sync_now_busy = false;
+                if let Err(error) = result {
+                    this.last_error = Some(error_text(
+                        this.translator.read(cx),
+                        &error,
+                        ErrorContext::Sync,
+                    ));
+                }
+                cx.notify();
+            }) else {
+                // 账户视图或窗口已释放，结束回调，不再更新状态。
+                return;
+            };
+        })
+        .detach();
+    }
+
     /// 登出：用户主动结束会话，agent 不发撤销提示。
     pub(crate) fn sign_out(&mut self, cx: &mut Context<Self>) {
         if self.signing_out {
@@ -255,6 +301,7 @@ impl AccountView {
             params: serde_json::json!({}),
         });
         self.linked_refreshing = true;
+        self.linked_hold.start(cx);
         self.last_error = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -312,6 +359,7 @@ impl AccountView {
             params: serde_json::json!({}),
         });
         self.cloud_refreshing = true;
+        self.cloud_hold.start(cx);
         self.last_error = None;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -338,6 +386,7 @@ impl AccountView {
         let port = self.port(cx);
         self.devices_refreshing = true;
         self.last_error = None;
+        self.devices_hold.start(cx);
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = async {
@@ -579,7 +628,7 @@ impl Render for AccountView {
                 pages::profile::ProfileState {
                     copied: origin_id_copied,
                     disabled: disabled || self.signing_out,
-                    refreshing: self.cloud_refreshing,
+                    refreshing: self.cloud_refreshing || self.cloud_hold.is_held(),
                     last_error,
                     show_referral: self.host.read(cx).show_referral(),
                 },
@@ -607,8 +656,8 @@ impl Render for AccountView {
                 linked: &linked,
                 logged_in,
                 disabled,
-                refreshing: self.devices_refreshing,
-                linked_refreshing: self.linked_refreshing,
+                refreshing: self.devices_refreshing || self.devices_hold.is_held(),
+                linked_refreshing: self.linked_refreshing || self.linked_hold.is_held(),
             },
             cx,
         ));
@@ -618,6 +667,7 @@ impl Render for AccountView {
             pages::cloud_features::CloudFeaturesState {
                 logged_in,
                 disabled,
+                sync_now_busy: self.sync_now_busy || self.sync_now_hold.is_held(),
             },
             &sync,
             (!self.host.read(cx).controller.is_stale()

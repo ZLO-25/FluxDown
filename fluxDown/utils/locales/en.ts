@@ -9,6 +9,7 @@ const en: Record<MessageKey, string> = {
   "header.languageSwitch": "Switch to {language}",
   "header.checking": "Checking...",
   "header.connected": "Connected",
+  "header.androidHandoff": "To FluxDown app",
   "header.disconnected": "Disconnected",
 
   // Main switch
@@ -100,12 +101,15 @@ const en: Record<MessageKey, string> = {
   "options.general.notifyRemoteTitle": "Remote Task Notifications",
   "options.general.notifyRemoteDesc":
     "Show a desktop notification when a task is sent to the remote server (created / failed)",
+  "options.general.groupInterface": "Interface",
+  "options.general.groupNotify": "Notifications",
+  "options.general.groupAdvanced": "Advanced",
 
   // Intercept rules
   "options.nav.rules": "Sniffing Rules",
   "options.rules.extTitle": "File Extensions",
   "options.rules.extDesc":
-    "Downloads matching these extensions are intercepted (positive match in Smart mode). Add your own below; built-in entries cannot be removed",
+    "Downloads matching these extensions are intercepted. Add your own below; built-in entries cannot be removed",
   "options.rules.extPlaceholder": "e.g. .epub",
   "options.rules.add": "Add",
   "options.rules.builtinExts": "Built-in extensions",
@@ -115,7 +119,7 @@ const en: Record<MessageKey, string> = {
   "options.rules.extAdded": "Added {ext}",
   "options.rules.mimeTitle": "MIME Types",
   "options.rules.mimeDesc":
-    "Responses matching these MIME types are intercepted in Smart mode. A trailing slash matches the whole family (e.g. video/)",
+    "Responses matching these MIME types are intercepted. A trailing slash matches the whole family (e.g. video/)",
   "options.rules.mimePlaceholder": "e.g. application/epub+zip or video/",
   "options.rules.mimeInvalid":
     "Invalid format, e.g. application/epub+zip or video/",
@@ -123,7 +127,7 @@ const en: Record<MessageKey, string> = {
   "options.rules.mimeResetDone": "Default MIME list restored",
   "options.rules.excludeExtTitle": "Excluded Extensions",
   "options.rules.excludeExtDesc":
-    "Downloads matching these extensions are never intercepted, even if they also match the include rules above (e.g. .torrent, .crx)",
+    "Downloads matching these extensions are never intercepted (e.g. .torrent, .crx)",
   "options.rules.excludeExtPlaceholder": "e.g. .torrent",
   "options.rules.minFileSizeCustom": "Custom",
   "options.rules.minFileSizeCustomPlaceholder": "Custom size (MB)",
@@ -156,6 +160,8 @@ const en: Record<MessageKey, string> = {
   "notify.batchSentDetail": "{count} tasks sent to FluxDown",
   "notify.sendFailed": "Send Failed",
   "notify.connectionFailed": "Cannot connect to FluxDown app: {message}",
+  "notify.androidUnsupported": "This download can't be handed to the FluxDown Android app (audio/video track pairs, form submissions and FTP links need the desktop or remote channel)",
+  "notify.androidHandoffFailed": "The browser refused to open the FluxDown Android app",
   "notify.fallbackBrowser": "Fell back to browser download",
   "notify.fallbackBrowserDetail":
     "Could not send to FluxDown, fell back to browser: {url}",
@@ -280,6 +286,7 @@ const en: Record<MessageKey, string> = {
   "popup.task.remove": "Remove",
   "popup.task.open": "Open",
   "popup.task.reveal": "Show in Folder",
+  "popup.task.fileMissing": "File missing",
   "popup.task.paused": "Paused",
   "popup.task.pending": "Pending",
   "popup.task.preparing": "Preparing",
@@ -296,6 +303,8 @@ const en: Record<MessageKey, string> = {
   // Popup / side panel
   "popup.viewAll": "View all in side panel ({count})",
   "popup.sidePanel": "Side panel",
+  "popup.bypassHint": "{key}+click to skip",
+  "popup.bypassHintTip": "Hold {key} while clicking a link and the browser downloads it instead of FluxDown (magnet links go to the system handler). Also works for buttons that start the download via script. Change the key in Settings → Download Interception.",
   "sidepanel.tab.resources": "Resources",
   "sidepanel.tab.links": "Links",
   "sidepanel.tab.tasks": "Tasks",
@@ -348,7 +357,7 @@ const en: Record<MessageKey, string> = {
   "options.protocol.label": "FluxDown Protocol",
   "options.protocol.enabled": "On — launch app via fluxdown://",
   "options.protocol.disabled": "Off (default)",
-  "options.protocol.desc": "Launch the app via the fluxdown:// protocol — supported on Windows, macOS, Linux and Android. The native channel is more capable, so enable this only when it is unavailable",
+  "options.protocol.desc": "Launch the app via the fluxdown:// protocol — supported on Windows, macOS and Linux (browsers on Android hand downloads to the FluxDown app automatically, no need to enable this). The native channel is more capable, so enable this only when it is unavailable",
 
   // Task completion notification (task panel)
   "notify.taskCompletedTitle": "Download Complete",
@@ -517,6 +526,12 @@ const en: Record<MessageKey, string> = {
   "options.about.github": "GitHub Repository",
   "options.about.releases": "Releases & Downloads",
   "options.about.feedback": "Feedback",
+  "options.intercept.groupBasic": "Basics",
+  "options.intercept.groupInclude": "What to Intercept",
+  "options.intercept.groupIncludeDesc": "In Smart mode, a download is intercepted when it matches any extension or MIME type below; \"Intercept All\" mode ignores this group",
+  "options.intercept.groupExclude": "Exclusions",
+  "options.intercept.groupExcludeDesc": "Downloads matching any condition below always go to the browser, overriding the intercept mode and the rules above",
+  "options.intercept.groupFallback": "Failures & Cancellations",
   "options.intercept.enabled": "Download Interception",
   "options.intercept.enabledDesc": "Master switch: when off, every download is left to the browser",
   "options.intercept.mode": "Intercept Mode",
@@ -527,6 +542,10 @@ const en: Record<MessageKey, string> = {
   "options.intercept.localDownloadHint": "Files generated inside the browser (blob:/data: links, service-worker streamed downloads) can't be taken over and use the browser download",
   "options.intercept.magnet": "Take Over Magnet Links",
   "options.intercept.magnetHint": "When off, magnet links go to the system default handler (e.g. qBittorrent)",
+  "options.intercept.bypassKey": "Skip Takeover Key",
+  "options.intercept.bypassKeyDesc": "Hold this key while clicking a link to let the browser handle that download (magnet links go to the system handler)",
+  "options.intercept.bypassKeyAlt": "Alt (Option on Mac)",
+  "options.intercept.bypassKeyOff": "Off",
   "options.intercept.minSize": "Min File Size",
   "options.intercept.sizeNoLimit": "No limit",
   "options.intercept.fallbackReject": "Fall back to browser when the desktop app rejects",
@@ -537,6 +556,9 @@ const en: Record<MessageKey, string> = {
   "options.intercept.askExcludeDesc": "When downloads from one site are cancelled 3 or more times within 7 days, ask whether to stop intercepting that site",
   "options.intercept.contextMenu": "Context menu",
   "options.intercept.contextMenuDesc": "Add \"Download with FluxDown\" entries to the page context menu",
+  "options.sniff.groupDetect": "Detection",
+  "options.sniff.groupEntry": "In-page Entry Points",
+  "options.sniff.groupEntryDesc": "These entry points are hidden when Resource Sniffing is off",
   "options.sniff.enabled": "Resource Sniffing",
   "options.sniff.enabledDesc": "Detect downloadable resources on web pages; turning it off hides the in-page entry points (applies to newly opened pages)",
   "options.sniff.pageDot": "In-page Floating Dot",
@@ -557,7 +579,10 @@ const en: Record<MessageKey, string> = {
   "options.sniff.imagesDesc": "Detect large images on web pages (>100KB)",
   "options.sniff.lowConfidence": "Show Low-confidence Resources",
   "options.sniff.lowConfidenceDesc": "Also list items the detector is less sure about",
-  "options.sites.desc": "Override the global behaviour per site: whether to take over downloads, sniff, show the dot and float button, and where to save. A site entry also applies to its subdomains.",
+  "options.sniff.maxResources": "Max Resources per Page",
+  "options.sniff.maxResourcesDesc":
+    "Stop scanning page links after this many items (1–{max}). Very large values may slow down long list pages. Media caught from network requests is not counted.",
+  "options.sites.desc": "Override the global behaviour per site: whether to take over downloads, sniff, show the dot and float button, and where to save. A site entry also applies to its subdomains. For private or intranet IPs, enter a CIDR range such as 10.0.0.0/8, 192.168.0.0/16 or fd00::/8; an exact IP entry takes priority over a range, and the longest matching range wins.",
   "options.sites.colHost": "Site",
   "options.sites.colIntercept": "Intercept",
   "options.sites.colSniff": "Sniff",
@@ -847,6 +872,7 @@ const en: Record<MessageKey, string> = {
   "rules.validate.mirror_out_of_scope": "Mirror host {param} is outside the rule's scope",
   "rules.validate.page_scope_required": "Page rules must be scoped with host or pageHost",
   "rules.validate.player_float_invalid": "Invalid player.float",
+  "rules.validate.player_top_invalid": "player.top must be an integer from 1 to 200",
   "rules.validate.preempt_forbidden": "preempt is only allowed for built-in and official rules",
   "rules.validate.requires_invalid": "Invalid requires",
   "rules.validate.resource_type_invalid": "Invalid resource type {param}",

@@ -21,10 +21,13 @@ struct EventState {
 }
 
 /// 线性化 daemon 快照与增量事件。
+///
+/// 广播环形缓冲在建通道时按容量整块分配，槽里放 `Arc<EventFrame>`（约 40B / 槽，内联帧
+/// 约 600B / 槽）；每个订阅者 `recv` 只是引用计数加一，不深拷贝整帧。
 #[derive(Clone)]
 pub struct DaemonEventHub {
     state: Arc<Mutex<EventState>>,
-    events: broadcast::Sender<EventFrame>,
+    events: broadcast::Sender<Arc<EventFrame>>,
     /// 可移植视图会话存储：事件映射（渲染 → 帧）与 RPC（open / snapshot / close）共享。
     plugin_views: Arc<crate::plugin_views::PluginViewStore>,
 }
@@ -42,6 +45,7 @@ impl DaemonEventHub {
             expiry_running: false,
         };
         update_runtime_stats(&mut state, Instant::now());
+        state.snapshot.runtime_stats.local_work_count = Some(0);
         Self {
             state: Arc::new(Mutex::new(state)),
             events,
@@ -57,13 +61,13 @@ impl DaemonEventHub {
 
     /// 只订阅增量广播（不克隆快照）；滞后时接收者自行按 [`Self::snapshot`] 复核。
     #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<EventFrame> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<EventFrame>> {
         self.events.subscribe()
     }
 
     /// 先订阅广播，再原子克隆快照；调用方丢弃不大于快照 sequence 的帧。
     #[must_use]
-    pub fn subscribe_and_snapshot(&self) -> (broadcast::Receiver<EventFrame>, Snapshot) {
+    pub fn subscribe_and_snapshot(&self) -> (broadcast::Receiver<Arc<EventFrame>>, Snapshot) {
         let receiver = self.events.subscribe();
         let state = lock_or_recover(&self.state);
         let snapshot = Snapshot {
@@ -119,7 +123,7 @@ impl DaemonEventHub {
     }
 
     /// 先更新物化投影，再递增 sequence 并广播对应帧。
-    pub fn publish(&self, event: DaemonEvent) -> EventFrame {
+    pub fn publish(&self, event: DaemonEvent) -> Arc<EventFrame> {
         let mut state = lock_or_recover(&self.state);
         let frame = self.publish_with_stats_locked_at(&mut state, event, Instant::now());
         self.start_expiry(&mut state);
@@ -144,7 +148,33 @@ impl DaemonEventHub {
         self.publish_locked(&mut state, DaemonEvent::RuntimeStatsChanged(stats));
     }
 
-    fn publish_locked(&self, state: &mut EventState, event: DaemonEvent) -> EventFrame {
+    /// 写回 `save_dir` 所在卷的剩余空间探测结果；数值不变不发布。
+    ///
+    /// `configured` 是探测开始时读到的 `default_save_dir` 原值：探测期间保存目录已被改掉
+    /// 就丢弃结果（那次配置变化会触发新的探测），避免旧目录的读数覆盖新目录。
+    pub fn set_disk_free(&self, configured: Option<&str>, save_dir: String, free: Option<u64>) {
+        let mut state = lock_or_recover(&self.state);
+        if state
+            .snapshot
+            .config
+            .values
+            .get("default_save_dir")
+            .map(String::as_str)
+            != configured
+        {
+            return;
+        }
+        let current = &state.snapshot.runtime_stats;
+        if current.disk_free_bytes == free && current.save_dir == save_dir {
+            return;
+        }
+        let mut stats = current.clone();
+        stats.disk_free_bytes = free;
+        stats.save_dir = save_dir;
+        self.publish_locked(&mut state, DaemonEvent::RuntimeStatsChanged(stats));
+    }
+
+    fn publish_locked(&self, state: &mut EventState, event: DaemonEvent) -> Arc<EventFrame> {
         let frame = self.publish_locked_at(state, event, Instant::now());
         self.start_expiry(state);
         frame
@@ -155,7 +185,7 @@ impl DaemonEventHub {
         state: &mut EventState,
         event: DaemonEvent,
         now: Instant,
-    ) -> EventFrame {
+    ) -> Arc<EventFrame> {
         let before = runtime_measurements(&state.snapshot.runtime_stats);
         let metadata_changed = match &event {
             DaemonEvent::SnapshotReplaced(snapshot) => {
@@ -185,7 +215,7 @@ impl DaemonEventHub {
         state: &mut EventState,
         mut event: DaemonEvent,
         now: Instant,
-    ) -> EventFrame {
+    ) -> Arc<EventFrame> {
         state.accounting.apply(&event, now);
         apply_daemon_event(&mut state.snapshot, &event);
         update_runtime_stats(state, now);
@@ -193,17 +223,17 @@ impl DaemonEventHub {
             stats.clone_from(&state.snapshot.runtime_stats);
         }
         state.sequence = state.sequence.saturating_add(1);
-        let frame = EventFrame {
+        let frame = Arc::new(EventFrame {
             epoch: state.epoch.clone(),
             sequence: state.sequence,
             previous: None,
             // 投影已用完整事件更新；广播 / 线上形态里整表事件换成头或重载宣告，任何一帧
             // 都不随任务数增长（订阅者经 `system.taskPage` 分页取表）。
             event: ServiceEvent::Daemon(event.into_wire()),
-        };
+        });
         // 与序号递增处于同一临界区，接收者不会收到乱序帧。
-        // 无订阅者是正常空闲状态，不克隆帧或逐条记录进度日志。
-        if self.events.receiver_count() != 0 && self.events.send(frame.clone()).is_err() {
+        // 无订阅者是正常空闲状态，不入队也不逐条记录进度日志。
+        if self.events.receiver_count() != 0 && self.events.send(Arc::clone(&frame)).is_err() {
             tracing::trace!("daemon event subscribers disconnected before publish");
         }
         frame
@@ -254,7 +284,7 @@ impl DaemonEventHub {
     }
 
     /// 原子替换投影并发布替换事件。
-    pub fn replace_snapshot(&self, snapshot: DaemonSnapshot) -> EventFrame {
+    pub fn replace_snapshot(&self, snapshot: DaemonSnapshot) -> Arc<EventFrame> {
         self.publish(DaemonEvent::SnapshotReplaced(snapshot))
     }
 }
@@ -696,6 +726,22 @@ impl fluxdown_engine::events::EventSink for DaemonEngineEventSink {
     fn emit(&self, event: fluxdown_engine::events::EngineEvent) {
         use fluxdown_engine::events::EngineEvent;
         match event {
+            EngineEvent::LocalWorkChanged { active } => {
+                let mut state = lock_or_recover(&self.0.state);
+                let mut stats = state.snapshot.runtime_stats.clone();
+                let count = stats.local_work_count.unwrap_or(0);
+                stats.local_work_count = Some(if active {
+                    count.saturating_add(1)
+                } else {
+                    count.checked_sub(1).unwrap_or_else(|| {
+                        tracing::error!("unbalanced engine local-work guard");
+                        0
+                    })
+                });
+                self.0
+                    .publish_locked(&mut state, DaemonEvent::RuntimeStatsChanged(stats));
+                return;
+            }
             EngineEvent::TaskTransferred { task_id, bytes } => {
                 // Host-local like the baseline: the progress frame that follows
                 // publishes the updated runtime stats.
@@ -762,6 +808,19 @@ impl fluxdown_engine::events::EventSink for DaemonEngineEventSink {
                 self.0.publish(DaemonEvent::TaskNotice(
                     fluxdown_engine_protocol::task_notice_to_dto(notice),
                 ));
+                return;
+            }
+            EngineEvent::BtGuardChanged => {
+                self.0.publish(DaemonEvent::BtGuardChanged);
+                return;
+            }
+            EngineEvent::BtGuardCloudRefreshWanted { have_sequence } => {
+                self.0
+                    .publish(DaemonEvent::BtGuardCloudRefreshWanted { have_sequence });
+                return;
+            }
+            EngineEvent::BtGuardEvidenceReady { count } => {
+                self.0.publish(DaemonEvent::BtGuardEvidenceReady { count });
                 return;
             }
             _ => {}
@@ -925,6 +984,14 @@ impl fluxdown_engine::events::EventSink for DaemonEngineEventSink {
                     .publish(DaemonEvent::PluginViewClosed { session, reason });
                 return;
             }
+            EngineEvent::PluginViewNavigate { session, target } => {
+                let frame = self
+                    .0
+                    .plugin_views
+                    .effect(&session, fluxdown_protocol::ViewEffect::Navigate { target });
+                self.0.publish(DaemonEvent::PluginViewFrame(frame));
+                return;
+            }
             EngineEvent::PluginToast {
                 identity,
                 level,
@@ -935,6 +1002,16 @@ impl fluxdown_engine::events::EventSink for DaemonEngineEventSink {
                     level,
                     text,
                 });
+                return;
+            }
+            #[cfg(feature = "plugins")]
+            EngineEvent::PluginsChanged(plugins) => {
+                self.0.publish(DaemonEvent::PluginsChanged(
+                    plugins
+                        .into_iter()
+                        .map(fluxdown_engine_protocol::plugin_info_to_dto)
+                        .collect(),
+                ));
                 return;
             }
             EngineEvent::PluginAutoDisabled { identity, reason } => {
@@ -1060,6 +1137,28 @@ mod tests {
 
     use super::{DaemonEngineEventSink, DaemonEventHub};
 
+    #[test]
+    fn local_work_blocks_power_until_every_guard_finishes_and_reaches_subscribers() {
+        let hub = DaemonEventHub::new(DaemonSnapshot::default(), 8);
+        let mut subscriber = hub.subscribe();
+        let sink = DaemonEngineEventSink(hub.clone());
+        assert_eq!(hub.inspect(|s| s.runtime_stats.local_work_count), Some(0));
+        for (active, expected) in [(true, 1), (true, 2), (false, 1), (false, 0)] {
+            sink.emit(EngineEvent::LocalWorkChanged { active });
+            let frame = subscriber
+                .try_recv()
+                .expect("local work immediately publishes stats");
+            let ServiceEvent::Daemon(DaemonEvent::RuntimeStatsChanged(stats)) = &frame.event else {
+                panic!("local work must publish runtime stats");
+            };
+            assert_eq!(stats.local_work_count, Some(expected));
+            assert_eq!(
+                hub.inspect(|s| s.runtime_stats.local_work_count),
+                Some(expected)
+            );
+        }
+    }
+
     /// 引擎的队列顺序增量经 hub 以 `QueueOrderChanged` 发出，并由共享 reducer 更新快照里的
     /// `queue_positions`（名次 = 按 `order` 升序的下标 + 1）。
     #[test]
@@ -1114,7 +1213,7 @@ mod tests {
         let ServiceEvent::Daemon(DaemonEvent::Engine(WsServerMsg::QueueOrderChanged {
             removed,
             added,
-        })) = frame.event
+        })) = frame.event.clone()
         else {
             panic!("queue order increments must reach subscribers as queueOrderChanged");
         };
@@ -1165,7 +1264,7 @@ mod tests {
                 .try_recv()
                 .expect("subscriber receives queue change");
             let fluxdown_protocol::ServiceEvent::Daemon(DaemonEvent::QueuesChanged(changed)) =
-                frame.event
+                frame.event.clone()
             else {
                 panic!("queue changes must use the domain event consumed by live windows");
             };
@@ -1197,7 +1296,7 @@ mod tests {
             .try_recv()
             .expect("subscriber receives group change");
         let fluxdown_protocol::ServiceEvent::Daemon(DaemonEvent::GroupsChanged(groups)) =
-            frame.event
+            frame.event.clone()
         else {
             panic!("groups must use the domain event consumed by live windows");
         };
@@ -1225,7 +1324,7 @@ mod tests {
             .try_recv()
             .expect("subscriber receives delivery change");
         let fluxdown_protocol::ServiceEvent::Daemon(DaemonEvent::WebhooksChanged(deliveries)) =
-            frame.event
+            frame.event.clone()
         else {
             panic!("deliveries must use the domain event consumed by live settings");
         };
@@ -1256,7 +1355,8 @@ mod tests {
             },
         ));
         let frame = subscriber.try_recv().expect("notice is published");
-        let fluxdown_protocol::ServiceEvent::Daemon(DaemonEvent::TaskNotice(notice)) = frame.event
+        let fluxdown_protocol::ServiceEvent::Daemon(DaemonEvent::TaskNotice(notice)) =
+            frame.event.clone()
         else {
             panic!("task notices use the dedicated event, not an engine message");
         };
@@ -1279,7 +1379,7 @@ mod tests {
         sink.emit(EngineEvent::RetryPendingChanged { count: 2 });
         let frame = subscriber.try_recv().expect("a changed count is published");
         let fluxdown_protocol::ServiceEvent::Daemon(DaemonEvent::RuntimeStatsChanged(stats)) =
-            frame.event
+            frame.event.clone()
         else {
             panic!("retry-pending count travels in the runtime stats projection");
         };
@@ -1317,6 +1417,7 @@ mod tests {
             ignore_tls_errors: false,
             file_missing: false,
             completed_at: String::new(),
+            file_hash: String::new(),
             segments: 0,
             queue_order: 1,
             uploaded_bytes: 0,
@@ -1329,12 +1430,17 @@ mod tests {
             seed_time_limit_minutes: -2,
             seed_inactive_time_limit_minutes: -2,
             seed_upload_limit_bps: 0,
+            bt_sequential: false,
+            bt_first_last_pieces_first: false,
+            bt_download_limit_bps: 0,
+            bt_super_seeding: false,
             referrer: String::new(),
             group_id: String::new(),
             rss_source_id: String::new(),
             origin_url: String::new(),
             auto_route: String::new(),
             source_bytes: Default::default(),
+            properties: Default::default(),
         }
     }
 
@@ -1350,7 +1456,8 @@ mod tests {
             engine_task("c", 2),
         ]));
         let frame = subscriber.try_recv().expect("one batch frame");
-        let fluxdown_protocol::ServiceEvent::Daemon(DaemonEvent::TasksChanged(tasks)) = frame.event
+        let fluxdown_protocol::ServiceEvent::Daemon(DaemonEvent::TasksChanged(tasks)) =
+            frame.event.clone()
         else {
             panic!("the batch must travel as a single TasksChanged event");
         };
@@ -1365,7 +1472,7 @@ mod tests {
             .try_recv()
             .expect("runtime stats follow the batch");
         let fluxdown_protocol::ServiceEvent::Daemon(DaemonEvent::RuntimeStatsChanged(stats)) =
-            stats_frame.event
+            stats_frame.event.clone()
         else {
             panic!("pending count changed, so runtime stats must follow");
         };
@@ -1407,7 +1514,7 @@ mod tests {
         ]));
         let frame = subscriber.try_recv().expect("one batch frame");
         let fluxdown_protocol::ServiceEvent::Daemon(DaemonEvent::TasksDeleted { task_ids }) =
-            frame.event
+            frame.event.clone()
         else {
             panic!("the batch must travel as a single TasksDeleted event");
         };
@@ -1575,8 +1682,11 @@ mod tests {
             tasks: vec![traffic_task("a", 2, 0, 0), traffic_task("b", 2, 0, 0)],
             ..DaemonSnapshot::default()
         });
-        let ServiceEvent::Daemon(DaemonEvent::SnapshotReplaced(header)) =
-            subscriber.try_recv().expect("replacement frame").event
+        let ServiceEvent::Daemon(DaemonEvent::SnapshotReplaced(header)) = subscriber
+            .try_recv()
+            .expect("replacement frame")
+            .event
+            .clone()
         else {
             panic!("replacement frame");
         };
@@ -1661,7 +1771,7 @@ mod tests {
         assert_eq!(state.snapshot.runtime_stats.total_download_bps, 0);
         let mut published = Vec::new();
         while let Ok(frame) = receiver.try_recv() {
-            if let ServiceEvent::Daemon(DaemonEvent::RuntimeStatsChanged(stats)) = frame.event {
+            if let ServiceEvent::Daemon(DaemonEvent::RuntimeStatsChanged(stats)) = &frame.event {
                 published.push(stats.total_download_bps);
             }
         }
@@ -1997,7 +2107,7 @@ mod tests {
         };
         let mut drain = || {
             std::iter::from_fn(|| subscriber.try_recv().ok())
-                .map(|frame| match frame.event {
+                .map(|frame| match frame.event.clone() {
                     ServiceEvent::Daemon(DaemonEvent::RuntimeStatsChanged(stats)) => {
                         Some(stats.total_download_bps)
                     }

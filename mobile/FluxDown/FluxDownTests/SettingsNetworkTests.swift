@@ -43,28 +43,21 @@ struct SettingsNetworkTests {
             "proxy_type": "socks5", "proxy_host": "10.0.0.2", "proxy_port": "1080",
             "proxy_username": "u", "proxy_password": "p",
         ])
-        #expect(NetworkProxyTest.request(mode: .manual, form: f, system: nil)
+        #expect(NetworkProxyTest.manual(form: f)
             == ProxyTestRequest(proxyType: "socks5", host: "10.0.0.2", port: "1080", username: "u", password: "p"))
     }
 
     @Test func manualRequestDefaultsTypeToHttp() {
         let f = form(["proxy_host": "h", "proxy_port": "1"])
-        #expect(NetworkProxyTest.request(mode: .manual, form: f, system: nil)?.proxyType == "http")
+        #expect(NetworkProxyTest.manual(form: f).proxyType == "http")
     }
 
     @Test func systemRequestNeedsADetectedProxyAndSendsNoCredentials() {
-        let f = form(["proxy_username": "u", "proxy_password": "p"])
         let detected = SystemProxyDto(detected: true, proxyType: "http", host: "192.168.1.2", port: 7890, noList: "localhost")
-        #expect(NetworkProxyTest.request(mode: .system, form: f, system: detected)
+        #expect(NetworkProxyTest.system(dto: detected)
             == ProxyTestRequest(proxyType: "http", host: "192.168.1.2", port: "7890"))
-        #expect(NetworkProxyTest.request(mode: .system, form: f, system: SystemProxyDto()) == nil)
-        #expect(NetworkProxyTest.request(mode: .system, form: f, system: nil) == nil)
-    }
-
-    @Test func noneAndAutoHaveNothingToTest() {
-        let f = form(["proxy_host": "h", "proxy_port": "1"])
-        #expect(NetworkProxyTest.request(mode: .none, form: f, system: nil) == nil)
-        #expect(NetworkProxyTest.request(mode: .auto, form: f, system: nil) == nil)
+        #expect(NetworkProxyTest.system(dto: SystemProxyDto()) == nil)
+        #expect(NetworkProxyTest.system(dto: nil) == nil)
     }
 
     @Test func tlsHandshakeFailureGetsTheActionableHint() {
@@ -78,19 +71,14 @@ struct SettingsNetworkTests {
 
     // MARK: 行目录
 
-    @Test func rowVisibilityFollowsModeAndConfigLoad() {
-        let unloaded = NetworkRow.visible(mode: .none, isLoaded: false)
+    @Test func rowVisibilityFollowsConfigLoadNotMode() {
+        let unloaded = NetworkRow.visible(isLoaded: false)
         #expect(unloaded == [.siteAuth, .siteAuthAdd, .siteAuthClear])
 
-        let none = NetworkRow.visible(mode: .none, isLoaded: true)
-        #expect(none == [.mode, .siteAuth, .siteAuthAdd, .siteAuthClear])
-        #expect(NetworkRow.visible(mode: .system, isLoaded: true) == none)
-        #expect(NetworkRow.visible(mode: .auto, isLoaded: true) == none)
-
-        let manual = NetworkRow.visible(mode: .manual, isLoaded: true)
-        #expect(manual.contains(.host))
-        #expect(manual.contains(.password))
-        #expect(manual.contains(.test))
+        #expect(NetworkRow.visible(isLoaded: true) == [
+            .mode, .type, .host, .port, .username, .password, .noList, .test,
+            .rules, .rulesAdd, .rulesTest, .siteAuth, .siteAuthAdd, .siteAuthClear,
+        ])
     }
 
     @Test func configRowsMapToProxyCatalogKeysThatAreNotSynced() throws {
@@ -103,23 +91,63 @@ struct SettingsNetworkTests {
         #expect(NetworkRow.test.item == nil)
     }
 
-    @Test func searchEntriesOnlyIndexVisibleRows() {
+    @Test func searchEntriesIndexManualRowsInEveryMode() {
         func ctx(_ host: [String: String]) -> SettingsSearchContext {
             SettingsSearchContext(form: form(host), isLocalHost: true, capabilities: [])
         }
-        let manual = NetworkPage.searchEntries(ctx(["proxy_mode": "manual"]))
-        #expect(manual.map(\.id).contains("network.host"))
-        #expect(manual.map(\.id).contains("network.test"))
-        #expect(manual.allSatisfy { $0.route == .network })
+        for mode in ["manual", "none", "system", "auto"] {
+            let entries = NetworkPage.searchEntries(ctx(["proxy_mode": mode]))
+            #expect(entries.map(\.id).contains("network.host"))
+            #expect(entries.map(\.id).contains("network.test"))
+            #expect(entries.map(\.id).contains("network.mode"))
+            #expect(entries.allSatisfy { $0.route == .network })
+        }
 
         let none = NetworkPage.searchEntries(ctx(["proxy_mode": "none"]))
-        #expect(!none.map(\.id).contains("network.host"))
-        #expect(none.map(\.id).contains("network.mode"))
         #expect(none.map(\.id).contains("network.siteAuth"))
 
         #expect(NetworkPage.readout(ctx(["proxy_mode": "auto"])) == L("proxyModeAuto"))
         #expect(NetworkPage.readout(ctx([:])) == nil)
     }
+
+    // MARK: BitTorrent 代理
+
+    #if FULL_FLAVOR
+    @Test func btProxyRowsFollowTheMasterSwitch() {
+        #expect(BtProxyRow.visible(form([:])).isEmpty)
+        #expect(BtProxyRow.visible(form(["proxy_mode": "manual"])) == [.enabled])
+        #expect(BtProxyRow.visible(form(["bt_proxy_enabled": "true"])) == [.enabled, .source, .peers])
+        for row in BtProxyRow.allCases {
+            #expect(SettingsCatalog.field(row.configKey)?.store == .daemon, "\(row)")
+            #expect(!SettingsCatalog.isSynced(row.configKey), "\(row)")
+        }
+    }
+
+    @Test func btProxyHintMatchesGpui() {
+        func manual(_ type: String, _ host: String, _ port: String) -> String? {
+            BtProxyRow.hint(source: "manual", proxyType: type, host: host, port: port)
+        }
+        #expect(manual("socks5", "", "1080") == "btProxyNoServer")
+        #expect(manual("https", "proxy.lan", " ") == "btProxyNoServer")
+        #expect(manual("https", "proxy.lan", "443") == "btProxyUnsupportedType")
+        #expect(manual("http", "proxy.lan", "8080") == "btProxyNoUdp")
+        #expect(manual("socks4", "proxy.lan", "1080") == "btProxyNoUdp")
+        #expect(manual("socks5", "proxy.lan", "1080") == nil)
+        #expect(BtProxyRow.hint(source: "system", proxyType: "https", host: "", port: "") == "btProxySystemNote")
+        // 总开关关闭 / 未加载：不提示。
+        #expect(BtProxyRow.hint(in: form(["bt_proxy_enabled": "false"])) == nil)
+        #expect(BtProxyRow.hint(in: form([:])) == nil)
+        let server = ["bt_proxy_enabled": "true", "proxy_type": "http", "proxy_host": "h", "proxy_port": "1"]
+        #expect(BtProxyRow.hint(in: form(server)) == "btProxyNoUdp")
+        #expect(BtProxyRow.hint(in: form(server.merging(["bt_proxy_source": "system"]) { $1 })) == "btProxySystemNote")
+    }
+
+    @Test func btProxyRowsAreIndexedForSearch() {
+        let ctx = SettingsSearchContext(form: form(["bt_proxy_enabled": "true"]), isLocalHost: true, capabilities: [])
+        let ids = NetworkPage.searchEntries(ctx).map(\.id)
+        #expect(ids.contains(BtProxyRow.enabled.id) && ids.contains(BtProxyRow.peers.id))
+    }
+    #endif
 
     // MARK: 站点凭据
 
