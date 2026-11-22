@@ -86,7 +86,7 @@ jobs:
           }
           # portable 标记：agent / daemon 据此把数据写在同目录的 portable_data，不碰系统目录。
           New-Item -Path "$stage\portable" -ItemType File -Force | Out-Null
-          Copy-Item "FORK.md" $stage
+          Copy-Item "FORK.md", "FORK-INSTALL.md" $stage
           Copy-Item "LICENSE" $stage -ErrorAction SilentlyContinue
           @(
             "FluxDown fork build"
