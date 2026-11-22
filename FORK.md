@@ -6,6 +6,8 @@
 
 **要在一台電腦上安裝，請看 [FORK-INSTALL.md](FORK-INSTALL.md)**：從編譯、下載、驗證到設定與瀏覽器擴充功能的完整步驟。
 
+附加工具：[`fork-tools/轉成MP3.bat`](fork-tools/轉成MP3.bat) 把影片轉成 MP3（拖放，或放進資料夾點兩下），用法見 FORK-INSTALL.md 的「附加工具」。
+
 ## 本 fork 多做的事
 
 | 改動 | 位置 | 目的 |
