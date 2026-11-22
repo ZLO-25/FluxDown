@@ -4,7 +4,8 @@
 # 但不发 Release、不推镜像、不读取任何 secret，也不需要 tag。
 #
 # 触发：Actions 页面手动运行（workflow_dispatch），或推送 build/windows 分支。
-# 产物：运行页面底部 Artifacts 里的 FluxDown-fork-windows-x64-portable。
+# 产物：运行页面底部 Artifacts 里的 FluxDown-fork-windows-x64-portable（桌面版）
+#       与 FluxDown-fork-chrome-extension（Chrome 扩展，开发者模式加载）。
 name: Fork Windows build
 
 on:
@@ -85,7 +86,7 @@ jobs:
           }
           # portable 标记：agent / daemon 据此把数据写在同目录的 portable_data，不碰系统目录。
           New-Item -Path "$stage\portable" -ItemType File -Force | Out-Null
-          Copy-Item "FORK.md" $stage
+          Copy-Item "FORK.md", "FORK-INSTALL.md" $stage
           Copy-Item "LICENSE" $stage -ErrorAction SilentlyContinue
           @(
             "FluxDown fork build"
@@ -170,3 +171,78 @@ jobs:
         shell: bash
         run: |
           cargo test --locked --target "$TARGET" -p fluxdown_agent --lib update::
+
+  # Chrome 扩展：与官方 release.yml 的 build-extension 同样的构建命令，不上架、不签名。
+  # manifest 里的固定 key 让侧载产物与商店版同 ID，桌面端的浏览器桥接才会放行。
+  extension:
+    name: Build Chrome extension
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Read synced upstream version
+        id: version
+        run: |
+          version=$(grep -oE '目前同步到：`v[0-9]+\.[0-9]+\.[0-9]+`' FORK.md | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          if [ -z "$version" ]; then echo "FORK.md 里找不到同步版本" >&2; exit 1; fi
+          echo "VERSION=$version" >> "$GITHUB_OUTPUT"
+          echo "SHORT_SHA=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          node --version && npm --version
+
+      - name: Set extension version
+        working-directory: fluxDown
+        run: |
+          sed -i "s/\"version\": \".*\"/\"version\": \"${{ steps.version.outputs.VERSION }}\"/" package.json
+
+      - name: Install dependencies
+        working-directory: fluxDown
+        run: npm ci
+
+      - name: Build Chrome extension
+        working-directory: fluxDown
+        env:
+          WXT_HIDE_BUILTIN_RULES: "1"
+        run: npm run build
+
+      # 产物自检：ID 必须是桌面端放行的那个；不得带 update_url（否则浏览器会从外部自动更新它）。
+      - name: Check manifest
+        working-directory: fluxDown/.output/chrome-mv3
+        run: |
+          node -e '
+            const crypto = require("crypto");
+            const m = JSON.parse(require("fs").readFileSync("manifest.json", "utf8"));
+            if (!m.key) throw new Error("manifest has no key");
+            if (m.update_url) throw new Error("manifest has update_url");
+            const hex = crypto.createHash("sha256").update(Buffer.from(m.key, "base64")).digest("hex").slice(0, 32);
+            const id = [...hex].map((c) => String.fromCharCode(97 + parseInt(c, 16))).join("");
+            console.log("extension id:", id, "version:", m.version);
+            if (id !== "meleenglfggcmcajknpeeeiobnpfmahc") throw new Error("unexpected extension id " + id);
+            if (m.version !== process.env.EXPECTED) throw new Error("unexpected version " + m.version);
+          '
+        env:
+          EXPECTED: ${{ steps.version.outputs.VERSION }}
+
+      - name: Package
+        id: package
+        run: |
+          name="FluxDown-fork-${{ steps.version.outputs.VERSION }}-${{ steps.version.outputs.SHORT_SHA }}-chrome-extension"
+          mkdir -p build/out
+          mv fluxDown/.output/chrome-mv3 "build/$name"
+          (cd build && zip -qr "out/$name.zip" "$name")
+          (cd build/out && sha256sum "$name.zip" > SHA256SUMS-extension.txt)
+          { echo "### SHA-256 (extension)"; echo '```'; cat build/out/SHA256SUMS-extension.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload extension artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: FluxDown-fork-chrome-extension
+          path: |
+            build/out/*.zip
+            build/out/SHA256SUMS-extension.txt
+          if-no-files-found: error
+          retention-days: 30
