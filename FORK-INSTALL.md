@@ -43,7 +43,7 @@
    ```powershell
    Get-FileHash .\FluxDown-fork-*.zip -Algorithm SHA256
    ```
-   輸出的 Hash 要和三個地方相同（大小寫不影響）：同資料夾的 `SHA256SUMS.txt` 第一行、該次執行頁面上方 Summary 區塊顯示的值。相同代表檔案就是 GitHub 編出來的那份，下載途中沒被換掉。不同就刪掉重來。
+   輸出的 Hash 要和同資料夾的 `SHA256SUMS.txt` 第一行相同（大小寫不影響），該次執行頁面的 Summary 區塊也會顯示同一個值。要在**解開外層之後**的資料夾執行；資料夾裡同時有桌面程式與擴充功能兩個 zip 時會各印一行，擴充功能的對照 `SHA256SUMS-extension.txt`。相同代表檔案就是 GitHub 編出來的那份，下載途中沒被換掉。不同就刪掉重來。
 3. **上傳 [VirusTotal](https://www.virustotal.com)**。把桌面程式的內層 zip（`FluxDown-fork-<版本>-<commit>-windows-x64-portable.zip`）拖進去。
 
    | 結果 | 判讀 |
@@ -109,6 +109,21 @@
 2. **瀏覽器接手**：在 Chrome 任一網頁點一個下載連結，任務應出現在 FluxDown。
 3. **登入下載**：到一個需要登入才能下載的網站，登入後點下載，確認能下載完成而不是下載到登入頁。
 
+## 附加工具：影片轉 MP3
+
+[`fork-tools/轉成MP3.bat`](fork-tools/轉成MP3.bat) 把影片的聲音另存成 MP3，與 FluxDown 本身無關，可單獨使用。在 GitHub 上打開該檔案，按右上角的下載按鈕（Download raw file）取得。
+
+| 用法 | 做法 | 結果 |
+|---|---|---|
+| 拖放 | 把一個或多個影片檔拖到 `轉成MP3.bat` 的圖示上放開 | 只轉拖進來的檔案，任何 FFmpeg 支援的影片格式都可以 |
+| 點兩下 | 把 `轉成MP3.bat` 放進有影片的資料夾，點兩下 | 轉換**該資料夾內**所有 `.mp4`（不含子資料夾） |
+
+- MP3 產生在影片旁邊，檔名相同；原本的影片不會被更動。
+- 已有同名 MP3 的會跳過，所以同一個資料夾可以重複執行，只補轉新的。
+- 第一次執行若電腦沒有 FFmpeg，會用 `winget` 自動安裝（`Gyan.FFmpeg`），裝完再執行一次。
+- 第一次執行可能跳出「Windows 已保護您的電腦」，按「其他資訊」→「仍要執行」。這是純文字腳本，可用記事本打開檢視。
+- 檔名含 `%`、`^` 等特殊符號時批次檔可能處理失敗，先改檔名再轉。
+
 ## 日常使用
 
 - 關掉視窗後程式仍在系統匣繼續下載；要完全結束，在系統匣圖示上按右鍵退出。
@@ -123,7 +138,19 @@
 
 1. 照 [FORK.md](FORK.md) 的「同步官方新版」把新版併進 `main`，並更新「目前同步到」。
 2. 重做本文件的 ① ② ③。
-3. 桌面程式：結束 FluxDown（含系統匣）→ 把舊的 `C:\Apps\FluxDown\portable_data` 整個資料夾搬到新解開的 `FluxDown` 資料夾裡 → 用新資料夾取代舊的。
+3. 桌面程式（PowerShell，一行一行執行，出現紅字就停）：
+   ```powershell
+   # 先關掉 Chrome，再結束所有 FluxDown 程式；只關視窗不夠，背景服務會占用資料夾
+   Get-Process fluxdown-desktop, fluxdown-agent, fluxdownd, fluxdown_nmh, flux_down -ErrorAction SilentlyContinue | Stop-Process -Force
+   Start-Sleep 2
+   Get-Process fluxdown*, flux_down -ErrorAction SilentlyContinue   # 應該什麼都不印
+
+   Rename-Item C:\Apps\FluxDown C:\Apps\FluxDown-old
+   # 寫完整檔名，不要用 * 萬用字元：資料夾裡有兩個 zip 時會失敗
+   Expand-Archive <內層 zip 的完整路徑> -DestinationPath C:\Apps
+   Copy-Item C:\Apps\FluxDown-old\portable_data C:\Apps\FluxDown\ -Recurse
+   ```
+   開啟新的 `fluxdown-desktop.exe`，確認版本號、設定與下載紀錄都在，再刪掉 `C:\Apps\FluxDown-old`。
 4. 擴充功能：把新資料夾的內容覆蓋到原本的擴充功能資料夾，再到 `chrome://extensions` 按該擴充功能的重新載入。
 
 ## 搬到另一台電腦
