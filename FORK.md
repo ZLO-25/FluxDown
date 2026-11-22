@@ -59,6 +59,27 @@ git diff --stat v0.6.8 HEAD    # 應只列出上表的檔案、Cargo.lock 與 FO
 
 Artifacts 保留 30 天，過期後重跑即可。執行檔沒有程式碼簽章，第一次執行 Windows 會跳 SmartScreen 警告。
 
+## 自編的 Chrome 擴充功能
+
+同一個建置流程也會產出 `FluxDown-fork-chrome-extension`。它和商店版的差別只有來源：程式碼固定在本 repo 的版本，瀏覽器不會自動更新它。
+
+安裝：
+
+1. 下載 Artifact，解開外層，再把裡面的 zip 解到固定位置（例如 `C:\Apps\FluxDown-extension`）。之後不要搬動或刪除這個資料夾，Chrome 是直接從這裡載入的。
+2. Chrome 開 `chrome://extensions`，打開右上角「開發人員模式」。
+3. 按「載入未封裝項目」，選解開後含有 `manifest.json` 的那個資料夾。
+4. 擴充功能的 ID 應該是 `meleenglfggcmcajknpeeeiobnpfmahc`。桌面程式只放行這個 ID。
+5. 不要同時安裝商店版：兩者 ID 相同，會互相覆蓋。
+
+更新：重跑建置、下載新 zip、把資料夾內容換掉，再到 `chrome://extensions` 按該擴充功能的重新載入。
+
+它做什麼、不做什麼（依 v0.6.8 原始碼）：
+
+- 需要「所有網站」權限，用來攔截下載與偵測頁面上的影音資源。
+- 下載時讀取**該下載網址**的 Cookie、Referer 與請求標頭，經瀏覽器的原生通訊交給本機的桌面程式，讓需要登入的下載能成功。
+- 自身唯一的對外連線是「遠端伺服器」模式，只有你在選項裡填了遠端位址才會啟用，預設是空的。
+- 沒有統計上報，沒有 `eval` 或動態載入遠端程式碼。
+
 ## 同步官方新版
 
 ```bash
